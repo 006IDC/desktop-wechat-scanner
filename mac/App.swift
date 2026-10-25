@@ -354,10 +354,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard connected,!stopping else{return}
         if let library=applicationLibrary {library.showWindow(nil);library.window?.makeKeyAndOrderFront(nil);return}
         let library=ApplicationLibrary();applicationLibrary=library
-        library.onOpen={ [weak self] app,point in
-            guard let self,self.connected,!self.stopping else{return}
-            if app.packageName=="com.tencent.mm" {self.enterWechat(scan:false,at:point)}
-            else {self.detachedApplications?.open(app,at:point)}
+        library.onOpen={ [weak self,weak library] app,point in
+            guard let self,self.connected,!self.stopping else {
+                library?.showError("手机尚未连接或正在断开，请连接后再打开应用。");return
+            }
+            if app.packageName=="com.tencent.mm" {
+                guard !self.busy else {library?.showError("正在准备手机，请稍候再打开微信。");return}
+                self.enterWechat(scan:false,at:point)
+            } else if self.detachedApplications?.open(app,at:point) != true {
+                library?.showError("暂时无法打开此应用。请等待正在关闭的窗口完成，或关闭一个独立窗口后重试。")
+            }
         }
         library.showWindow(nil)
         catalogTask=Task { [weak self,weak library] in
@@ -451,6 +457,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 await clearCamera();let generation=scanGeneration
                 status("准备桌面相机","正在读取当前窗口后方的桌面画面…")
                 try await capture.prepare();try Task.checkCancellation()
+                control.showPermissionHelp(false)
                 guard connected && mode == .wechat && generation==scanGeneration else{return}
                 guard control.window?.isVisible == true,control.window?.isMiniaturized == false else {
                     await capture.stop();busy=false;cameraSuppressed=true;status("桌面相机已暂停","恢复窗口后点扫码继续。");return
@@ -709,6 +716,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowShouldClose(_ sender:NSWindow)->Bool {
         if sender === wechatWindow?.window {returnToPhone();return false}
         sender.orderOut(nil);return false
+    }
+    func applicationDidBecomeActive(_ notification:Notification) {
+        // Refresh only an already granted permission. Activating the app must
+        // never request capture or reopen the system permission prompt.
+        if CGPreflightScreenCaptureAccess() {
+            mainControl.showPermissionHelp(false);wechatWindow?.showPermissionHelp(false)
+            refresh();writeDiagnosticState()
+        }
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool)->Bool {showMainWindow();return true}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {

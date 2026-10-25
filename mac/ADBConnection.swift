@@ -34,6 +34,7 @@ struct ADBConnectionError: LocalizedError, Sendable {
 /// IPv6 requires brackets; URLs, implicit ports and shell syntax are rejected.
 struct ADBEndpoint: Equatable, Sendable {
     let value: String
+    let host: String
     init(_ input: String) throws {
         let host: String, portText: String
         if input.hasPrefix("["), let close = input.firstIndex(of: "]") {
@@ -61,6 +62,7 @@ struct ADBEndpoint: Equatable, Sendable {
         }
         guard !portText.isEmpty, portText.utf8.allSatisfy({ (48...57).contains($0) }),
               let port = UInt16(portText), port > 0 else { throw Self.invalid }
+        self.host = host
         value = host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
     }
     private static var invalid: ADBConnectionError { ADBConnectionError("请输入手机显示的地址和端口，例如 192.168.1.20:37123 或 [IPv6]:37123。") }

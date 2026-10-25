@@ -18,6 +18,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     private var wirelessManager: ADBConnectionManager?
     private var wirelessLease: WirelessConnectionLease?
     private let serverHandoff = ADBWirelessServerHandoff()
+    private let reconnectStore = WirelessReconnectStore()
     private var handedOffServerSocket: String?
     private var devices = [ADBDevice]()
     private var services = [ADBDiscoveredService]()
@@ -53,12 +54,6 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         window.contentMinSize = NSSize(width: 640, height: 560)
         window.delegate = self
         buildContent(window)
-        if let resource=Bundle.main.resourceURL,
-           let data=try? Data(contentsOf:resource.appendingPathComponent("adb/manifest.json")),
-           let manifest=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any],
-           let features=manifest["features"] as? [String:Bool],features["mdns_discovery"]==false {
-            discoverButton.isHidden=true;servicePicker.isHidden=true
-        }
         window.center()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -71,7 +66,10 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         closed = false; didSelect = false; didNotifyCancel = false
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
-        refreshDevices()
+        if let previous = reconnectStore.load() {
+            connectEndpoint.stringValue = previous.endpoint
+            reconnectRemembered(previous)
+        } else { refreshDevices() }
     }
 
     /// Call after close (including onSelect/onCancel) before App exit or another
@@ -99,7 +97,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         guard !Task.isCancelled, !closed, generation == current else {
             await server.stop(); throw CancellationError()
         }
-        let manager = ADBConnectionManager(adbURL: adbURL, serverSocket: server.socket)
+        let manager = ADBConnectionManager(adbURL: adbURL, serverSocket: server.socket, timeout: 6)
         let lease = WirelessConnectionLease(manager: manager)
         wirelessServer = server; wirelessManager = manager; wirelessLease = lease
         return lease
@@ -109,7 +107,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         guard let content = window.contentView else { return }
         let title = NSTextField(labelWithString: "选择要连接的手机")
         title.font = .systemFont(ofSize: 20, weight: .semibold)
-        let intro = note("USB：连接并解锁手机，允许此 Mac 调试。无线：先在手机开启无线调试，手机与 Mac 需在同一网络。配对会保留此 Mac 的调试信任；可在手机无线调试的“已配对设备”中取消。")
+        let intro = note("USB：连接并解锁手机，允许此 Mac 调试。无线：手机与 Mac 在同一网络，开启无线调试；选择过的手机下次会尝试自动找回连接。")
         let deviceTitle = heading("可用设备")
         table.headerView = NSTableHeaderView()
         for (identifier, title, width) in [("model", "设备", 330.0), ("transport", "连接方式", 120.0), ("authorization", "状态", 150.0)] {
@@ -134,7 +132,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         configure(selectButton, action: #selector(selectDevice))
         selectButton.keyEquivalent = "\r"
         let devicesActions = row([refreshButton, spacer(), selectButton])
-        let chooseHint = note("无线连接建立后，请在上方列表中明确选择手机。未授权或离线的设备无法进入镜像。")
+        let chooseHint = note("无线连接建立后，请在上方列表中选择已授权的手机。不会自动打开其他手机。")
 
         pairEndpoint.placeholderString = "例如 192.168.1.20:37123"
         pairEndpoint.setAccessibilityLabel("配对地址与端口，来自手机配对码窗口")
@@ -320,6 +318,42 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     private func replaceDevices(_ result: [ADBDevice]) {
         devices = result; table.reloadData(); table.deselectAll(nil)
     }
+    private func publishServices(_ result: [ADBDiscoveredService]) {
+        services = result
+        servicePicker.removeAllItems()
+        servicePicker.addItem(withTitle: "选择一个连接地址…")
+        for service in result { servicePicker.addItem(withTitle: "\(service.name) · \(service.endpoint)") }
+        updateEnabled()
+    }
+    private func reconnectRemembered(_ previous: RememberedWirelessDevice) {
+        startOperation("正在找回上次选择的无线手机…") { [weak self] current in
+            guard let self else { throw CancellationError() }
+            // A missing/denied Bonjour service is not a reason to discard a
+            // still usable endpoint. Never connect to an unrelated service.
+            let discovered = (try? await BonjourADBDiscovery().discover(seconds: 2)) ?? []
+            try Task.checkCancellation()
+            guard !self.closed, self.generation == current else { throw CancellationError() }
+            self.publishServices(discovered)
+            let endpoint = previous.preferredEndpoint(in: discovered)
+            self.connectEndpoint.stringValue = endpoint
+            do {
+                let lease = try await self.wirelessConnection(current: current)
+                try await lease.connect(endpoint: endpoint)
+                let result = try await self.listedDevices()
+                try Task.checkCancellation()
+                guard !self.closed, self.generation == current else { throw CancellationError() }
+                self.replaceDevices(result)
+                return "已找回无线连接。请在上方选择手机；以后无需再填写地址。"
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                // Preserve the input and allow explicit retry/new endpoint.
+                let result = (try? await self.listedDevices()) ?? []
+                guard !self.closed, self.generation == current else { throw CancellationError() }
+                self.replaceDevices(result)
+                return "自动连接未成功。请确认手机无线调试仍开启，或在下方输入当前连接端口重试。"
+            }
+        }
+    }
     @objc private func refreshDevices() {
         startOperation("正在读取设备列表…") { [weak self] current in
             guard let self else { throw CancellationError() }
@@ -347,6 +381,8 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
             _ = try ADBEndpoint(endpoint)
             let lease = try await self.wirelessConnection(current: current)
             try await lease.connect(endpoint: endpoint)
+            let found = (try? await BonjourADBDiscovery().discover(seconds: 1.5)) ?? []
+            self.publishServices(found)
             let result = try await self.listedDevices()
             try Task.checkCancellation()
             guard !self.closed, self.generation == current else { throw CancellationError() }
@@ -357,13 +393,10 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     @objc private func discoverWireless() {
         startOperation("正在查找无线连接服务…") { [weak self] current in
             guard let self else { throw CancellationError() }
-            let found = try await self.manager.discover().filter { $0.kind == .connection }
+            let found = try await BonjourADBDiscovery().discover(seconds: 2)
             try Task.checkCancellation()
             guard !self.closed, self.generation == current else { throw CancellationError() }
-            self.services = found
-            self.servicePicker.removeAllItems()
-            self.servicePicker.addItem(withTitle: "选择一个连接地址…")
-            for service in found { self.servicePicker.addItem(withTitle: service.endpoint) }
+            self.publishServices(found)
             return found.isEmpty ? "未发现无线连接服务，可直接填写手机显示的连接地址与端口。" : "请选择发现的连接地址，核对后点“建立无线连接”。"
         }
     }
@@ -375,6 +408,9 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     @objc private func selectDevice() {
         guard !busy, !closed, let device = selectedDevice else { return }
         didSelect = true
+        if device.transport == .wireless && device.serverSocket != nil {
+            reconnectStore.save(selectedSerial: device.serial, services: services)
+        }
         handedOffSerial = device.serial
         handedOffServerSocket = device.serverSocket
         window?.close()

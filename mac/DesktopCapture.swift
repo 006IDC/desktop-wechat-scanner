@@ -291,7 +291,6 @@ actor DesktopCapture {
             content=value
         } catch {
             markPermissionFailure(error)
-            if !CGPreflightScreenCaptureAccess() {permissionBlocked=true}
             throw error
         }
     }
@@ -400,6 +399,7 @@ actor DesktopCapture {
         await cleanup.value
     }
     private func checkPermission() throws {
+        if permissionBlocked && CGPreflightScreenCaptureAccess() {permissionBlocked=false}
         if permissionBlocked {throw ScanError("请处理系统授权后重新打开 App；本次运行不会重复请求权限。")}
     }
     private func markPermissionFailure(_ error:Error) {

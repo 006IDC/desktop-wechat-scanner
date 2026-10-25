@@ -12,7 +12,7 @@ App 使用 AppKit、ScreenCaptureKit、VideoToolbox 和 Vision；手机端 Java 
 
 ```sh
 mkdir -p .local/swift-cache .local
-swiftc -swift-version 5 -O -target arm64-apple-macos14.4 -module-cache-path .local/swift-cache mac/PhoneSession.swift mac/DesktopCapture.swift mac/CameraPumpMailbox.swift tests/CameraPumpMailboxTests.swift -o .local/mailbox-tests
+swiftc -swift-version 5 -O -target arm64-apple-macos14.4 -module-cache-path .local/swift-cache mac/AndroidApplication.swift mac/PhoneSession.swift mac/DesktopCapture.swift mac/CameraPumpMailbox.swift tests/CameraPumpMailboxTests.swift -o .local/mailbox-tests
 .local/mailbox-tests
 ```
 
@@ -55,3 +55,5 @@ ADBConnectionTests、AndroidApplicationTests、MirrorInputSchedulingTests 为纯
 swiftc -swift-version 5 -O -target arm64-apple-macos14.4 -module-cache-path .local/swift-cache mac/ADBConnection.swift mac/ADBPairingServer.swift tests/ADBManagedServerTests.swift -o .local/adb-managed-server-tests
 .local/adb-managed-server-tests
 ```
+
+`WirelessReconnectTests` 验证端点记忆、服务名匹配和端口变化选择；`ApplicationLibraryTests` 验证拖放意图，`--own-window` 只创建不排序到屏幕的自有测试窗口；`DetachedApplicationsTests` 使用假手机/镜像验证打开、失败、异步关闭和迟到创建后的清理。它们均不替代原生拖放或真实无线 GUI 验收。

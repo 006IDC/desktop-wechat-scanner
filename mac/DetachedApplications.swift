@@ -20,16 +20,19 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
         self.phone = phone; self.adb = adb; self.server = server; self.serverSocket = serverSocket
     }
 
-    func open(_ app: AndroidApplication, at point: NSPoint?) {
-        guard !stopping else { return }
+    @discardableResult func open(_ app: AndroidApplication, at point: NSPoint?) -> Bool {
+        guard !stopping, app.isValid else { return false }
         if let existing = entries[app.packageName] {
-            existing.ui.window?.deminiaturize(nil); existing.ui.showWindow(nil); existing.ui.window?.makeKeyAndOrderFront(nil); return
+            guard !existing.closing, let window = existing.ui.window else { return false }
+            existing.ui.showWindow(nil); AppWindowMotion.reveal(window, from: point); return true
         }
         guard entries.count < 4 else {
-            let alert = NSAlert(); alert.messageText = "最多同时打开 4 个独立应用"; alert.informativeText = "请关闭一个应用窗口后再打开。"; alert.runModal(); return
+            let alert = NSAlert(); alert.messageText = "最多同时打开 4 个独立应用"; alert.informativeText = "请关闭一个应用窗口后再打开。"; alert.runModal(); return false
         }
         let entry = Entry(app); entries[app.packageName] = entry
-        entry.ui.window?.delegate = self
+        guard let window = entry.ui.window else { entries.removeValue(forKey: app.packageName); return false }
+        window.isReleasedWhenClosed = false
+        window.delegate = self
         entry.ui.onTouch = { [weak entry] action,x,y in
             guard let entry,!entry.closing,entry.display != nil else{return}
             entry.mirror.touch(action:action,x:x,y:y)
@@ -38,7 +41,8 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
         entry.ui.onSwipe = { [weak entry] x1,y1,x2,y2 in guard let entry, !entry.closing else { return }; entry.mirror.swipe(x1:x1,y1:y1,x2:x2,y2:y2) }
         entry.ui.onBack = { [weak entry] in entry?.mirror.key(4) }
         entry.ui.update(status: "正在打开 \(app.name)", detail: "应用仍在手机运行，画面即将在这里出现。", connected: false, busy: true, paused: true)
-        if let window = entry.ui.window { AppWindowMotion.reveal(window, from: point) }
+        entry.ui.showWindow(nil)
+        AppWindowMotion.reveal(window, from: point)
         entry.task = Task { [weak self, entry] in
             guard let self else { return }
             do {
@@ -62,9 +66,10 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
                     do { try await phone.closeAppDisplay(id); entry.display = nil }
                     catch { /* Keep ownership for the next close or disconnect recovery. */ }
                 }
-                entry.ui.update(status: "应用未能独立打开", detail: error.localizedDescription, connected: false, busy: false, paused: true)
+                entry.ui.update(status: "应用打开失败", detail: error.localizedDescription, connected: false, busy: false, paused: true)
             }
         }
+        return true
     }
     func present() {
         for entry in entries.values where !entry.closing && entry.ui.window?.isMiniaturized != true {
