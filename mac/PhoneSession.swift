@@ -115,6 +115,7 @@ final class ServerLog {
         }
         condition.broadcast()
     }
+    func dpi() -> Int { condition.lock(); defer { condition.unlock() }; return Int(fields["display_dpi"] ?? "") ?? 320 }
     func dimensions() -> (Int,Int) {
         condition.lock();defer {condition.unlock()}
         return (Int(fields["display_width"] ?? "") ?? 720,Int(fields["display_height"] ?? "") ?? 1280)
@@ -143,6 +144,8 @@ private struct Recovery: Codable {
     var display: Int? = nil
     var device: Int? = nil
     var pid: Int? = nil
+    var appDisplays: [AndroidAppDisplay]? = nil
+    var appTasks: [AndroidOwnedTask]? = nil
     var path: String { "/data/local/tmp/006idc-scan-" + suffix }
     var socketName: String { "006idc_scan_" + suffix }
     var valid: Bool {
@@ -151,7 +154,11 @@ private struct Recovery: Codable {
         mac.range(of: "^02:06:1D:([0-9A-F]{2}:){2}[0-9A-F]{2}$", options: .regularExpression) != nil &&
         !serial.isEmpty && !serial.contains("\n") &&
         (association == nil || association! > 0) &&
-        (device == nil || device! > 0) && (pid == nil || pid! > 0)
+        (device == nil || device! > 0) && (pid == nil || pid! > 0) && (display == nil || display! > 0) &&
+        (appDisplays ?? []).count <= 4 && (appDisplays ?? []).allSatisfy({ $0.isValid && $0.id != display }) &&
+        Set((appDisplays ?? []).map(\.id)).count == (appDisplays ?? []).count &&
+        (appTasks ?? []).allSatisfy({ $0.id > 0 && $0.originalDisplay >= 0 && $0.ownedDisplay > 0 &&
+            $0.packageName.range(of: "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+$", options: .regularExpression) != nil })
     }
 }
 
@@ -169,7 +176,7 @@ actor PhoneSession {
     private let adbURL: URL, jarURL: URL, recoveryURL: URL
     private var recovery: Recovery?
     private var server: Process?, serverPipe: Pipe?, channel: CameraSocket?
-    private var displayWidth=720, displayHeight=1280
+    private var displayWidth=720, displayHeight=1280, displayDpi=320
     private var displayID: Int?
     private var cleaning=false
     init(resources: URL, adbURL: URL? = nil) {
@@ -189,14 +196,16 @@ actor PhoneSession {
         try JSONEncoder().encode(state).write(to: recoveryURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:recoveryURL.path)
     }
-    func connect(openWechatOnConnect: Bool = true, progress: @escaping @Sendable (String) -> Void) async throws -> String {
+    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, progress: @escaping @Sendable (String) -> Void) async throws -> String {
         guard server == nil else { throw ScanError("手机已经连接。") }
         do {
-            progress("正在检查 USB 连接…")
+            progress("正在检查手机连接…")
             let listing = try adb(["devices","-l"])
             let lines = listing.split(separator:"\n").map { $0.split(whereSeparator:{$0==" " || $0=="\t"}).map(String.init) }
-            let devices = lines.filter { $0.count >= 2 && $0[1] == "device" && $0.contains(where:{$0.hasPrefix("usb:")}) }
+            let devices = lines.filter { $0.count >= 2 && $0[1] == "device" &&
+                (selectedSerial == nil ? $0.contains(where:{$0.hasPrefix("usb:")}) : $0[0] == selectedSerial!) }
             if devices.isEmpty {
+                if selectedSerial != nil { throw ScanError("选中的手机当前未连接或尚未授权，请刷新设备列表。") }
                 if lines.contains(where:{$0.count>=2 && $0[1]=="unauthorized"}) { throw ScanError("请解锁手机，并在手机上允许这台 Mac 的 USB 调试。") }
                 throw ScanError("未发现已授权的 USB 手机。请使用数据线连接并开启 USB 调试。")
             }
@@ -204,7 +213,7 @@ actor PhoneSession {
             let serial = devices[0][0]
             if FileManager.default.fileExists(atPath: recoveryURL.path) {
                 let old = try JSONDecoder().decode(Recovery.self,from:Data(contentsOf:recoveryURL))
-                guard old.valid,old.serial==serial else { throw ScanError("上次会话尚未清理，请连接上次使用的手机再试。") }
+                guard old.valid,old.serial==serial else { throw ScanError("上次会话的设备标识与当前连接不一致；无线地址与 USB 标识不能自动互换，请使用上次的准确连接清理。") }
                 recovery=old
                 progress("正在清理上次未结束的连接…")
                 let problems = disconnect()
@@ -236,7 +245,7 @@ actor PhoneSession {
             pipe.fileHandleForReading.readabilityHandler = { handle in let data=handle.availableData; if !data.isEmpty {log.append(data)} }
             server=process;serverPipe=pipe;try process.run()
             let (device,display,pid)=try log.waitReady()
-            (displayWidth,displayHeight)=log.dimensions()
+            (displayWidth,displayHeight)=log.dimensions(); displayDpi=log.dpi()
             displayID=display;recovery?.display=display;recovery?.device=device;recovery?.pid=pid;try save()
             let portText=try adb(["forward","tcp:0","localabstract:"+r.socketName])
             guard let port=UInt16(portText), port>0 else {throw ScanError("USB 图像通道创建失败。")}
@@ -285,10 +294,18 @@ actor PhoneSession {
         guard let state=recovery,let displayID,channel != nil else {throw ScanError("手机未连接。")}
         return (state.serial,displayID)
     }
+    func mirrorEndpoint(display: Int) throws -> (serial: String, display: Int) {
+        guard let state = recovery, channel != nil, ownsDisplay(display) else { throw ScanError("屏幕不属于本次手机连接。") }
+        return (state.serial, display)
+    }
     /// Return only a foreground component, never task extras, URLs or chat text.
     func foreground(onVirtualDisplay: Bool) async throws -> String? {
-        guard let displayID, let state=recovery else {return nil}
-        let target=onVirtualDisplay ? displayID : 0, adb=adbURL, serial=state.serial
+        guard let displayID else { return nil }
+        return try await foreground(display: onVirtualDisplay ? displayID : 0)
+    }
+    func foreground(display target: Int) async throws -> String? {
+        guard let state=recovery, target == 0 || ownsDisplay(target) else {return nil}
+        let adb=adbURL, serial=state.serial
         // Read-only monitoring must not hold the camera actor while ADB waits.
         let dump=try await Task.detached {
             try ShellCommand.run(adb,["-s",serial,"shell","dumpsys activity activities"],timeout:5)
@@ -334,7 +351,11 @@ actor PhoneSession {
         guard let displayID,let state=recovery,state.device != nil else {
             throw ScanError("手机临时屏幕尚未准备好。")
         }
-        let target=onVirtualDisplay ? displayID : 0
+        if onVirtualDisplay {
+            try launchApplication(AndroidApplication(packageName: "com.tencent.mm", component: "com.tencent.mm/.ui.LauncherUI", name: "微信"), on: displayID)
+            return
+        }
+        let target=0
         let trust=try shell("dumpsys trust")
         guard let owner=trust.split(separator:"\n").map(String.init)
             .first(where:{$0.contains("(id=0,") && $0.contains("(current)")}) else {
@@ -346,7 +367,7 @@ actor PhoneSession {
         guard owner.contains("deviceLocked=0") else {
             throw ScanError("无法确认手机是否已解锁，请解锁后重试。")
         }
-        let launch=try shell("am start --display \(target) --activity-clear-top -n com.tencent.mm/.ui.LauncherUI")
+        let launch=try shell("am start --display \(target) -n com.tencent.mm/.ui.LauncherUI")
         let lower=launch.lowercased()
         if lower.contains("error:") || lower.contains("exception") {
             throw ScanError("微信未能在手机临时屏幕启动："+String(launch.prefix(300)))
@@ -366,6 +387,160 @@ actor PhoneSession {
             }
         }
         throw ScanError("微信没有出现在本次手机临时屏幕，请保持手机解锁后重试。")
+    }
+    private func ownsDisplay(_ id: Int) -> Bool {
+        id == displayID || recovery?.appDisplays?.contains(where: { $0.id == id }) == true
+    }
+    func scannerDisplay() -> AndroidAppDisplay? {
+        guard let displayID else { return nil }
+        return AndroidAppDisplay(id: displayID, width: displayWidth, height: displayHeight, dpi: displayDpi)
+    }
+    func applications() async throws -> [AndroidApplication] {
+        guard let channel else { throw ScanError("手机未连接。") }
+        return try catalog(channel)
+    }
+    private func catalog(_ channel: CameraSocket) throws -> [AndroidApplication] { try AndroidApplication.decodeCatalog(channel.request(10)) }
+    private func appendAppDisplay(_ display: AndroidAppDisplay) {
+        // Read before optional-chain writeback begins (Swift exclusivity).
+        var displays = recovery?.appDisplays ?? []
+        displays.append(display)
+        recovery?.appDisplays = displays
+    }
+    private func appendAppTask(_ task: AndroidOwnedTask) {
+        var tasks = recovery?.appTasks ?? []
+        tasks.append(task)
+        recovery?.appTasks = tasks
+    }
+    func createAppDisplay() throws -> AndroidAppDisplay {
+        guard let channel else { throw ScanError("手机未连接。") }
+        guard (recovery?.appDisplays?.count ?? 0) < 4 else { throw ScanError("最多同时打开四个应用窗口。") }
+        let created = try JSONDecoder().decode(AndroidAppDisplay.self, from: channel.request(11))
+        guard created.isValid, !ownsDisplay(created.id) else { throw ScanError("手机返回无效的应用屏幕。") }
+        appendAppDisplay(created)
+        do { try save() }
+        catch {
+            var id = Int32(created.id).bigEndian
+            _ = try? channel.request(12, withUnsafeBytes(of: &id) { Data($0) })
+            recovery?.appDisplays?.removeAll(where: { $0.id == created.id })
+            throw error
+        }
+        return created
+    }
+    private func requireUnlocked() throws {
+        let trust = try shell("dumpsys trust")
+        guard let owner = trust.split(separator: "\n").first(where: { $0.contains("(id=0,") && $0.contains("(current)") }), owner.contains("deviceLocked=0") else {
+            throw ScanError("请先解锁手机，再打开应用窗口。")
+        }
+    }
+    private func tasks() throws -> [AndroidTaskSnapshot] {
+        let dump = try shell("dumpsys activity activities")
+        guard dump.contains("Display #") else { throw ScanError("无法核实手机任务的显示归属，已保留恢复记录。") }
+        return AndroidTaskSnapshot.parse(dump)
+    }
+    private func moveTask(_ id: Int, to display: Int, expectedRoot: Int? = nil) throws {
+        let snapshot = try tasks()
+        guard let task = snapshot.first(where: { $0.id == id }) else { return }
+        guard expectedRoot == nil || task.rootID == expectedRoot else { throw ScanError("应用任务容器已变化，已保留恢复记录。") }
+        let result = try shell("am display move-stack \(task.rootID) \(display)")
+        guard !result.lowercased().contains("error"), !result.lowercased().contains("exception") else { throw ScanError("手机拒绝移动应用任务。") }
+        if let moved = try tasks().first(where: { $0.id == id }), moved.display != display {
+            throw ScanError("应用任务没有移动到指定屏幕，已保留恢复记录。")
+        }
+    }
+    func launchApplication(_ app: AndroidApplication, on target: Int) throws {
+        guard let state = recovery, channel != nil, ownsDisplay(target), app.isValid else { throw ScanError("应用或屏幕不属于本次连接。") }
+        try requireUnlocked()
+        // Revalidate against the authenticated launcher catalog, never execute an arbitrary component.
+        guard let channel, try catalog(channel).contains(where: { $0.canonicalComponent == app.canonicalComponent }) else { throw ScanError("手机主用户中未找到此应用入口。") }
+        let before = try tasks()
+        let moving = before.filter { $0.packageName == app.packageName && $0.display != target }
+        let groups = Dictionary(grouping: moving, by: \.rootID)
+        for root in groups.keys {
+            guard before.filter({ $0.rootID == root }).allSatisfy({ $0.packageName == app.packageName && $0.display != target }) else {
+                throw ScanError("此应用与其他应用共享任务容器，无法安全地单独移入窗口。")
+            }
+        }
+        // Record every child before moving a root once: one root move affects all children.
+        for task in moving {
+            if state.appTasks?.contains(where: { $0.id == task.id }) != true {
+                appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: task.display, packageName: task.packageName, ownedDisplay: target))
+            } else if let index = recovery?.appTasks?.firstIndex(where: { $0.id == task.id }), let old = recovery?.appTasks?[index] {
+                recovery?.appTasks?[index] = AndroidOwnedTask(id: old.id, originalDisplay: old.originalDisplay, packageName: old.packageName, ownedDisplay: target)
+            }
+        }
+        try save()
+        for root in groups.keys.sorted() {
+            guard let group = groups[root], let representative = group.first else { continue }
+            let current = try tasks().filter { $0.rootID == root }
+            guard current.allSatisfy({ task in group.contains(where: { $0.id == task.id && $0.packageName == task.packageName && $0.display == task.display }) }) else {
+                throw ScanError("应用任务在移动前发生变化，已保留恢复记录。")
+            }
+            try moveTask(representative.id, to: target, expectedRoot: root)
+        }
+        let result = try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")
+        guard !result.lowercased().contains("error:"), !result.lowercased().contains("exception") else { throw ScanError("手机应用启动失败。") }
+        for _ in 0..<8 {
+            let after = try tasks()
+            for task in after where task.packageName == app.packageName && task.display == target && !(recovery?.appTasks?.contains(where: { $0.id == task.id }) ?? false) {
+                appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: 0, packageName: app.packageName, ownedDisplay: target))
+                try save()
+            }
+            if Self.foregroundComponent(in: try shell("dumpsys activity activities"), display: target)?.hasPrefix(app.packageName + "/") == true { return }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        throw ScanError("应用未出现在指定屏幕；已保留恢复记录。")
+    }
+    private func restoreTasks(on target: Int) throws {
+        let snapshot = try tasks()
+        let recorded = recovery?.appTasks ?? []
+        let groups = Dictionary(grouping: snapshot.filter { $0.display == target }, by: \.rootID)
+        var destinations: [Int: Int] = [:]
+        // A root cannot be split by move-stack. Refuse conflicting destinations
+        // before moving anything, including children associated with another window.
+        for (root, group) in groups {
+            guard snapshot.filter({ $0.rootID == root }).allSatisfy({ $0.display == target }) else {
+                throw ScanError("任务容器跨越多个屏幕，已保留恢复记录。")
+            }
+            let targetDisplays = Set(group.map { task in
+                recorded.first(where: { $0.id == task.id && $0.packageName == task.packageName })?.originalDisplay ?? 0
+            })
+            guard targetDisplays.count == 1, let destination = targetDisplays.first, destination != target else {
+                throw ScanError("同一任务容器的原屏幕记录不一致，已保留窗口和恢复记录。")
+            }
+            destinations[root] = destination
+        }
+        for root in groups.keys.sorted() {
+            guard let group = groups[root], let representative = group.first, let destination = destinations[root] else { continue }
+            let current = try tasks().filter { $0.rootID == root }
+            guard current.allSatisfy({ task in group.contains(where: { $0.id == task.id && $0.packageName == task.packageName && task.display == target }) }) else {
+                throw ScanError("应用任务在恢复前发生变化，已保留窗口和恢复记录。")
+            }
+            try moveTask(representative.id, to: destination, expectedRoot: root)
+        }
+        let restored = try tasks()
+        guard !restored.contains(where: { $0.display == target }), groups.allSatisfy({ root, group in
+            group.allSatisfy { original in
+                restored.first(where: { $0.id == original.id }).map { $0.display == destinations[root] } ?? true
+            }
+        }) else { throw ScanError("应用任务尚未恢复，已保留临时屏幕，避免丢失应用状态。") }
+        recovery?.appTasks?.removeAll(where: { $0.ownedDisplay == target })
+        do { try save() }
+        catch { recovery?.appTasks = recorded; throw error }
+    }
+    /// Restore every scanner task without releasing its reserved display or camera.
+    func restoreScannerApplications() throws {
+        guard let displayID, channel != nil, let state = recovery, state.display == displayID,
+              state.valid, try ownedDevice(state) != nil else { throw ScanError("扫码屏幕不属于当前连接。") }
+        try restoreTasks(on: displayID)
+    }
+    func closeAppDisplay(_ id: Int) throws {
+        guard let channel, recovery?.appDisplays?.contains(where: { $0.id == id }) == true, let value = Int32(exactly: id) else { throw ScanError("应用屏幕不属于本次连接。") }
+        try restoreTasks(on: id)
+        var network = value.bigEndian
+        let body = withUnsafeBytes(of: &network) { Data($0) }
+        _ = try channel.request(12, body)
+        recovery?.appDisplays?.removeAll(where: { $0.id == id })
+        try save()
     }
     private func virtualRecords() throws -> [VirtualRecord] {
         let dump=try shell("dumpsys virtualdevice")
@@ -464,6 +639,17 @@ actor PhoneSession {
     /// Synchronous inside this actor so connect/quit cannot enter cleanup twice.
     func disconnect() -> String {
         cleaning=true;defer {cleaning=false}
+        if let state = recovery {
+            do {
+                guard state.valid else { throw ScanError("连接恢复记录无效。") }
+                let owner = try shell("if test -d \(state.path); then cat \(state.path)/owner; else printf absent; fi")
+                guard owner == state.token || owner == "absent" else { throw ScanError("手机会话标记不匹配。") }
+                if try ownedDevice(state) != nil {
+                    for display in state.appDisplays ?? [] { try restoreTasks(on: display.id) }
+                    if let display = state.display { try restoreTasks(on: display) }
+                }
+            } catch { return "应用任务恢复失败，已保留连接与临时屏幕：" + error.localizedDescription }
+        }
         if let channel {_ = try? channel.request(9);channel.close()}
         channel=nil
         if let server,server.isRunning {

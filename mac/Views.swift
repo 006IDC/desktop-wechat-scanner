@@ -81,12 +81,13 @@ private final class PhonePreviewView: NSView {
         }
     }
     var onTap: ((Double, Double) -> Void)?
+    var onTouch: ((UInt8, Double, Double) -> Void)?
     var onSwipe: ((Double, Double, Double, Double) -> Void)?
     private var touchStart: NSPoint?
     private var touchStartLocation: NSPoint?
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { localScanPreview }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -281,6 +282,13 @@ private final class PhonePreviewView: NSView {
         guard imageRect.contains(location) else { return }
         touchStart = normalized(location)
         touchStartLocation = location
+        if let start=touchStart { onTouch?(0,Double(start.x),Double(start.y)) }
+    }
+
+    override func mouseDragged(with event:NSEvent) {
+        guard !localScanPreview,touchStart != nil,onTouch != nil else{return}
+        let point=normalized(convert(event.locationInWindow,from:nil))
+        onTouch?(2,Double(point.x),Double(point.y))
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -288,6 +296,7 @@ private final class PhonePreviewView: NSView {
         defer { touchStart = nil; touchStartLocation = nil }
         let finishLocation = convert(event.locationInWindow, from: nil)
         let end = normalized(finishLocation)
+        if let onTouch { onTouch(1,Double(end.x),Double(end.y));return }
         if hypot(finishLocation.x - location.x, finishLocation.y - location.y) >= 12 {
             onSwipe?(Double(start.x), Double(start.y), Double(end.x), Double(end.y))
         } else if imageRect.contains(finishLocation) {
@@ -354,13 +363,17 @@ final class ControlWindowController: NSWindowController {
     var onBack: (() -> Void)?
     var onHome: (() -> Void)?
     var onWechat: (() -> Void)?
+    var onApplications: (() -> Void)?
     var onPermissionSettings: (() -> Void)?
     var onRelaunch: (() -> Void)?
     var onTap: ((Double, Double) -> Void)?
+    var onTouch: ((UInt8, Double, Double) -> Void)? {
+        didSet { holder.phone.onTouch = onTouch }
+    }
     var onSwipe: ((Double, Double, Double, Double) -> Void)?
 
     private let connectButton = toolbarButton("连接", symbol: "cable.connector",
-                                               tooltip: "连接或断开 USB 手机")
+                                               tooltip: "连接或断开 USB / 无线手机")
     private let backButton = toolbarButton("返回", symbol: "chevron.left",
                                             tooltip: "返回手机上一页")
     private let homeButton = toolbarButton("主屏幕", symbol: "house",
@@ -369,6 +382,7 @@ final class ControlWindowController: NSWindowController {
                                               tooltip: "打开手机微信")
     private let scanButton = toolbarButton("桌面扫码", symbol: "qrcode.viewfinder",
                                             tooltip: "将此窗口拖到电脑二维码上扫码")
+    private let appsButton = toolbarButton("手机应用", symbol: "square.grid.2x2", tooltip: "拖出手机应用，打开独立窗口")
     private let pauseButton = NSButton(title: "暂停", target: nil, action: nil)
     private let statusLabel = text("未连接", size: 12, weight: .semibold)
     private let modeLabel = text("手机镜像", size: 10, weight: .medium,
@@ -397,14 +411,14 @@ final class ControlWindowController: NSWindowController {
         return WindowCaptureGeometry.correctedCaptureRect(for: window, cachedRect: cached)
     }
 
-    init() {
+    init(title: String = "桌面微信扫码", standalone: Bool = false, scanner: Bool = false) {
         let visibleHeight = NSScreen.main?.visibleFrame.height ?? 740
         let initialHeight = min(690, max(500, visibleHeight - 30))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360,
                                                    height: initialHeight),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
-        window.title = "桌面微信扫码"
+        window.title = title
         // Our opaque surface must also extend behind the native title/traffic lights.
         // Only the phone aperture is transparent; content is laid out below this chrome.
         window.titlebarAppearsTransparent = true
@@ -417,6 +431,10 @@ final class ControlWindowController: NSWindowController {
         window.center()
         super.init(window: window)
         buildContent(in: window)
+        if standalone {
+            connectButton.isHidden = true; homeButton.isHidden = true; wechatButton.isHidden = true; appsButton.isHidden = true
+            scanButton.isHidden = !scanner
+        }
         update(status: "未连接", detail: "请连接已开启 USB 调试的手机。",
                connected: false, busy: false, paused: true)
     }
@@ -426,7 +444,7 @@ final class ControlWindowController: NSWindowController {
     private func buildContent(in window: NSWindow) {
         guard let content = window.contentView else { return }
         let toolbar = NSStackView(views: [connectButton, backButton, homeButton,
-                                          wechatButton, scanButton])
+                                          wechatButton, appsButton, scanButton])
         toolbar.orientation = .horizontal
         toolbar.distribution = .fillEqually
         toolbar.spacing = 5
@@ -435,6 +453,7 @@ final class ControlWindowController: NSWindowController {
         backButton.target = self; backButton.action = #selector(backPressed)
         homeButton.target = self; homeButton.action = #selector(homePressed)
         wechatButton.target = self; wechatButton.action = #selector(wechatPressed)
+        appsButton.target = self; appsButton.action = #selector(applicationsPressed)
         scanButton.target = self; scanButton.action = #selector(scanPressed)
         pauseButton.target = self; pauseButton.action = #selector(pausePressed)
         pauseButton.font = .systemFont(ofSize: 11, weight: .medium)
@@ -536,9 +555,9 @@ final class ControlWindowController: NSWindowController {
         connectButton.imagePosition = .imageOnly
         connectButton.contentTintColor = connected ? .systemGreen : .labelColor
         connectButton.setAccessibilityLabel(connected ? "断开手机" : (busy ? "取消连接" : "连接手机"))
-        connectButton.toolTip = connected ? "断开手机" : (busy ? "取消连接" : "连接 USB 手机")
+        connectButton.toolTip = connected ? "断开手机" : (busy ? "取消连接" : "通过 USB 或无线连接手机")
         connectButton.isEnabled = true
-        for control in [backButton, homeButton, wechatButton] {
+        for control in [backButton, homeButton, wechatButton, appsButton] {
             control.isEnabled = connected && !busy
         }
         scanButton.isEnabled = connected && !busy && !permissionHelp
@@ -642,6 +661,7 @@ final class ControlWindowController: NSWindowController {
     @objc private func pausePressed() { onPause?() }
     @objc private func backPressed() { onBack?() }
     @objc private func homePressed() { onHome?() }
+    @objc private func applicationsPressed() { onApplications?() }
     @objc private func wechatPressed() { onWechat?() }
     @objc private func permissionSettingsPressed() { onPermissionSettings?() }
     @objc private func relaunchPressed() { onRelaunch?() }

@@ -1,33 +1,40 @@
-# 安装与首次连接
+# 安装与连接
 
-## 下载
+从 [GitHub Releases](https://github.com/006IDC/desktop-wechat-scanner/releases) 下载相应版本 DMG/ZIP，核对同版本 SHA256SUMS.txt。当前源码候选为 0.4.0-preview.1；旧 0.3.2 包仍需要外部 ADB，不要混用说明。仅 Apple Silicon、macOS 14.4+。
 
-从 [GitHub Releases](https://github.com/006IDC/desktop-wechat-scanner/releases/tag/v0.3.2-preview.1) 下载 `DesktopWeChatScanner-0.3.2-preview.1-macOS-arm64.dmg` 或 ZIP。仅支持 Apple Silicon 和 macOS 14.4+。Release 同时提供 SHA256SUMS.txt 和 release-manifest.json。
+将 App 拖入 Applications。ZIP 用户先解压；不要从 DMG 内长期运行。升级前断开并退出旧实例。
 
-打开 DMG，把 App 拖到 Applications。ZIP 用户解压后把 App 移入应用程序；不要从 DMG 内长期运行。
+## 开发者验证提示
 
-## macOS 提示无法验证开发者
+预览包为 ad-hoc 签名，未公证。若 macOS 阻止打开，先核对来源与校验值，再按 [Apple 官方指引](https://support.apple.com/102445) 在“系统设置 → 隐私与安全”使用“仍要打开”。保持 Gatekeeper 开启。企业策略可能禁止运行。
 
-此预览版只有 ad-hoc 签名，未公证，可能被系统阻止打开。先确认下载来自本仓库且校验值一致，再在“系统设置 → 隐私与安全”查找本 App 的“仍要打开”，按系统指引确认。保持 Gatekeeper 开启；无需关闭系统安全保护。说明依据 [Apple 官方指引](https://support.apple.com/102445)。
+## ADB 已内置
 
-不同 macOS 版本的按钮文字可能不同；没有入口时不要反复删除权限记录。企业管理的 Mac 可能禁止运行此类应用。
+0.4.0 包含从 android-tools 37.0.0 开源源码构建的 ADB，无需 Homebrew、SDK 或终端。App 优先使用自带工具；源码开发版缺少随包资源时保留外部工具选择入口。完整对应源码、依赖许可证、构建配方与哈希位于 `Contents/Resources/adb/`。
 
-## 准备 ADB
+## USB
 
-1. 打开 [Google 官方 Platform-Tools](https://developer.android.com/tools/releases/platform-tools)，阅读并接受其条款，下载 Mac 版本并解压。
-2. 将解压后的 `platform-tools` 文件夹放在固定位置，避免放在随后删除的临时目录。
-3. 在 App 中点击连接。未发现 adb 时选择“选择 adb…”，选中该目录的 `adb` 文件；“官方下载”会打开上述网页。
-4. 已有 Homebrew/Android SDK 用户可选择原安装目录的 adb。首次选择后会记住位置；移动或升级工具后，可在 App 菜单中重新设置。
+手机开启开发者选项及 USB 调试，接数据线、解锁，允许此 Mac 调试。App 点连接，选择已授权设备。小米可能还需要“USB 调试（安全设置）”。Android 16 是目标环境；无需安装测试 APK。
 
-App 会执行所选 adb 的 `version` 检查；只选择可信来源的工具。它使用你本机 ADB 的密钥和 USB 授权，不上传这些资料。
+## 无线
 
-## 手机与录屏权限
+1. Mac 和手机连同一个网络，手机打开“开发者选项 → 无线调试”。
+2. 选“使用配对码配对设备”，把该页面的地址、端口和六位配对码填入 App 的配对区。
+3. 返回手机无线调试主页，将主页的连接地址和端口填入 App 的连接区，点“建立无线连接”。这通常不是刚才的配对端口。
+4. 在设备列表中明确选中手机，点“连接所选手机”。内置 ADB 当前不提供 mDNS 自动发现。
 
-- 手机开启开发者选项和 USB 调试，使用数据线连接并解锁，在手机上接受调试授权。
-- Android 16 为本版的目标；小米系统可能另有“USB 调试（安全设置）”。不需要为了使用公开版安装测试 APK。
-- 连接后进入微信扫一扫，在 Mac 提示时授予本 App“屏幕录制 / 录屏与系统录音”权限，并按 App 提示重启。App 只使用屏幕图像，音频关闭。
-- 确保先断开旧实例，避免两个 App 争用同一手机会话。
+配对码只经标准输入交给 ADB，提交后清空，不进入参数或日志。Android/ADB 会保留此 Mac 的配对信任。App 断开时清理自己的会话并断开所选无线地址；若要撤销信任，在手机“无线调试 → 已配对设备”中忘记此 Mac，或关闭无线调试。
+
+地址变化且上次会话未清理时，本版本不会猜测新地址属于同一设备；先恢复上次连接完成清理。内置 ADB 已完成手机无线配对，App 内完整无线镜像流程仍待验收。
+
+## 独立窗口与扫码
+
+点“手机应用”按钮，把列表中的应用拖到窗口外，或双击打开。普通窗口关闭前会把任务移回手机；同一应用复用一个窗口。不能把手机镜像里的任意图标直接抓到 Mac 桌面。
+
+微信窗口进入扫一扫后，按 macOS 提示授予本 App 屏幕录制权限，并在提示要求时重启。只采集图像，不采集声音。将标题栏拖到电脑二维码上；扫码结果由真实微信处理。收进程序坞暂停桌面相机，恢复后点扫码继续。
+
+黄色按钮和 ⌘M 使用系统动画。若希望“吸入”效果，可在 macOS“桌面与程序坞”选择“神奇效果”；App 不修改全局偏好。打开应用与桌面回传仍受手机性能和网络延迟影响。
 
 ## 卸载
 
-先在 App 中断开，正常退出，再将 App 移入废纸篓。ADB 是用户独立安装的工具，不随本 App 卸载；手机可撤销 USB 调试授权。App 本地状态位于 `~/Library/Application Support/006IDC/DesktopWeChatScanner/`，包含中断清理所需会话资料，不要把该目录上传到 Issues。若上次清理失败，建议先重新连接完成恢复，再移除本地状态。
+先断开并正常退出，再移入废纸篓。手机可撤销 USB/无线调试授权；共享 ADB 信任不会因删除 App 自动撤销。本地恢复记录位于 `~/Library/Application Support/006IDC/DesktopWeChatScanner/`，不要上传。清理失败时先连接同一手机恢复，再删除本地状态。

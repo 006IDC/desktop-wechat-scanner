@@ -12,10 +12,10 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-RELEASE = '0.3.2-preview.1'
+RELEASE = '0.4.0-preview.1'
 APP_NAME = '桌面微信扫码.app'
 STEM = f'DesktopWeChatScanner-{RELEASE}-macOS-arm64'
-OUT = ROOT / 'build/release'
+OUT = ROOT / 'build/release' / RELEASE
 SCRCPY_SHA256 = '764eb6f79811d5211fe9df341120882ba9994c7a61b897d7bf3fb662e53bc536'
 
 
@@ -67,12 +67,19 @@ def main():
         app = stage/APP_NAME
         verify(app)
         resources = app/'Contents/Resources'
-        if (resources/'adb').exists():
-            raise RuntimeError('Public app must not bundle adb')
+        if not (resources/'adb/bin/adb').is_file():
+            raise RuntimeError('Missing bundled ADB')
+        adb_manifest = json.loads((resources/'adb/manifest.json').read_text())
+        for relative, expected in adb_manifest['files'].items():
+            if digest(resources/'adb'/relative) != expected:
+                raise RuntimeError('Bundled ADB binary differs from source build')
+        for source in adb_manifest['sources']:
+            if digest(resources/'adb'/source['archive']) != source['sha256']:
+                raise RuntimeError('Bundled ADB corresponding source differs')
         if (resources/'SOURCE-REVISION.txt').read_text().strip() != revision:
             raise RuntimeError('App source revision does not match current commit')
         info = plistlib.loads((app/'Contents/Info.plist').read_bytes())
-        if (info['CFBundleShortVersionString'], info['CFBundleVersion'], info['DesktopScannerRelease']) != ('0.3.2', '11', RELEASE):
+        if (info['CFBundleShortVersionString'], info['CFBundleVersion'], info['DesktopScannerRelease']) != ('0.4.0', '12', RELEASE):
             raise RuntimeError('Release/Info.plist mismatch')
         executable = app/'Contents/MacOS/DesktopWeChatScanner'
         if run('lipo', '-archs', str(executable)) != 'arm64' or not os.access(executable, os.X_OK):
@@ -89,6 +96,9 @@ def main():
                    'Contents/Resources/LICENSE', 'Contents/Resources/NOTICE',
                    'Contents/Resources/THIRD_PARTY.md', 'Contents/Resources/SOURCE-REVISION.txt',
                    'Contents/_CodeSignature/CodeResources'}
+        for source in (ROOT/'.local/adb-bundle').rglob('*'):
+            if source.is_file() and not source.is_symlink():
+                allowed.add('Contents/Resources/adb/' + source.relative_to(ROOT/'.local/adb-bundle').as_posix())
         for path in sorted(app.rglob('*')):
             if path.is_file():
                 relative = path.relative_to(app).as_posix()
@@ -98,11 +108,11 @@ def main():
         if set(bundle) != allowed:
             raise RuntimeError('Incomplete bundle')
         readme = stage/'安装说明.txt'
-        readme.write_text('桌面微信扫码 0.3.2-preview.1\n\n'
+        readme.write_text('桌面微信扫码 0.4.0-preview.1\n\n'
                           '将桌面微信扫码.app拖到应用程序目录。仅支持Apple Silicon、macOS 14.4+。\n'
-                          '本预览版仍有拖动和打开扫码卡顿。仅USB，Android 16目标环境。\n'
-                          '不捆绑ADB：首次连接前从Google官方下载Mac Platform-Tools并解压，在App选择adb。\n'
-                          'https://developer.android.com/tools/releases/platform-tools\n\n'
+                          '预览版：Android 16目标环境；无线配对和应用独立窗口有设备兼容性限制。\n'
+                          '已内置开源ADB，无需额外安装。无线连接需在手机允许配对，配对码只填入App。\n'
+                          '配对会保留此Mac的调试信任，断开App不会撤销。请在手机无线调试的已配对设备中忘记此Mac以撤销。\n\n'
                           '此包为ad-hoc签名、未公证。若macOS阻止打开，请核对来源和校验值，按Apple官方指引操作，勿关闭Gatekeeper。\n'
                           'https://support.apple.com/102445\n\n'
                           '完整安装、隐私及开源说明：\nhttps://github.com/006IDC/desktop-wechat-scanner\n')
@@ -141,9 +151,12 @@ def main():
                 raise RuntimeError('Release ZIP lost executable permission')
         manifest = {'release':'v'+RELEASE, 'source_repository':'https://github.com/006IDC/desktop-wechat-scanner',
                     'source_commit':revision, 'architecture':'arm64', 'minimum_macos':'14.4',
-                    'app_version':'0.3.2', 'app_build':'11', 'signature':'ad-hoc', 'notarized':False,
-                    'bundled_adb':False, 'known_limitations':['dragging and scanner startup lag', 'USB only',
-                    'first-run ADB picker and clean Mac installation not human-verified'],
+                    'app_version':'0.4.0', 'app_build':'12', 'signature':'ad-hoc', 'notarized':False,
+                    'bundled_adb':True, 'adb_source_version':'37.0.0-android-tools',
+                    'known_limitations':['desktop camera round-trip latency remains', 'wireless mirroring and app pairing UI not yet verified',
+                    'manual wireless endpoints required; bundled adb has no mDNS discovery',
+                    'independent app display support varies by Android app and device',
+                    'interactive drag and clean Mac installation not human-verified'],
                     'verification':['ZIP CRC and executable mode', 'codesign deep strict after extraction',
                     'DMG verification, read-only mount and exact bundle hashes'],
                     'bundle_files':bundle,

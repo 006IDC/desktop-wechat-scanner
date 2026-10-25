@@ -1,4 +1,11 @@
 import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ResolveInfo;
+import android.content.ComponentName;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.util.HashSet;
+import java.util.List;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -72,6 +79,13 @@ public final class LiveCameraServer {
     private Object camera;
     private VirtualDisplay display;
     private ImageReader displayReader;
+    private final Map<Integer, AppDisplay> appDisplays = new ConcurrentHashMap<>();
+    private static final class AppDisplay {
+        final VirtualDisplay display;
+        final ImageReader reader;
+        AppDisplay(VirtualDisplay display, ImageReader reader) { this.display = display; this.reader = reader; }
+        void close() { display.release(); reader.close(); }
+    }
     private HandlerThread imageThread;
     private LocalServerSocket server;
     private LocalSocket client;
@@ -247,6 +261,63 @@ public final class LiveCameraServer {
         log("display_width", displayWidth); log("display_height", displayHeight); log("display_dpi", displayDpi);
     }
 
+    private byte[] applications() throws Exception {
+        // Explicitly query the primary user, never work-profile/private-profile apps.
+        if (Process.myUid() / 100000 != 0) throw new IOException("Primary user required");
+        Intent launcher = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+        PackageManager pm = context.getPackageManager();
+        List<ResolveInfo> resolved = pm.queryIntentActivities(launcher, PackageManager.MATCH_DIRECT_BOOT_AWARE | PackageManager.MATCH_DIRECT_BOOT_UNAWARE);
+        JSONArray entries = new JSONArray();
+        HashSet<String> seen = new HashSet<>();
+        for (ResolveInfo entry : resolved) {
+            if (entries.length() >= 500) break;
+            if (entry.activityInfo == null || !entry.activityInfo.exported || !entry.activityInfo.enabled || !entry.activityInfo.applicationInfo.enabled) continue;
+            String pkg = entry.activityInfo.packageName;
+            String cls = entry.activityInfo.name;
+            if (pkg == null || cls == null || !pkg.matches("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+") ||
+                    !cls.matches("[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*")) continue;
+            String component = new ComponentName(pkg, cls).flattenToString();
+            if (!seen.add(component)) continue;
+            String label = String.valueOf(entry.loadLabel(pm)).replaceAll("[\\p{Cntrl}]", " ");
+            if (label.length() > 160) label = label.substring(0, 160);
+            entries.put(new JSONObject().put("packageName", pkg).put("component", component).put("name", label));
+        }
+        return entries.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    private byte[] createAppDisplay() throws Exception {
+        if (appDisplays.size() >= 4) throw new IOException("At most four app windows are supported");
+        ImageReader reader = ImageReader.newInstance(displayWidth, displayHeight, PixelFormat.RGBA_8888, 2);
+        VirtualDisplay created = null;
+        try {
+            // Drain GPU buffers immediately; normal app windows never copy pixels on CPU.
+            reader.setOnImageAvailableListener(source -> {
+                try (Image image = source.acquireLatestImage()) {} catch (IllegalStateException closed) {}
+            }, new Handler(imageThread.getLooper()));
+            int flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY |
+                    CameraProbe.DISPLAY_SUPPORTS_TOUCH | CameraProbe.DISPLAY_TRUSTED | CameraProbe.DISPLAY_OWN_FOCUS;
+            created = (VirtualDisplay) call(device, "createVirtualDisplay",
+                    new Class[]{int.class, int.class, int.class, Surface.class, int.class, Executor.class, VirtualDisplay.Callback.class},
+                    displayWidth, displayHeight, displayDpi, reader.getSurface(), flags, callbacks, new VirtualDisplay.Callback() {});
+            int id = created.getDisplay().getDisplayId();
+            byte[] response = new JSONObject().put("id", id).put("width", displayWidth).put("height", displayHeight)
+                    .put("dpi", displayDpi).toString().getBytes(StandardCharsets.UTF_8);
+            appDisplays.put(id, new AppDisplay(created, reader));
+            return response;
+        } catch (Exception failure) {
+            if (created != null) created.release();
+            reader.close();
+            throw failure;
+        }
+    }
+
+    private void releaseAppDisplay(int id) throws IOException {
+        AppDisplay owned = appDisplays.get(id);
+        if (owned == null) throw new IOException("Display does not belong to this session");
+        owned.close();
+        appDisplays.remove(id);
+    }
+
     private static boolean isSupportedImage(byte[] bytes) {
         boolean jpeg = bytes.length >= 3 && (bytes[0] & 255) == 0xff && (bytes[1] & 255) == 0xd8 && (bytes[2] & 255) == 0xff;
         boolean png = bytes.length >= 8 && (bytes[0] & 255) == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4e && bytes[3] == 0x47 &&
@@ -356,6 +427,18 @@ public final class LiveCameraServer {
             } else if (command == 4) {
                 if (length != 0) { error(output, "Heartbeat must be empty"); continue; }
                 reply(output, true, new byte[0]);
+            } else if (command == 10 || command == 11 || command == 12) {
+                if ((command == 12 && length != Integer.BYTES) || (command != 12 && length != 0)) {
+                    error(output, "Invalid app command payload"); continue;
+                }
+                try {
+                    if (command == 10) reply(output, true, applications());
+                    else if (command == 11) reply(output, true, createAppDisplay());
+                    else {
+                        releaseAppDisplay(new DataInputStream(new ByteArrayInputStream(body)).readInt());
+                        reply(output, true, new byte[0]);
+                    }
+                } catch (Exception failure) { error(output, "App operation failed: " + failure.getClass().getSimpleName()); }
             } else if (command == 9) {
                 if (length != 0) { error(output, "Stop request must be empty"); continue; }
                 reply(output, true, new byte[0]);
@@ -410,6 +493,8 @@ public final class LiveCameraServer {
         if (server != null) try { server.close(); } catch (Exception e) { clean = false; log("cleanup_error", e); }
         try { revokeWechatCamera(); } catch (Exception e) { clean = false; log("cleanup_error", "virtual camera permission: " + e); }
         painter.shutdownNow();
+        for (AppDisplay owned : appDisplays.values()) try { owned.close(); } catch (Exception e) { clean = false; log("cleanup_error", e); }
+        appDisplays.clear();
         if (display != null) try { display.release(); } catch (Exception e) { clean = false; log("cleanup_error", e); }
         synchronized (frameLock) {
             if (latestDisplayImage != null) latestDisplayImage.close();

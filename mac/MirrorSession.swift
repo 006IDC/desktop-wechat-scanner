@@ -71,6 +71,87 @@ enum MirrorProtocol {
     }
 }
 
+/// One scheduled drain, bounded discrete work, and latest-only consecutive moves.
+/// Accepted DOWN/UP edges stay paired; discrete gestures wait for a live finger's UP.
+final class MirrorInputScheduler {
+    enum Event: Equatable {
+        case touch(UInt8, Double, Double)
+        case tap(Double, Double)
+        case swipe(Double, Double, Double, Double)
+        case key(Int)
+        var isSwipe: Bool { if case .swipe = self { return true }; return false }
+        var isMove: Bool { if case .touch(2, _, _) = self { return true }; return false }
+    }
+    struct Submission { let accepted: Bool; let wake: Bool; let overflow: Bool }
+    private let lock = NSLock()
+    private let capacity: Int
+    private var epoch = 0, enabled = false, draining = false, fingerDown = false
+    private var queue: [Event] = [], deferred: [Event] = []
+    init(capacity: Int = 64) { self.capacity = max(4, capacity) }
+    func reset(epoch: Int, enabled: Bool) {
+        lock.withLock {
+            self.epoch = epoch; self.enabled = enabled; draining = false; fingerDown = false
+            queue.removeAll(); deferred.removeAll()
+        }
+    }
+    func cancel(epoch: Int) {
+        lock.withLock {
+            guard self.epoch == epoch else { return }
+            enabled = false; draining = false; fingerDown = false
+            queue.removeAll(); deferred.removeAll()
+        }
+    }
+    var pendingCount: Int { lock.withLock { queue.count + deferred.count } }
+    func submit(_ event: Event, epoch: Int) -> Submission {
+        lock.withLock {
+            guard enabled, self.epoch == epoch else { return Submission(accepted: false, wake: false, overflow: false) }
+            func reject(_ overflow: Bool = false) -> Submission { Submission(accepted: false, wake: false, overflow: overflow) }
+            switch event {
+            case let .touch(action, _, _):
+                if action == 0 {
+                    guard !fingerDown else { return reject() }
+                    guard queue.count + deferred.count <= capacity - 2 else { return reject(true) }
+                    fingerDown = true; queue.append(event)
+                } else if action == 2 {
+                    guard fingerDown else { return reject() }
+                    if queue.last?.isMove == true { queue[queue.count - 1] = event }
+                    else {
+                        guard queue.count + deferred.count < capacity - 1 else { return reject() }
+                        queue.append(event)
+                    }
+                } else if action == 1 {
+                    guard fingerDown else { return reject() }
+                    fingerDown = false; queue.append(event)
+                    queue.append(contentsOf: deferred); deferred.removeAll()
+                } else { return reject() }
+            default:
+                if event.isSwipe {
+                    if let index = deferred.firstIndex(where: \.isSwipe) { deferred[index] = event; return Submission(accepted: true, wake: false, overflow: false) }
+                    if let index = queue.firstIndex(where: \.isSwipe) { queue.remove(at: index) }
+                }
+                guard queue.count + deferred.count < capacity - 1 else { return reject(true) }
+                if fingerDown { deferred.append(event) } else { queue.append(event) }
+            }
+            let wake = !draining && !queue.isEmpty
+            if wake { draining = true }
+            return Submission(accepted: true, wake: wake, overflow: false)
+        }
+    }
+    func next(epoch: Int) -> Event? {
+        lock.withLock {
+            guard enabled, self.epoch == epoch else { return nil }
+            guard !queue.isEmpty else { draining = false; return nil }
+            return queue.removeFirst()
+        }
+    }
+    func hasPending(epoch: Int) -> Bool { lock.withLock { enabled && self.epoch == epoch && !queue.isEmpty } }
+    func hasPendingTouch(epoch: Int) -> Bool {
+        lock.withLock {
+            enabled && self.epoch == epoch && queue.contains { if case .touch = $0 { return true }; return false }
+        }
+    }
+}
+
 private final class MirrorSocket {
     private(set) var fd: Int32 = -1
     init(port: UInt16) throws {
@@ -81,6 +162,7 @@ private final class MirrorSocket {
         setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&one,socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&one,socklen_t(MemoryLayout<Int32>.size))
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
@@ -185,6 +267,8 @@ private final class H264Decoder: @unchecked Sendable {
                             imageBufferAttributes:attributes as CFDictionary,
                             outputCallback:&record,decompressionSessionOut:&decoder)
         guard created == noErr else { throw ScanError("Mac 无法创建 H.264 硬件解码器。") }
+        // Public optional property; unsupported decoders retain their defaults.
+        if let decoder { _ = VTSessionSetProperty(decoder, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue) }
     }
     func feed(_ payload:Data, config:Bool) throws {
         let units = try MirrorProtocol.nalUnits(payload)
@@ -233,6 +317,7 @@ private final class H264Decoder: @unchecked Sendable {
 
 final class MirrorSession: @unchecked Sendable {
     private let lock=NSLock()
+    private let inputScheduler = MirrorInputScheduler()
     private let inputQueue=DispatchQueue(label:"com.idc006.mirror.input",qos:.userInitiated)
     private var generation=0, video:MirrorSocket?, control:MirrorSocket?, server:Process?
     private var adbURL:URL?, serial:String?, port:UInt16?, socketName:String?, remotePath:String?
@@ -246,6 +331,7 @@ final class MirrorSession: @unchecked Sendable {
         lock.lock();defer {lock.unlock()}
         guard !started && !stopping else {throw ScanError("手机镜像已经运行或正在关闭。")}
         started=true;generation += 1
+        inputScheduler.reset(epoch: generation, enabled: true)
         self.adbURL=adbURL;self.serial=serial
         failureCallback=onFailure
         let token=UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
@@ -380,39 +466,81 @@ final class MirrorSession: @unchecked Sendable {
             }
         }
     }
+    func touch(action: UInt8, x: Double, y: Double) {
+        guard [0, 1, 2].contains(action), x.isFinite, y.isFinite else { return }
+        enqueueInput(.touch(action, x, y))
+    }
     func tap(x:Double,y:Double) {
-        guard let epoch=currentEpoch() else {return}
-        inputQueue.async { [weak self] in
-            guard let self else {return}
-            do {
-                try self.sendTouch(0,x,y,epoch:epoch)
-                try self.sendTouch(1,x,y,epoch:epoch)
-            } catch {self.reportInputFailure(error,epoch:epoch)}
-        }
+        guard x.isFinite, y.isFinite else { return }
+        enqueueInput(.tap(x, y))
     }
     func swipe(x1:Double,y1:Double,x2:Double,y2:Double) {
-        guard let epoch=currentEpoch() else {return}
-        inputQueue.async { [weak self] in
-            guard let self else {return}
-            do {
-                try self.sendTouch(0,x1,y1,epoch:epoch)
-                for step in 1...8 {
-                    guard self.isCurrent(epoch) else {return}
-                    let t=Double(step)/8
-                    try self.sendTouch(2,x1+(x2-x1)*t,y1+(y2-y1)*t,epoch:epoch)
-                    Thread.sleep(forTimeInterval:0.012)
-                }
-                try self.sendTouch(1,x2,y2,epoch:epoch)
-            } catch {self.reportInputFailure(error,epoch:epoch)}
-        }
+        guard [x1, y1, x2, y2].allSatisfy(\.isFinite) else { return }
+        enqueueInput(.swipe(x1, y1, x2, y2))
     }
     func key(_ code:Int) {
-        guard let epoch=currentEpoch(),let down=MirrorProtocol.key(action:0,code:code),
-              let up=MirrorProtocol.key(action:1,code:code) else {return}
-        inputQueue.async { [weak self] in
-            guard let self else {return}
-            do {try self.send(down,epoch:epoch);try self.send(up,epoch:epoch)}
-            catch {self.reportInputFailure(error,epoch:epoch)}
+        guard MirrorProtocol.key(action: 0, code: code) != nil else { return }
+        enqueueInput(.key(code))
+    }
+    private func enqueueInput(_ event: MirrorInputScheduler.Event) {
+        guard let epoch = currentEpoch() else { return }
+        let result = inputScheduler.submit(event, epoch: epoch)
+        if result.overflow { reportInputFailure(ScanError("手机控制繁忙，请稍后重试。"), epoch: epoch) }
+        if result.wake { inputQueue.async { [weak self] in self?.drainInputs(epoch: epoch) } }
+    }
+    private func drainInputs(epoch: Int) {
+        guard isCurrent(epoch) else { return }
+        do {
+            while let event = inputScheduler.next(epoch: epoch) {
+                switch event {
+                case let .touch(action, x, y): try sendTouch(action, x, y, epoch: epoch)
+                case let .tap(x, y):
+                    try sendTouch(0, x, y, epoch: epoch); try sendTouch(1, x, y, epoch: epoch)
+                case let .key(code):
+                    if let down = MirrorProtocol.key(action: 0, code: code), let up = MirrorProtocol.key(action: 1, code: code) {
+                        try send(down, epoch: epoch); try send(up, epoch: epoch)
+                    }
+                case let .swipe(x1, y1, x2, y2):
+                    try sendTouch(0, x1, y1, epoch: epoch)
+                    scheduleSwipe(x1: x1, y1: y1, x2: x2, y2: y2, step: 1, epoch: epoch)
+                    return
+                }
+            }
+        } catch {
+            inputScheduler.cancel(epoch: epoch)
+            reportInputFailure(error, epoch: epoch)
+        }
+    }
+    private func scheduleSwipe(x1: Double, y1: Double, x2: Double, y2: Double, step: Int, epoch: Int) {
+        inputQueue.asyncAfter(deadline: .now() + .milliseconds(12)) { [weak self] in
+            guard let self, self.isCurrent(epoch) else { return }
+            do {
+                let t = Double(step - 1) / 8
+                if self.inputScheduler.hasPending(epoch: epoch) {
+                    // A live gesture never waits behind an old wheel animation.
+                    let progress: Double
+                    if self.inputScheduler.hasPendingTouch(epoch: epoch) { progress = t }
+                    else {
+                        // A stream of wheel events still makes progress while replacing its tail.
+                        progress = Double(step) / 8
+                        try self.sendTouch(2, x1 + (x2 - x1) * progress, y1 + (y2 - y1) * progress, epoch: epoch)
+                    }
+                    try self.sendTouch(1, x1 + (x2 - x1) * progress, y1 + (y2 - y1) * progress, epoch: epoch)
+                    self.drainInputs(epoch: epoch)
+                    return
+                }
+                let next = Double(step) / 8
+                try self.sendTouch(2, x1 + (x2 - x1) * next, y1 + (y2 - y1) * next, epoch: epoch)
+                if step == 8 {
+                    try self.sendTouch(1, x2, y2, epoch: epoch)
+                    self.drainInputs(epoch: epoch)
+                } else {
+                    self.scheduleSwipe(x1: x1, y1: y1, x2: x2, y2: y2, step: step + 1, epoch: epoch)
+                }
+            } catch {
+                self.inputScheduler.cancel(epoch: epoch)
+                self.reportInputFailure(error, epoch: epoch)
+            }
         }
     }
     private func currentEpoch()->Int? {
@@ -444,6 +572,7 @@ final class MirrorSession: @unchecked Sendable {
                     return nil
                 }
                 stopping=true;generation += 1;started=false
+                inputScheduler.reset(epoch: generation, enabled: false)
                 return (video,control,preparing)
             }
             guard let (video,control,preparing)=state else {return}

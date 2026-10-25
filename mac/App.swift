@@ -13,20 +13,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var failure:String?
         var incarnation=0
     }
-    private let control=ControlWindowController(), capture=DesktopCapture()
+    private let mainControl=ControlWindowController(), capture=DesktopCapture()
+    private var wechatWindow:ControlWindowController?
+    private var control:ControlWindowController {wechatWindow ?? mainControl}
+    private var connectionWindow:ConnectionWindowController?
+    private var applicationLibrary:ApplicationLibrary?
+    private var detachedApplications:DetachedApplications?
+    private var catalogTask:Task<Void,Never>?
+    private var physicalFrame:CVPixelBuffer?
+    private var nextCameraGeometry=0.0
     private let physicalMirror=MirrorRoute(), scannerMirror=MirrorRoute()
     private var activeRoute:MirrorRoute {mirrorDisplay == nil || mirrorDisplay == 0 ? physicalMirror:scannerMirror}
     private var mirror:MirrorSession {activeRoute.session}
     private var phoneSession:PhoneSession?
     private var phone:PhoneSession { phoneSession! } // Set before any connected operation.
     private var adbURL:URL?
+    private var wirelessEndpoint:String?
     private var adbSettingsItem:NSMenuItem?
     private var connected=false, busy=false, paused=true, stopping=false
     private var cameraActive=false, cameraSuppressed=false, mode=Mode.phone
     private var cameraPump:CameraPumpMailbox?,cameraFramesBase=0
     private var nextCameraDiagnostic=0.0
     private var connectionTask:Task<Void,Never>?, operationTask:Task<Void,Never>?, loop:Task<Void,Never>?, cameraLoop:Task<Void,Never>?
-    private var currentStatus="未连接", currentDetail="用 USB 连接并解锁手机，然后点击左上角连接。"
+    private var currentStatus="未连接", currentDetail="点击连接，选择 USB 手机或设置无线连接。"
     private var model="", scanGeneration=1, mirrorGeneration=0
     private var relaunchAfterExit=false, lastUserInput=Date.distantPast
     private var framesSent=0, previewsReceived=0, cameraFPS=0.0
@@ -46,14 +55,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         control.onScan={ [weak self] in self?.enterWechat(scan:true) }
         control.onPause={ [weak self] in self?.togglePause() }
         control.onBack={ [weak self] in self?.back() }
-        control.onHome={ [weak self] in self?.home() }
+        control.onHome={ [weak self] in self?.physicalMirror.session.key(3) }
         control.onWechat={ [weak self] in self?.enterWechat(scan:false) }
+        control.onApplications={ [weak self] in self?.showApplications() }
         control.onPermissionSettings={ [weak self] in self?.permissionSettings() }
         control.onRelaunch={ [weak self] in self?.relaunch() }
-        control.onTap={ [weak self] x,y in self?.tap(x,y) }
+        control.onTouch={ [weak self] action,x,y in
+            guard let self,self.connected,!self.stopping else{return}
+            self.lastUserInput=Date();self.physicalMirror.session.touch(action:action,x:x,y:y)
+        }
+        control.onTap={ [weak self] x,y in
+            guard let self,self.connected,!self.stopping else{return}
+            self.lastUserInput=Date();self.physicalMirror.session.tap(x:x,y:y)
+        }
         control.onSwipe={ [weak self] x1,y1,x2,y2 in
             guard let self,self.connected,!self.busy else{return}
-            self.lastUserInput=Date();self.mirror.swipe(x1:x1,y1:y1,x2:x2,y2:y2)
+            self.lastUserInput=Date();self.physicalMirror.session.swipe(x1:x1,y1:y1,x2:x2,y2:y2)
         }
         control.showWindow(nil);refresh();writeDiagnosticState()
         NSApp.activate(ignoringOtherApps:true)
@@ -74,7 +91,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         actions.addItem(.separator())
         actions.addItem(withTitle:"关闭窗口",action:#selector(NSWindow.performClose(_:)),keyEquivalent:"w")
-        item.submenu=actions;menu.addItem(item);NSApp.mainMenu=menu
+        actions.addItem(withTitle:"手机应用…",action:#selector(applicationsAction),keyEquivalent:"l").target=self
+        item.submenu=actions;menu.addItem(item)
+        let windowItem=NSMenuItem(),windows=NSMenu(title:"窗口")
+        windows.addItem(withTitle:"最小化",action:#selector(NSWindow.performMiniaturize(_:)),keyEquivalent:"m")
+        windows.addItem(withTitle:"手机镜像",action:#selector(showMainWindow),keyEquivalent:"0").target=self
+        windowItem.submenu=windows;menu.addItem(windowItem);NSApp.windowsMenu=windows;NSApp.mainMenu=menu
     }
     @objc private func about(){NSApp.orderFrontStandardAboutPanel(options:[.applicationName:"桌面微信扫码",.applicationVersion:"\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "未知"))",.credits:NSAttributedString(string:"Android 手机镜像与桌面扫码\n镜像采用 scrcpy 5.0.1（Apache 2.0）与 Mac 原生解码。")])}
     /// Selection stays on the main actor; executable validation runs off it.
@@ -107,13 +129,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         throw CancellationError()
     }
     private func resolveADB() async throws -> URL? {
+        if let adbURL {return try await ADBConfiguration.validateAsync(adbURL)}
+        if let bundled=Bundle.main.resourceURL?.appendingPathComponent("adb/bin/adb"),FileManager.default.isExecutableFile(atPath:bundled.path) {
+            return try await ADBConfiguration.validateAsync(bundled)
+        }
         if let selected=try await ADBConfiguration.discover(savedPath:UserDefaults.standard.string(forKey:ADBConfiguration.defaultsKey)) {
             UserDefaults.standard.set(selected.path,forKey:ADBConfiguration.defaultsKey)
             return selected
         }
         try Task.checkCancellation()
         let alert=NSAlert();alert.messageText="需要 Google Platform-Tools"
-        alert.informativeText="此 App 不内置 ADB。请从 Google 官方网站下载适用于 Mac 的 Platform-Tools，自行阅读并接受其许可，解压后选择其中的 adb 文件。已有 Platform-Tools 可直接选择 adb。"
+        alert.informativeText="此构建缺少随包 ADB。请重新安装完整发行包，或选择已有的 adb。也可以从 Google 官方网站下载 Platform-Tools，阅读并接受其许可后使用。"
         alert.addButton(withTitle:"选择 adb…");alert.addButton(withTitle:"官方下载");alert.addButton(withTitle:"取消")
         let answer=alert.runModal()
         try Task.checkCancellation()
@@ -137,6 +163,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } catch is CancellationError {} catch {status("ADB 设置未完成",error.localizedDescription)}
         }
     }
+    @objc private func applicationsAction(){showApplications()}
+    @objc private func showMainWindow(){mainControl.window?.deminiaturize(nil);mainControl.showWindow(nil);mainControl.window?.makeKeyAndOrderFront(nil)}
     @objc private func homeAction(){home()}
     @objc private func wechatAction(){enterWechat(scan:false)}
     @objc private func scanAction(){enterWechat(scan:true)}
@@ -151,6 +179,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Keep the complete, interactive WeChat scanner. The transparent-only
         // experiment hides its controls and does not match the reference video.
         control.setLocalScanPreview(false)
+        if wechatWindow != nil {
+            mainControl.update(status:connected ? "手机镜像 · \(model)" : currentStatus,detail:"通过应用列表拖出应用，分别在 Mac 窗口里使用。",connected:connected,busy:stopping,paused:true)
+        }
         control.setMode(cameraActive ? "桌面相机" : (mode == .phone ? "手机镜像" : "微信"))
     }
     private func writeDiagnosticState(){
@@ -161,21 +192,56 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func connect(){
         guard !connected && !busy else{return}
-        busy=true;status("正在连接","请解锁手机，并允许 USB 调试。")
+        busy=true;status("选择手机","正在准备连接…")
+        connectionTask=Task { [weak self] in
+            guard let self else{return}
+            do {
+                guard let selected=try await resolveADB() else {busy=false;status("未连接","可以重新选择手机连接。");return}
+                try Task.checkCancellation()
+                let chooser=ConnectionWindowController(adbURL:selected) { [weak self] device in
+                    guard let self else{return}
+                    let window=self.connectionWindow
+                    self.status("正在连接","正在收束连接设置…")
+                    self.connectionTask=Task {
+                        let clean=await window?.waitForCleanup() ?? true
+                        guard !self.stopping,!Task.isCancelled else{return}
+                        self.connectionWindow=nil
+                        if clean {self.connectDevice(device,adb:selected)}
+                        else {
+                            if device.transport == .wireless,let endpoint=try? ADBEndpoint(device.serial).value {
+                                try? await ADBConnectionManager(adbURL:selected).disconnect(endpoint:endpoint)
+                            }
+                            self.busy=false;self.status("无线连接未完全清理","请在手机关闭无线调试，再重新连接。配对信任不会自动撤销。")
+                        }
+                    }
+                }
+                chooser.onCancel={ [weak self] in
+                    guard let self,!self.stopping else{return}
+                    let window=self.connectionWindow
+                    self.connectionTask=Task {
+                        let clean=await window?.waitForCleanup() ?? true
+                        guard !self.stopping else{return}
+                        self.connectionWindow=nil;self.busy=false
+                        self.status(clean ? "未连接":"无线连接未完全清理",clean ? "USB 和无线连接都可以在连接窗口设置。":"请在手机关闭无线调试，再重新连接。")
+                    }
+                }
+                connectionWindow=chooser;chooser.show()
+            } catch is CancellationError {} catch {busy=false;status("连接未完成",error.localizedDescription)}
+        }
+    }
+    private func connectDevice(_ device:ADBDevice,adb selected:URL){
+        guard !connected,!stopping else{return}
+        busy=true;status("正在连接","请保持手机解锁。")
         connectionTask=Task { [self] in
             do {
-                let resolved=try await resolveADB()
-                try Task.checkCancellation()
-                guard let selected=resolved else {
-                    busy=false;status("未连接","请下载并解压 Google Platform-Tools，然后再点连接选择 adb。已有 Platform-Tools 可再次连接后直接选择 adb。");return
-                }
-                try Task.checkCancellation()
+                wirelessEndpoint=device.transport == .wireless ? (try? ADBEndpoint(device.serial).value):nil
                 adbURL=selected;phoneSession=PhoneSession(resources:Bundle.main.resourceURL!,adbURL:selected)
-                model=try await phone.connect(openWechatOnConnect:false){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
+                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
                 try Task.checkCancellation();connected=true;mode = .phone;mirrorGeneration+=1
                 try await showMirror(display:0)
                 try Task.checkCancellation();busy=false
                 status("已连接 · \(model)","直接点击或滑动手机画面；点微信后可在这里使用桌面扫码。")
+                detachedApplications=DetachedApplications(phone:phone,adb:selected,server:Bundle.main.resourceURL!.appendingPathComponent("scrcpy-server"))
                 startLoop()
                 // The empty secondary display is warmed while the user operates the
                 // normal phone. Its frames never replace the active mirror.
@@ -202,7 +268,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if previewsReceived%60==1 {writeDiagnosticState()}
     }
     @objc private func presentMirrorFrame(){
-        updateCameraTick()
+        updateCameraTick();detachedApplications?.present()
+        if wechatWindow != nil,let frame=physicalMirror.frames.takeLatest(),frame.generation==physicalMirror.incarnation {
+            physicalFrame=frame.pixelBuffer;mainControl.setPhonePixelBuffer(frame.pixelBuffer)
+        }
         guard connected,!stopping,mirrorDisplay != nil,let frame=activeRoute.frames.takeLatest(),frame.generation==activeRoute.incarnation else{return}
         present(frame)
     }
@@ -255,7 +324,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if let failure=route.failure {throw ScanError(failure)}
             if let frame=route.frames.takeLatest(),frame.generation==route.incarnation,
                after == nil || frame.receivedAt >= after! {
-                control.setPhonePixelBuffer(nil)
                 mirrorDisplay=display;present(frame);return
             }
             try await Task.sleep(nanoseconds:16_000_000)
@@ -276,101 +344,101 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         await capture.stop()
         try? await phone.clear(epoch:scanGeneration)
     }
-    private func enterWechat(scan:Bool){
-        guard connected && !busy && !stopping else{return}
-        busy=true;cameraSuppressed=false;operationTask?.cancel()
-        status("正在打开微信","正在打开手机上的微信…")
-        operationTask=Task {
-            do {
-                await clearCamera()
-                if mode == .wechat {try await phone.moveWechat(toVirtualDisplay:false)}
-                try await phone.openWechat(onVirtualDisplay:false);try Task.checkCancellation()
-                mode = .phone;try await showMirror(display:0)
-                try Task.checkCancellation()
-                if scan {
-                    let opened=try await openScanner();try Task.checkCancellation()
-                    busy=false
-                    if opened {activateDesktopScanner()}
-                    else {status("微信","在微信中点“＋ → 扫一扫”，桌面相机会自动启用。")}
-                } else {
-                    busy=false;lastUserInput=Date()
-                    status("微信","点“＋ → 扫一扫”，然后拖动窗口覆盖电脑二维码。")
-                }
-            } catch {
-                guard !stopping && connected else{return}
-                status("微信未打开",error.localizedDescription);disconnect(preserveError:true)
-            }
+    private func showApplications(){
+        guard connected,!stopping else{return}
+        if let library=applicationLibrary {library.showWindow(nil);library.window?.makeKeyAndOrderFront(nil);return}
+        let library=ApplicationLibrary();applicationLibrary=library
+        library.onOpen={ [weak self] app,point in
+            guard let self,self.connected,!self.stopping else{return}
+            if app.packageName=="com.tencent.mm" {self.enterWechat(scan:false,at:point)}
+            else {self.detachedApplications?.open(app,at:point)}
+        }
+        library.showWindow(nil)
+        catalogTask=Task { [weak self,weak library] in
+            guard let self else{return}
+            do {let apps=try await phone.applications();try Task.checkCancellation();library?.setApplications(apps)}
+            catch {if !Task.isCancelled {library?.showError(error.localizedDescription)}}
         }
     }
-    // Keep every ordinary WeChat screen on the physical display. Moving its
-    // launcher to a secondary display produces duplicate headers on this phone.
-    private func activateDesktopScanner(){
+    private func configureWechatWindow(at point:NSPoint?){
+        if let window=wechatWindow?.window {window.deminiaturize(nil);window.makeKeyAndOrderFront(nil);return}
+        let window=ControlWindowController(title:"微信 · 手机应用",standalone:true,scanner:true)
+        wechatWindow=window;window.window?.delegate=self
+        window.onTouch={ [weak self] action,x,y in
+            guard let self,self.connected,!self.stopping else{return}
+            self.lastUserInput=Date();self.scannerMirror.session.touch(action:action,x:x,y:y)
+        }
+        window.onTap={ [weak self] x,y in self?.tap(x,y) }
+        window.onSwipe={ [weak self] x1,y1,x2,y2 in
+            guard let self,self.connected,!self.busy else{return}
+            self.lastUserInput=Date();self.scannerMirror.session.swipe(x1:x1,y1:y1,x2:x2,y2:y2)
+        }
+        window.onBack={ [weak self] in self?.back() }
+        window.onScan={ [weak self] in self?.enterWechat(scan:true) }
+        window.onPause={ [weak self] in self?.togglePause() }
+        window.onPermissionSettings={ [weak self] in self?.permissionSettings() }
+        window.onRelaunch={ [weak self] in self?.relaunch() }
+        if let native=window.window {AppWindowMotion.reveal(native,from:point)}
+    }
+    private func enterWechat(scan:Bool,at point:NSPoint?=nil){
         guard connected && !busy && !stopping else{return}
-        busy=true;cameraSuppressed=false
-        status("正在打开扫一扫","正在准备桌面扫码…")
+        let alreadyOpen=wechatWindow != nil && mode == .wechat && mirrorDisplay != nil
+        configureWechatWindow(at:point)
+        busy=true;cameraSuppressed=false;operationTask?.cancel()
+        status("正在打开微信","微信会保留在这个独立窗口里。")
         operationTask=Task {
-            var moved=false
             do {
-                let switching=ProcessInfo.processInfo.systemUptime
                 let endpoint=try await phone.mirrorEndpoint()
                 try await prepareMirror(display:endpoint.display)
-                let moving=ProcessInfo.processInfo.systemUptime
-                try await phone.moveWechat(toVirtualDisplay:true);moved=true;mode = .wechat
-                try Task.checkCancellation()
-                try await showMirror(display:endpoint.display,after:moving)
-                scannerSwitchMilliseconds=(ProcessInfo.processInfo.systemUptime-switching)*1000
-                busy=false;startCamera()
-            } catch {
-                guard connected && !stopping && !Task.isCancelled else{return}
-                let reason=error.localizedDescription
-                if moved {
-                    do {
-                        try await phone.moveWechat(toVirtualDisplay:false)
-                        try Task.checkCancellation();mode = .phone;try await showMirror(display:0)
-                    } catch {
-                        guard connected && !stopping && !Task.isCancelled else{return}
-                        status("扫码切换未完成","恢复手机镜像失败，正在清理连接。"+error.localizedDescription)
-                        disconnect(preserveError:true);return
-                    }
+                if !alreadyOpen {
+                    let began=ProcessInfo.processInfo.systemUptime
+                    let apps=try await phone.applications()
+                    guard let wechat=apps.first(where:{$0.packageName=="com.tencent.mm"}) else {throw ScanError("手机中没有找到微信入口。")}
+                    try await phone.launchApplication(wechat,on:endpoint.display)
+                    try Task.checkCancellation();mode = .wechat
+                    try await showMirror(display:endpoint.display,after:began)
+                    scannerSwitchMilliseconds=(ProcessInfo.processInfo.systemUptime-began)*1000
                 }
-                busy=false;cameraSuppressed=true
-                status("桌面相机未开启",reason)
+                try Task.checkCancellation()
+                if scan {
+                    let opened=try await openScanner();try Task.checkCancellation();busy=false
+                    if opened {startCamera()}
+                    else {status("微信","在微信中点“＋ → 扫一扫”，桌面相机会自动启用。")}
+                } else {busy=false;status("微信","独立窗口已打开；扫一扫会使用窗口后方的桌面画面。")}
+            } catch {
+                guard !stopping && connected && !Task.isCancelled else{return}
+                busy=false;status("微信未打开",error.localizedDescription)
+                // Keep the window and ownership available for retry or safe close.
             }
         }
     }
+    private func activateDesktopScanner(){
+        if wechatWindow == nil {enterWechat(scan:true)}
+        else {startCamera()}
+    }
     private func returnToPhone(){
-        guard connected && !busy && !stopping else{return}
-        busy=true
+        guard connected && !stopping else{return}
+        busy=true;let opening=operationTask;opening?.cancel()
         operationTask=Task {
+            await opening?.value
             do {
-                await clearCamera();try await phone.moveWechat(toVirtualDisplay:false)
-                try Task.checkCancellation();mode = .phone;try await showMirror(display:0)
-                cameraSuppressed=false;busy=false;lastUserInput = .distantPast
-                status("微信","已回到真实手机镜像。扫码结果由你继续操作。")
+                await clearCamera();try await phone.restoreScannerApplications();try Task.checkCancellation()
+                wechatWindow?.window?.orderOut(nil);wechatWindow=nil;mode = .phone;mirrorDisplay=0
+                if let physicalFrame {latestPhoneFrame=physicalFrame;mainControl.setPhonePixelBuffer(physicalFrame)}
+                cameraSuppressed=false;busy=false;status("手机镜像","微信已移回手机。")
             } catch {
-                guard connected && !stopping else{return}
-                status("返回手机未完成",error.localizedDescription);disconnect(preserveError:true)
+                guard connected && !stopping && !Task.isCancelled else{return}
+                busy=false;status("返回手机未完成",error.localizedDescription)
             }
         }
     }
     private func home(){
-        guard connected && !busy && !stopping else{return}
-        busy=true;operationTask?.cancel()
-        operationTask=Task {
-            do {
-                await clearCamera();cameraSuppressed=false
-                if mode == .wechat {try await phone.moveWechat(toVirtualDisplay:false)}
-                try await phone.mainHome();try Task.checkCancellation()
-                mode = .phone;try await showMirror(display:0)
-                busy=false;status("手机镜像","点击手机中的应用；微信桌面扫码会在同一个窗口打开。")
-            } catch {
-                guard !stopping && connected else{return}
-                status("返回主屏幕未完成",error.localizedDescription);disconnect(preserveError:true)
-            }
-        }
+        guard connected && !stopping else{return}
+        physicalMirror.session.key(3);showMainWindow()
     }
     private func startCamera(){
         guard connected && !busy && !stopping && !cameraSuppressed else{return}
+        guard control.window?.isVisible == true,control.window?.isMiniaturized == false else{return}
         busy=true;operationTask?.cancel()
         operationTask=Task {
             do {
@@ -378,6 +446,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 status("准备桌面相机","正在读取当前窗口后方的桌面画面…")
                 try await capture.prepare();try Task.checkCancellation()
                 guard connected && mode == .wechat && generation==scanGeneration else{return}
+                guard control.window?.isVisible == true,control.window?.isMiniaturized == false else {
+                    await capture.stop();busy=false;cameraSuppressed=true;status("桌面相机已暂停","恢复窗口后点扫码继续。");return
+                }
                 cameraActive=true;paused=false;busy=false
                 startCameraLoop()
                 status("拖动窗口扫码","微信扫一扫正在读取窗口后方的桌面；拖动标题栏对准二维码，识别结果由你继续操作。")
@@ -406,8 +477,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             let scanning=component?.hasPrefix("com.tencent.mm/")==true && component?.lowercased().contains("scanner")==true
                             if scanning && !cameraActive && !cameraSuppressed {startCamera()}
                             else if !scanning {
-                                if component?.hasPrefix("com.tencent.mm/")==true {returnToPhone()}
-                                else if cameraActive {await clearCamera();cameraSuppressed=true;status("桌面相机已停止","已离开微信扫一扫。")}
+                                if cameraActive {await clearCamera();cameraSuppressed=false;status("微信","已离开扫一扫；结果保留在此窗口中。")}
                             }
                         } else if Date().timeIntervalSince(lastUserInput)<12 {
                             let component=try await phone.foreground(onVirtualDisplay:false)
@@ -416,7 +486,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
                         failures=0
                     } catch {failures+=1}
-                    nextActivity=Date().addingTimeInterval(0.7)
+                    nextActivity=Date().addingTimeInterval(mode == .wechat ? 0.25:0.7)
                 }
                 if Date()>=nextHeartbeat && !Task.isCancelled {
                     do {try await phone.heartbeat();failures=0} catch {failures+=1}
@@ -430,10 +500,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
     }
+    func windowWillMiniaturize(_ notification:Notification) {
+        if notification.object as? NSWindow === wechatWindow?.window {suspendHiddenCamera()}
+    }
+    private func suspendHiddenCamera(){
+        guard connected,!stopping,!busy,cameraActive else{return}
+        busy=true;cameraSuppressed=true;cameraPump?.stop();refresh()
+        operationTask=Task {
+            await clearCamera()
+            guard connected,!stopping,!Task.isCancelled else{return}
+            busy=false;status("桌面相机已暂停","窗口已收起；恢复窗口后点扫码继续。")
+        }
+    }
     private func updateCameraTick(){
         guard let pump=cameraPump,cameraActive,!paused else{return}
-        do {pump.publish(try DesktopCaptureTarget.current(for:control.desktopCaptureRect))}
-        catch {pump.fail(error)}
+        guard control.window?.isVisible == true,control.window?.isMiniaturized == false else {
+            suspendHiddenCamera();return
+        }
+        let tick=ProcessInfo.processInfo.systemUptime
+        if tick>=nextCameraGeometry {
+            nextCameraGeometry=tick+1.0/30
+            do {pump.publish(try DesktopCaptureTarget.current(for:control.desktopCaptureRect))}
+            catch {pump.fail(error)}
+        }
         let snapshot=pump.snapshot(),stats=snapshot.statistics
         framesSent=cameraFramesBase+stats.sent;cameraFPS=stats.fps
         captureMilliseconds=stats.captureMilliseconds;transferMilliseconds=stats.transferMilliseconds
@@ -578,30 +667,48 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         helper.arguments=["-c","while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"$2\"","scanner-relaunch",String(ProcessInfo.processInfo.processIdentifier),Bundle.main.bundleURL.path]
         helper.standardOutput=FileHandle.nullDevice;helper.standardError=FileHandle.nullDevice;try? helper.run()
     }
+    private func disconnectWireless() async -> String {
+        guard let endpoint=wirelessEndpoint,let adbURL else{return ""}
+        do {try await ADBConnectionManager(adbURL:adbURL).disconnect(endpoint:endpoint);wirelessEndpoint=nil;return ""}
+        catch {return "应用会话已关闭，但无线调试连接未断开。可在手机关闭无线调试。"}
+    }
     private func disconnect(preserveError:Bool=false){
         guard !stopping else{return}
         stopping=true;busy=true;paused=true;cameraActive=false;scanGeneration+=1;mirrorGeneration+=1;physicalMirror.frames.stop();scannerMirror.frames.stop()
-        connectionTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;cameraLoop?.cancel()
+        let chooser=connectionWindow;chooser?.close();connectionWindow=nil
+        connectionTask?.cancel();catalogTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;cameraLoop?.cancel()
         refresh()
         if !preserveError {status("正在断开","正在结束手机镜像并清理临时连接…")}
         Task {
-            await capture.stop();await stopMirrors()
-            let problem=await phoneSession?.disconnect() ?? ""
+            let chooserClean=await chooser?.waitForCleanup() ?? true
+            await capture.stop();await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
+            var problem=await phoneSession?.disconnect() ?? ""
+            if problem.isEmpty {problem=await disconnectWireless()}
+            if !chooserClean {problem += " 部分未选中的无线连接未清理，请在手机关闭无线调试。"}
+            wechatWindow?.window?.orderOut(nil);wechatWindow=nil;applicationLibrary?.close();applicationLibrary=nil
             connected=false;busy=false;stopping=false;mirrorDisplay=nil;latestPhoneFrame=nil;control.setPhoneImage(nil)
             if !problem.isEmpty {status("需要重新连接以清理",problem)}
             else if !preserveError {status("已断开","可以拔线，下次直接连接即可。")}
             else {refresh();writeDiagnosticState()}
         }
     }
-    func windowShouldClose(_ sender:NSWindow)->Bool {NSApp.terminate(nil);return false}
+    func windowShouldClose(_ sender:NSWindow)->Bool {
+        if sender === wechatWindow?.window {returnToPhone();return false}
+        sender.orderOut(nil);return false
+    }
+    func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool)->Bool {showMainWindow();return true}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
-        stopping=true;connectionTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;cameraLoop?.cancel()
+        stopping=true;let chooser=connectionWindow;chooser?.close();connectionWindow=nil
+        connectionTask?.cancel();catalogTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;cameraLoop?.cancel()
         paused=true;cameraActive=false;scanGeneration+=1;mirrorGeneration+=1;busy=true
         physicalMirror.frames.stop();scannerMirror.frames.stop();previewTimer?.invalidate();previewTimer=nil
         status("正在退出","正在停止镜像并清理手机临时连接…")
         Task {
-            await capture.stop();await stopMirrors()
-            let problem=await phoneSession?.disconnect() ?? ""
+            let chooserClean=await chooser?.waitForCleanup() ?? true
+            await capture.stop();await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
+            var problem=await phoneSession?.disconnect() ?? ""
+            if problem.isEmpty {problem=await disconnectWireless()}
+            if !chooserClean {problem += " 部分未选中的无线连接未清理，请在手机关闭无线调试。"}
             if !problem.isEmpty {
                 let alert=NSAlert();alert.messageText="连接已停止，手机清理待恢复";alert.informativeText=problem
                 alert.addButton(withTitle:"退出，下次连接时清理");alert.runModal()

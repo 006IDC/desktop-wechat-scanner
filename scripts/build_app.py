@@ -93,6 +93,7 @@ def install(staged: Path, target: Path, bundle_id: str) -> None:
                 backup.rename(target)
             raise
 
+subprocess.run(['python3',str(ROOT/'scripts/bootstrap_adb.py')],check=True)
 subprocess.run(['python3',str(ROOT/'scripts/build.py')],check=True)
 subprocess.run(['python3',str(ROOT/'scripts/bootstrap_mirror.py')],check=True)
 icon_tool=ROOT/'build/generate-icon'
@@ -109,8 +110,8 @@ info={
     'CFBundleIdentifier':'com.idc006.DesktopWeChatScanner',
     'CFBundleName':'桌面微信扫码','CFBundleDisplayName':'桌面微信扫码',
     'CFBundleExecutable':'DesktopWeChatScanner','CFBundlePackageType':'APPL',
-    'CFBundleShortVersionString':'0.3.2','CFBundleVersion':'11',
-    'DesktopScannerRelease':'0.3.2-preview.1',
+    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'12',
+    'DesktopScannerRelease':'0.4.0-preview.1',
     'CFBundleIconFile':'AppIcon.icns',
     'LSMinimumSystemVersion':'14.4','NSHighResolutionCapable':True,
     'NSScreenCaptureUsageDescription':'将手机镜像窗口后方的桌面画面送给你的手机微信扫一扫。',
@@ -122,8 +123,10 @@ for source,dest in [('build/camera-probe.jar','camera-probe.jar'),('.tools/scrcp
 shutil.copy2(ROOT/'build/AppIcon.icns',resources/'AppIcon.icns')
 for name in ('LICENSE','NOTICE','THIRD_PARTY.md'):
     shutil.copy2(ROOT/name,resources/name)
+# The bundle is built from pinned open source, with its sources and licenses.
 if (resources/'adb').exists():
-    raise RuntimeError('Public build must not contain a bundled adb')
+    shutil.rmtree(resources/'adb')
+shutil.copytree(ROOT/'.local/adb-bundle',resources/'adb',copy_function=copy_without_metadata)
 (resources/'SOURCE-REVISION.txt').write_text(revision+'\n')
 subprocess.run(['swiftc','-swift-version','5','-O','-target','arm64-apple-macos14.4',
                 '-file-prefix-map',str(ROOT)+'=/source/desktop-wechat-scanner',
