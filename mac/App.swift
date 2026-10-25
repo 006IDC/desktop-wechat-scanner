@@ -28,6 +28,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var phoneSession:PhoneSession?
     private var phone:PhoneSession { phoneSession! } // Set before any connected operation.
     private var adbURL:URL?
+    private var adbServerSocket:String?
+    private var wirelessServer:ADBManagedServer?
     private var wirelessEndpoint:String?
     private var adbSettingsItem:NSMenuItem?
     private var connected=false, busy=false, paused=true, stopping=false
@@ -204,11 +206,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self.status("正在连接","正在收束连接设置…")
                     self.connectionTask=Task {
                         let clean=await window?.waitForCleanup() ?? true
-                        guard !self.stopping,!Task.isCancelled else{return}
+                        let ownedServer=window?.takeSelectedWirelessServer()
+                        guard !self.stopping,!Task.isCancelled else{await ownedServer?.stop();return}
                         self.connectionWindow=nil
-                        if clean {self.connectDevice(device,adb:selected)}
+                        if clean {self.wirelessServer=ownedServer;self.connectDevice(device,adb:selected)}
                         else {
-                            if device.transport == .wireless,let endpoint=try? ADBEndpoint(device.serial).value {
+                            await ownedServer?.stop()
+                            if device.serverSocket == nil,device.transport == .wireless,let endpoint=try? ADBEndpoint(device.serial).value {
                                 try? await ADBConnectionManager(adbURL:selected).disconnect(endpoint:endpoint)
                             }
                             self.busy=false;self.status("无线连接未完全清理","请在手机关闭无线调试，再重新连接。配对信任不会自动撤销。")
@@ -234,14 +238,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         busy=true;status("正在连接","请保持手机解锁。")
         connectionTask=Task { [self] in
             do {
+                guard device.serverSocket == nil || wirelessServer?.socket == device.serverSocket else {throw ScanError("无线服务已结束，请重新建立连接。")}
+                adbServerSocket=device.serverSocket
                 wirelessEndpoint=device.transport == .wireless ? (try? ADBEndpoint(device.serial).value):nil
-                adbURL=selected;phoneSession=PhoneSession(resources:Bundle.main.resourceURL!,adbURL:selected)
+                adbURL=selected;phoneSession=PhoneSession(resources:Bundle.main.resourceURL!,adbURL:selected,serverSocket:adbServerSocket)
                 model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
                 try Task.checkCancellation();connected=true;mode = .phone;mirrorGeneration+=1
                 try await showMirror(display:0)
                 try Task.checkCancellation();busy=false
                 status("已连接 · \(model)","直接点击或滑动手机画面；点微信后可在这里使用桌面扫码。")
-                detachedApplications=DetachedApplications(phone:phone,adb:selected,server:Bundle.main.resourceURL!.appendingPathComponent("scrcpy-server"))
+                detachedApplications=DetachedApplications(phone:phone,adb:selected,server:Bundle.main.resourceURL!.appendingPathComponent("scrcpy-server"),serverSocket:adbServerSocket)
                 startLoop()
                 // The empty secondary display is warmed while the user operates the
                 // normal phone. Its frames never replace the active mirror.
@@ -292,7 +298,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             try Task.checkCancellation()
             guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
             guard let adbURL else {throw ScanError("请先设置 ADB。")}
-            try await route.session.startVideo(adbURL:adbURL,serverURL:resources.appendingPathComponent("scrcpy-server"),serial:endpoint.serial,displayID:display,onFrame:{ [frames=route.frames] pixels in
+            try await route.session.startVideo(adbURL:adbURL,serverURL:resources.appendingPathComponent("scrcpy-server"),serial:endpoint.serial,displayID:display,serverSocket:adbServerSocket,onFrame:{ [frames=route.frames] pixels in
                 frames.publish(pixels,generation:incarnation)
             },onFailure:{ [weak self,weak route] message in
                 Task { @MainActor in
@@ -668,9 +674,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         helper.standardOutput=FileHandle.nullDevice;helper.standardError=FileHandle.nullDevice;try? helper.run()
     }
     private func disconnectWireless() async -> String {
-        guard let endpoint=wirelessEndpoint,let adbURL else{return ""}
-        do {try await ADBConnectionManager(adbURL:adbURL).disconnect(endpoint:endpoint);wirelessEndpoint=nil;return ""}
-        catch {return "应用会话已关闭，但无线调试连接未断开。可在手机关闭无线调试。"}
+        var problem=""
+        if let endpoint=wirelessEndpoint,let adbURL {
+            do {try await ADBConnectionManager(adbURL:adbURL,serverSocket:adbServerSocket).disconnect(endpoint:endpoint)}
+            catch {problem="应用会话已关闭，但无线调试连接未断开。可在手机关闭无线调试。"}
+        }
+        if let server=wirelessServer {
+            await server.stop();wirelessServer=nil;problem=""
+        }
+        wirelessEndpoint=nil;adbServerSocket=nil
+        return problem
     }
     private func disconnect(preserveError:Bool=false){
         guard !stopping else{return}
@@ -683,7 +696,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let chooserClean=await chooser?.waitForCleanup() ?? true
             await capture.stop();await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
             var problem=await phoneSession?.disconnect() ?? ""
-            if problem.isEmpty {problem=await disconnectWireless()}
+            let networkProblem=await disconnectWireless()
+            if !networkProblem.isEmpty {problem += " " + networkProblem}
             if !chooserClean {problem += " 部分未选中的无线连接未清理，请在手机关闭无线调试。"}
             wechatWindow?.window?.orderOut(nil);wechatWindow=nil;applicationLibrary?.close();applicationLibrary=nil
             connected=false;busy=false;stopping=false;mirrorDisplay=nil;latestPhoneFrame=nil;control.setPhoneImage(nil)
@@ -707,7 +721,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let chooserClean=await chooser?.waitForCleanup() ?? true
             await capture.stop();await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
             var problem=await phoneSession?.disconnect() ?? ""
-            if problem.isEmpty {problem=await disconnectWireless()}
+            let networkProblem=await disconnectWireless()
+            if !networkProblem.isEmpty {problem += " " + networkProblem}
             if !chooserClean {problem += " 部分未选中的无线连接未清理，请在手机关闭无线调试。"}
             if !problem.isEmpty {
                 let alert=NSAlert();alert.messageText="连接已停止，手机清理待恢复";alert.informativeText=problem

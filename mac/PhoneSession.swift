@@ -174,12 +174,14 @@ struct CameraFrameExpiredError: LocalizedError {
 
 actor PhoneSession {
     private let adbURL: URL, jarURL: URL, recoveryURL: URL
+    private let serverSocket: String?
     private var recovery: Recovery?
     private var server: Process?, serverPipe: Pipe?, channel: CameraSocket?
     private var displayWidth=720, displayHeight=1280, displayDpi=320
     private var displayID: Int?
     private var cleaning=false
-    init(resources: URL, adbURL: URL? = nil) {
+    init(resources: URL, adbURL: URL? = nil, serverSocket: String? = nil) {
+        self.serverSocket = serverSocket
         self.adbURL = adbURL ?? resources.appendingPathComponent("adb")
         jarURL = resources.appendingPathComponent("camera-probe.jar")
         let support = FileManager.default.urls(for: .applicationSupportDirectory,in: .userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
@@ -187,7 +189,7 @@ actor PhoneSession {
     }
     private func adb(_ args: [String], serial: String? = nil, timeout: TimeInterval = 15) throws -> String {
         let selected = serial ?? recovery?.serial
-        return try ShellCommand.run(adbURL, (selected.map { ["-s",$0] } ?? []) + args, timeout: timeout,cancellable:!cleaning)
+        return try ShellCommand.run(adbURL, (serverSocket.map { ["-L", $0] } ?? []) + (selected.map { ["-s",$0] } ?? []) + args, timeout: timeout,cancellable:!cleaning)
     }
     private func shell(_ command: String) throws -> String { try adb(["shell",command]) }
     private func save() throws {
@@ -240,7 +242,7 @@ actor PhoneSession {
             try Task.checkCancellation()
             let process=Process(), pipe=Pipe(), log=ServerLog()
             process.executableURL=adbURL
-            process.arguments=["-s",r.serial,"shell","CLASSPATH=\(r.path)/server.jar app_process / LiveCameraServer \(association) \(r.socketName) \(r.token)"]
+            process.arguments=(serverSocket.map { ["-L", $0] } ?? []) + ["-s",r.serial,"shell","CLASSPATH=\(r.path)/server.jar app_process / LiveCameraServer \(association) \(r.socketName) \(r.token)"]
             process.standardOutput=pipe;process.standardError=pipe
             pipe.fileHandleForReading.readabilityHandler = { handle in let data=handle.availableData; if !data.isEmpty {log.append(data)} }
             server=process;serverPipe=pipe;try process.run()
@@ -305,10 +307,10 @@ actor PhoneSession {
     }
     func foreground(display target: Int) async throws -> String? {
         guard let state=recovery, target == 0 || ownsDisplay(target) else {return nil}
-        let adb=adbURL, serial=state.serial
+        let adb=adbURL, serial=state.serial, route=serverSocket.map { ["-L", $0] } ?? []
         // Read-only monitoring must not hold the camera actor while ADB waits.
         let dump=try await Task.detached {
-            try ShellCommand.run(adb,["-s",serial,"shell","dumpsys activity activities"],timeout:5)
+            try ShellCommand.run(adb,route + ["-s",serial,"shell","dumpsys activity activities"],timeout:5)
         }.value
         return Self.foregroundComponent(in:dump,display:target)
     }

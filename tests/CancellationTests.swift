@@ -34,6 +34,30 @@ import Foundation
         guard PhoneSession.foregroundComponent(in:dump,display:7)=="com.tencent.mm/.plugin.scanner.ui.BaseScanUI",
               PhoneSession.foregroundComponent(in:dump,display:0)=="example.test/.Home",
               PhoneSession.foregroundComponent(in:dump,display:8)==nil else{fatalError("Foreground display isolation failed")}
-        print("PASS command/readiness cancellation, cleanup after cancellation, display isolation")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("phone-server-route-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fakeADB = directory.appendingPathComponent("fake-adb")
+        try #"""
+        #!/bin/sh
+        route=default
+        if [ "$1" = -L ]; then route="$2"; shift 2; fi
+        [ "$1" = devices ] && [ "$2" = -l ] && [ "$#" = 2 ] || exit 21
+        printf '%s' "$route" > "$0.route"
+        printf 'List of devices attached\n'
+        """#.write(to: fakeADB, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeADB.path)
+        for route in [String?.none, "tcp:127.0.0.1:42139"] {
+            let phone = PhoneSession(resources: directory, adbURL: fakeADB, serverSocket: route)
+            do {
+                _ = try await phone.connect(openWechatOnConnect: false, progress: { _ in })
+                fatalError("Empty synthetic device list connected")
+            } catch {
+                guard error.localizedDescription.contains("未发现") else { throw error }
+            }
+            let actual = try String(contentsOfFile: fakeADB.path + ".route", encoding: .utf8)
+            guard actual == (route ?? "default") else { fatalError("Phone enumeration crossed server routes") }
+        }
+        print("PASS command/readiness cancellation, cleanup after cancellation, display isolation, default/owned PhoneSession ADB routing")
     }
 }

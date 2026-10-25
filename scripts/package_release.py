@@ -153,7 +153,7 @@ def main():
                     'source_commit':revision, 'architecture':'arm64', 'minimum_macos':'14.4',
                     'app_version':'0.4.0', 'app_build':'12', 'signature':'ad-hoc', 'notarized':False,
                     'bundled_adb':True, 'adb_source_version':'37.0.0-android-tools',
-                    'known_limitations':['desktop camera round-trip latency remains', 'wireless mirroring and app pairing UI not yet verified',
+                    'known_limitations':['desktop camera round-trip latency remains', 'app pairing UI not yet verified',
                     'manual wireless endpoints required; bundled adb has no mDNS discovery',
                     'independent app display support varies by Android app and device',
                     'interactive drag and clean Mac installation not human-verified'],

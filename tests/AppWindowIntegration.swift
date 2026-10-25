@@ -13,7 +13,7 @@ private final class FrameCount: @unchecked Sendable {
         guard CommandLine.arguments.contains("--run-device-test") else {print("Explicit --run-device-test required");return}
         let root=URL(fileURLWithPath:FileManager.default.currentDirectoryPath)
         let adb=root.appendingPathComponent(".local/adb-bundle/bin/adb")
-        let phone=PhoneSession(resources:root.appendingPathComponent("build"),adbURL:adb)
+        var cleanupSession:PhoneSession?,server:ADBManagedServer?,wirelessManager:ADBConnectionManager?,wirelessEndpoint:String?
         let mirror=MirrorSession(),frames=FrameCount()
         do {
             let requestedEndpoint:String?
@@ -21,12 +21,21 @@ private final class FrameCount: @unchecked Sendable {
                 guard CommandLine.arguments.indices.contains(index+1) else {throw ScanError("Missing wireless endpoint")}
                 requestedEndpoint=try ADBEndpoint(CommandLine.arguments[index+1]).value
             } else {requestedEndpoint=nil}
-            let devices=try await ADBConnectionManager(adbURL:adb).devices().filter {device in
+            let manager:ADBConnectionManager
+            if let requestedEndpoint {
+                let owned=try await ADBManagedServer.start(adbURL:adb);server=owned
+                manager=ADBConnectionManager(adbURL:adb,serverSocket:owned.socket)
+                wirelessManager=manager;wirelessEndpoint=requestedEndpoint
+                try await manager.connect(endpoint:requestedEndpoint)
+            } else {manager=ADBConnectionManager(adbURL:adb)}
+            let devices=try await manager.devices().filter {device in
                 guard device.authorization == .authorized else{return false}
                 if let requestedEndpoint {return device.transport == .wireless && device.serial == requestedEndpoint}
                 return device.transport == .usb
             }
             guard devices.count==1 else {throw ScanError("Need exactly one selected authorized phone")}
+            let phone=PhoneSession(resources:root.appendingPathComponent("build"),adbURL:adb,serverSocket:server?.socket)
+            cleanupSession=phone
             _=try await phone.connect(openWechatOnConnect:false,selectedSerial:devices[0].serial){_ in}
             let apps=try await phone.applications()
             guard let wechat=apps.first(where:{$0.packageName=="com.tencent.mm"}),let scanner=await phone.scannerDisplay() else {throw ScanError("WeChat scanner target unavailable")}
@@ -41,7 +50,7 @@ private final class FrameCount: @unchecked Sendable {
             print("PASS extra display task restoration and release");fflush(stdout)
             try await phone.launchApplication(wechat,on:scanner.id)
             let endpoint=try await phone.mirrorEndpoint()
-            try await mirror.startVideo(adbURL:adb,serverURL:root.appendingPathComponent(".tools/scrcpy/scrcpy-server-v5.0.1"),serial:endpoint.serial,displayID:scanner.id,onFrame:{_ in frames.add()},onFailure:{_ in})
+            try await mirror.startVideo(adbURL:adb,serverURL:root.appendingPathComponent(".tools/scrcpy/scrcpy-server-v5.0.1"),serial:endpoint.serial,displayID:scanner.id,serverSocket:server?.socket,onFrame:{_ in frames.add()},onFailure:{_ in})
             try await Task.sleep(nanoseconds:2_000_000_000)
             guard frames.count>0,try await phone.foreground(display:scanner.id)?.hasPrefix("com.tencent.mm/")==true else {throw ScanError("WeChat independent mirror unavailable")}
             print("PASS WeChat independent display decoded frames",frames.count);fflush(stdout)
@@ -49,10 +58,14 @@ private final class FrameCount: @unchecked Sendable {
             print("PASS WeChat task restored; reserved display retained");fflush(stdout)
             let cleanup=await phone.disconnect()
             guard cleanup.isEmpty else {throw ScanError("Cleanup requires recovery")}
+            if let wirelessEndpoint {try await wirelessManager?.disconnect(endpoint:wirelessEndpoint)}
+            await server?.stop()
             print("PASS all owned resources cleaned")
         } catch {
             await mirror.stop()
-            let cleanup=await phone.disconnect()
+            let cleanup=await cleanupSession?.disconnect() ?? ""
+            if let wirelessEndpoint {try? await wirelessManager?.disconnect(endpoint:wirelessEndpoint)}
+            await server?.stop()
             print("FAILED",error.localizedDescription,"cleanup_ok",cleanup.isEmpty);exit(1)
         }
     }

@@ -14,8 +14,11 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
         }
     }
     private let phone: PhoneSession, adb: URL, server: URL
+    private let serverSocket: String?
     private var entries: [String: Entry] = [:], stopping = false
-    init(phone: PhoneSession, adb: URL, server: URL) { self.phone = phone; self.adb = adb; self.server = server }
+    init(phone: PhoneSession, adb: URL, server: URL, serverSocket: String? = nil) {
+        self.phone = phone; self.adb = adb; self.server = server; self.serverSocket = serverSocket
+    }
 
     func open(_ app: AndroidApplication, at point: NSPoint?) {
         guard !stopping else { return }
@@ -42,7 +45,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
                 let display = try await phone.createAppDisplay(); entry.display = display.id
                 try Task.checkCancellation()
                 let endpoint = try await phone.mirrorEndpoint(display: display.id)
-                try await entry.mirror.startVideo(adbURL: adb, serverURL: server, serial: endpoint.serial, displayID: display.id,
+                try await entry.mirror.startVideo(adbURL: adb, serverURL: server, serial: endpoint.serial, displayID: display.id, serverSocket: serverSocket,
                     onFrame: { [frames=entry.frames] pixels in frames.publish(pixels, generation: 1) },
                     onFailure: { [weak entry] _ in Task { @MainActor in
                         guard let entry, !entry.closing else { return }

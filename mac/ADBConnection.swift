@@ -8,7 +8,12 @@ struct ADBDevice: Identifiable, Equatable, Sendable {
     let model: String?
     let transport: Transport
     let authorization: Authorization
-    var id: String { serial }
+    let serverSocket: String?
+    init(serial: String, model: String?, transport: Transport, authorization: Authorization, serverSocket: String? = nil) {
+        self.serial = serial; self.model = model; self.transport = transport
+        self.authorization = authorization; self.serverSocket = serverSocket
+    }
+    var id: String { (serverSocket.map { $0 + ":" } ?? "") + serial }
 }
 
 struct ADBDiscoveredService: Identifiable, Equatable, Sendable {
@@ -67,16 +72,20 @@ struct ADBEndpoint: Equatable, Sendable {
 actor ADBConnectionManager {
     private let adbURL: URL
     private let timeout: TimeInterval
+    private let serverSocket: String?
     private let pairingPortProvider: ADBPairingServer.PortProvider
-    init(adbURL: URL, timeout: TimeInterval = 15,
+    init(adbURL: URL, serverSocket: String? = nil, timeout: TimeInterval = 15,
          pairingPortProvider: @escaping ADBPairingServer.PortProvider = { try ADBPairingServer.availablePort() }) {
         self.adbURL = adbURL
+        self.serverSocket = serverSocket
         self.timeout = timeout.isFinite && timeout > 0 ? timeout : 15
         self.pairingPortProvider = pairingPortProvider
     }
 
     func devices() async throws -> [ADBDevice] {
-        Self.parseDevices(try await run(["devices", "-l"]))
+        let result = Self.parseDevices(try await run(["devices", "-l"]))
+        return result.map { ADBDevice(serial: $0.serial, model: $0.model, transport: $0.transport,
+                                      authorization: $0.authorization, serverSocket: serverSocket) }
     }
 
     func pair(endpoint: String, code: String) async throws {
@@ -169,10 +178,17 @@ actor ADBConnectionManager {
     }
 
     private func run(_ arguments: [String], input: Data? = nil) async throws -> String {
+        if let socket = serverSocket {
+            guard socket.hasPrefix("tcp:127.0.0.1:"),
+                  (try? ADBEndpoint(String(socket.dropFirst(4)))) != nil else {
+                throw ADBConnectionError("无线 ADB 服务地址无效，请重新连接。")
+            }
+        }
+        let routedArguments = (serverSocket.map { ["-L", $0] } ?? []) + arguments
         let cancellation = ADBCommandCancellation()
         let executable = adbURL, timeout = timeout
         let task = Task.detached(priority: .userInitiated) {
-            try ADBConnectionProcess.run(executable, arguments, input: input, timeout: timeout, cancellation: cancellation)
+            try ADBConnectionProcess.run(executable, routedArguments, input: input, timeout: timeout, cancellation: cancellation)
         }
         return try await withTaskCancellationHandler(operation: {
             let result = try await task.value

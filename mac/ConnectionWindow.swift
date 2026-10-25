@@ -13,7 +13,12 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     var onCancel: (() -> Void)?
     private let onSelect: (ADBDevice) -> Void
     private let manager: ADBConnectionManager
-    private let wirelessLease: WirelessConnectionLease
+    private let adbURL: URL
+    private var wirelessServer: ADBManagedServer?
+    private var wirelessManager: ADBConnectionManager?
+    private var wirelessLease: WirelessConnectionLease?
+    private let serverHandoff = ADBWirelessServerHandoff()
+    private var handedOffServerSocket: String?
     private var devices = [ADBDevice]()
     private var services = [ADBDiscoveredService]()
     private var task: Task<Void, Never>?
@@ -38,7 +43,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     init(adbURL: URL, onSelect: @escaping (ADBDevice) -> Void) {
         let manager = ADBConnectionManager(adbURL: adbURL)
         self.manager = manager
-        self.wirelessLease = WirelessConnectionLease(manager: manager)
+        self.adbURL = adbURL
         self.onSelect = onSelect
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 710),
                               styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
@@ -74,6 +79,30 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     func waitForCleanup() async -> Bool {
         guard let cleanupTask else { return true }
         return await cleanupTask.value
+    }
+
+    /// Only call after waitForCleanup. Taking transfers the sole runtime
+    /// responsibility to App; an untaken server is stopped on deallocation.
+    func takeSelectedWirelessServer() -> ADBManagedServer? {
+        serverHandoff.take()
+    }
+
+    private func listedDevices() async throws -> [ADBDevice] {
+        let defaults = try await manager.devices()
+        guard let wirelessManager else { return defaults }
+        return defaults + (try await wirelessManager.devices())
+    }
+
+    private func wirelessConnection(current: Int) async throws -> WirelessConnectionLease {
+        if let wirelessLease { return wirelessLease }
+        let server = try await ADBManagedServer.start(adbURL: adbURL)
+        guard !Task.isCancelled, !closed, generation == current else {
+            await server.stop(); throw CancellationError()
+        }
+        let manager = ADBConnectionManager(adbURL: adbURL, serverSocket: server.socket)
+        let lease = WirelessConnectionLease(manager: manager)
+        wirelessServer = server; wirelessManager = manager; wirelessLease = lease
+        return lease
     }
 
     private func buildContent(_ window: NSWindow) {
@@ -220,7 +249,11 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         let text: String
         switch tableColumn?.identifier.rawValue {
         case "transport":
-            switch device.transport { case .usb: text = "USB"; case .wireless: text = "无线"; case .unknown: text = "其他 / 未知" }
+            switch device.transport {
+            case .usb: text = "USB"
+            case .wireless: text = device.serverSocket == nil ? "无线" : "无线（本 App）"
+            case .unknown: text = "其他 / 未知"
+            }
         case "authorization":
             switch device.authorization {
             case .authorized: text = "已授权"
@@ -290,7 +323,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     @objc private func refreshDevices() {
         startOperation("正在读取设备列表…") { [weak self] current in
             guard let self else { throw CancellationError() }
-            let result = try await self.manager.devices()
+            let result = try await self.listedDevices()
             try Task.checkCancellation()
             guard !self.closed, self.generation == current else { throw CancellationError() }
             self.replaceDevices(result)
@@ -311,8 +344,10 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         let endpoint = connectEndpoint.stringValue
         startOperation("正在建立无线连接…") { [weak self] current in
             guard let self else { throw CancellationError() }
-            try await self.wirelessLease.connect(endpoint: endpoint)
-            let result = try await self.manager.devices()
+            _ = try ADBEndpoint(endpoint)
+            let lease = try await self.wirelessConnection(current: current)
+            try await lease.connect(endpoint: endpoint)
+            let result = try await self.listedDevices()
             try Task.checkCancellation()
             guard !self.closed, self.generation == current else { throw CancellationError() }
             self.replaceDevices(result)
@@ -341,6 +376,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         guard !busy, !closed, let device = selectedDevice else { return }
         didSelect = true
         handedOffSerial = device.serial
+        handedOffServerSocket = device.serverSocket
         window?.close()
         onSelect(device)
     }
@@ -350,12 +386,16 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         let pendingOperation = task
         pendingOperation?.cancel(); task = nil
         if cleanupTask == nil {
-            let lease = wirelessLease, selected = handedOffSerial
-            cleanupTask = Task {
-                let succeeded = await lease.close(keeping: selected)
+            cleanupTask = Task { [self] in
                 // Also settle enumeration/pairing/discovery process shutdown,
                 // including a connect preflight that had not acquired a lease.
                 await pendingOperation?.value
+                let server = wirelessServer
+                let transfer = server != nil && server?.socket == handedOffServerSocket
+                let succeeded = await wirelessLease?.close(keeping: transfer ? handedOffSerial : nil) ?? true
+                if transfer { serverHandoff.finish(with: server) }
+                else { await server?.stop() }
+                wirelessServer = nil; wirelessManager = nil; wirelessLease = nil
                 return succeeded
             }
         }

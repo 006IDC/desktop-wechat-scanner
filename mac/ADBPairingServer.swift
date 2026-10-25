@@ -10,6 +10,22 @@ enum ADBPairingServer {
                     portProvider: PortProvider = { try availablePort() },
                     environment suppliedEnvironment: [String: String]? = nil,
                     pair: (String, [String: String], TimeInterval, @escaping @Sendable () -> Bool) throws -> String) throws -> String {
+        let started = try start(executable, timeout: timeout, cancellation: cancellation,
+                                portProvider: portProvider, environment: suppliedEnvironment)
+        defer { started.server.stop() }
+        return try pair(started.socket, started.environment, started.deadline - ProcessInfo.processInfo.systemUptime,
+                        { started.server.isRunning })
+    }
+
+    struct Started: Sendable {
+        let server: OwnedServer
+        let socket: String
+        let environment: [String: String]
+        let deadline: TimeInterval
+    }
+
+    static func start(_ executable: URL, timeout: TimeInterval, cancellation: ADBCommandCancellation,
+                      portProvider: PortProvider, environment suppliedEnvironment: [String: String]?) throws -> Started {
         let deadline = ProcessInfo.processInfo.systemUptime + min(19, timeout)
         var environment = suppliedEnvironment ?? ProcessInfo.processInfo.environment
         // A pairing-only server must not contend for the default server's USB
@@ -30,13 +46,12 @@ enum ADBPairingServer {
         // numeric 127.0.0.1: AOSP treats that as a remote-host spec and refuses
         // to auto-start a background daemon if our foreground server dies.
         let server = try OwnedServer(executable: executable, socket: "tcp:localhost:\(port)", environment: environment)
-        defer { server.stop() }
-        try server.waitUntilReady(deadline: deadline, cancellation: cancellation)
-        if cancellation.isCancelled { throw CancellationError() }
-        guard server.isRunning else { throw unavailable }
-        let remaining = deadline - ProcessInfo.processInfo.systemUptime
-        guard remaining > 0 else { throw unavailable }
-        return try pair(socket, environment, remaining, { server.checkAlive() })
+        do {
+            try server.waitUntilReady(deadline: deadline, cancellation: cancellation)
+            if cancellation.isCancelled { throw CancellationError() }
+            guard server.isRunning, deadline > ProcessInfo.processInfo.systemUptime else { throw unavailable }
+            return Started(server: server, socket: socket, environment: environment, deadline: deadline)
+        } catch { server.stop(); throw error }
     }
 
     private static var unavailable: ADBConnectionError {
@@ -65,11 +80,13 @@ enum ADBPairingServer {
         return UInt16(bigEndian: address.sin_port)
     }
 
-    private final class OwnedServer: @unchecked Sendable {
+    final class OwnedServer: @unchecked Sendable {
         private let pid: pid_t
         private let acknowledgement: Int32
         private let diagnostics: Int32
         private var stopped = false
+        private let stateLock = NSLock()
+        private let readerDone = DispatchSemaphore(value: 0)
 
         init(executable: URL, socket: String, environment: [String: String]) throws {
             var ack = [Int32](repeating: -1, count: 2), log = [Int32](repeating: -1, count: 2)
@@ -109,6 +126,13 @@ enum ADBPairingServer {
             pid = child; acknowledgement = ack[0]; diagnostics = log[0]
             _ = fcntl(acknowledgement, F_SETFL, O_NONBLOCK)
             _ = fcntl(diagnostics, F_SETFL, O_NONBLOCK)
+            DispatchQueue.global(qos: .utility).async { [self] in
+                while !isStopped {
+                    drainDiagnostics()
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                readerDone.signal()
+            }
         }
 
         var isRunning: Bool {
@@ -119,13 +143,12 @@ enum ADBPairingServer {
             return information.si_pid == 0
         }
 
-        func checkAlive() -> Bool { drainDiagnostics(); return isRunning }
+        private var isStopped: Bool { stateLock.lock(); defer { stateLock.unlock() }; return stopped }
 
         func waitUntilReady(deadline: TimeInterval, cancellation: ADBCommandCancellation) throws {
             var ack = Data()
             while ProcessInfo.processInfo.systemUptime < deadline {
                 if cancellation.isCancelled { throw CancellationError() }
-                drainDiagnostics()
                 var bytes = [UInt8](repeating: 0, count: 16)
                 let count = Darwin.read(acknowledgement, &bytes, bytes.count)
                 if count > 0 { ack.append(contentsOf: bytes.prefix(count)) }
@@ -145,8 +168,11 @@ enum ADBPairingServer {
         }
 
         func stop() {
-            guard !stopped else { return }
+            stateLock.lock()
+            guard !stopped else { stateLock.unlock(); return }
             stopped = true
+            stateLock.unlock()
+            readerDone.wait()
             _ = kill(-pid, SIGTERM)
             let deadline = ProcessInfo.processInfo.systemUptime + 0.3
             while isRunning && ProcessInfo.processInfo.systemUptime < deadline {
@@ -160,5 +186,60 @@ enum ADBPairingServer {
             drainDiagnostics()
             Darwin.close(acknowledgement); Darwin.close(diagnostics)
         }
+    }
+}
+
+/// App-owned wireless ADB runtime. No default-server operations are performed.
+/// The owner must retain this object for the complete selected phone session.
+final class ADBManagedServer: @unchecked Sendable {
+    let clientSocket: String
+    var socket: String { clientSocket }
+    private let owner: ADBPairingServer.OwnedServer
+    private let lock = NSLock()
+    private var stopTask: Task<Void, Never>?
+    private init(_ started: ADBPairingServer.Started) { clientSocket = started.socket; owner = started.server }
+    deinit { owner.stop() }
+
+    static func start(adbURL: URL, timeout: TimeInterval = 10,
+                      portProvider: @escaping ADBPairingServer.PortProvider = { try ADBPairingServer.availablePort() },
+                      environment: [String: String]? = nil) async throws -> ADBManagedServer {
+        let cancellation = ADBCommandCancellation()
+        let task = Task.detached(priority: .userInitiated) {
+            ADBManagedServer(try ADBPairingServer.start(adbURL, timeout: timeout, cancellation: cancellation,
+                                                       portProvider: portProvider, environment: environment))
+        }
+        return try await withTaskCancellationHandler(operation: {
+            let server = try await task.value
+            if Task.isCancelled { await server.stop(); throw CancellationError() }
+            return server
+        }, onCancel: { cancellation.cancel() })
+    }
+
+    var isRunning: Bool { owner.isRunning }
+    private func stopping() -> Task<Void, Never> {
+        lock.lock(); defer { lock.unlock() }
+        if let stopTask { return stopTask }
+        let owner = owner
+        let task = Task.detached(priority: .userInitiated) { owner.stop() }
+        stopTask = task
+        return task
+    }
+    func stop() async { await stopping().value }
+}
+
+/// Single-use transfer slot shared by the chooser and its headless lifecycle
+/// tests. Dropping an untaken slot drops its managed server and cleans it up.
+@MainActor
+final class ADBWirelessServerHandoff {
+    private var server: ADBManagedServer?
+    private var finished = false
+    func finish(with server: ADBManagedServer?) {
+        guard !finished else { return }
+        self.server = server; finished = true
+    }
+    func take() -> ADBManagedServer? {
+        guard finished else { return nil }
+        defer { server = nil }
+        return server
     }
 }

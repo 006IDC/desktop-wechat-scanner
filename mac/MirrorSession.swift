@@ -320,19 +320,19 @@ final class MirrorSession: @unchecked Sendable {
     private let inputScheduler = MirrorInputScheduler()
     private let inputQueue=DispatchQueue(label:"com.idc006.mirror.input",qos:.userInitiated)
     private var generation=0, video:MirrorSocket?, control:MirrorSocket?, server:Process?
-    private var adbURL:URL?, serial:String?, port:UInt16?, socketName:String?, remotePath:String?
+    private var adbURL:URL?, serial:String?, serverSocket:String?, port:UInt16?, socketName:String?, remotePath:String?
     private var width=0, height=0
     private var started=false, stopping=false
     private var preparing:DispatchGroup?
     private var failureCallback: (@Sendable (String)->Void)?
     private var stopWaiters:[CheckedContinuation<Void,Never>]=[]
-    private func begin(adbURL:URL,serial:String,
+    private func begin(adbURL:URL,serial:String,serverSocket:String?,
                        onFailure:@escaping @Sendable (String)->Void) throws -> (Int,String,DispatchGroup) {
         lock.lock();defer {lock.unlock()}
         guard !started && !stopping else {throw ScanError("手机镜像已经运行或正在关闭。")}
         started=true;generation += 1
         inputScheduler.reset(epoch: generation, enabled: true)
-        self.adbURL=adbURL;self.serial=serial
+        self.adbURL=adbURL;self.serial=serial;self.serverSocket=serverSocket
         failureCallback=onFailure
         let token=UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
         let scid="0"+String(token.prefix(7)) // 31-bit signed scid, 8 hex digits
@@ -341,35 +341,35 @@ final class MirrorSession: @unchecked Sendable {
         let group=DispatchGroup();group.enter();preparing=group
         return (generation,scid,group)
     }
-    func start(adbURL:URL,serverURL:URL,serial:String,displayID:Int,
+    func start(adbURL:URL,serverURL:URL,serial:String,displayID:Int,serverSocket:String?=nil,
                onFrame:@escaping @Sendable (CGImage)->Void,
                onFailure:@escaping @Sendable (String)->Void) async throws {
-        try await start(adbURL:adbURL,serverURL:serverURL,serial:serial,displayID:displayID,
+        try await start(adbURL:adbURL,serverURL:serverURL,serial:serial,displayID:displayID,serverSocket:serverSocket,
                         output:.image(onFrame),onFailure:onFailure)
     }
     /// Delivers the decoder's pixel buffer directly. The receiver must retain it
     /// (for example, in a latest-only mailbox) before this callback returns.
-    func startVideo(adbURL:URL,serverURL:URL,serial:String,displayID:Int,
+    func startVideo(adbURL:URL,serverURL:URL,serial:String,displayID:Int,serverSocket:String?=nil,
                     onFrame:@escaping @Sendable (CVPixelBuffer)->Void,
                     onFailure:@escaping @Sendable (String)->Void) async throws {
-        try await start(adbURL:adbURL,serverURL:serverURL,serial:serial,displayID:displayID,
+        try await start(adbURL:adbURL,serverURL:serverURL,serial:serial,displayID:displayID,serverSocket:serverSocket,
                         output:.pixelBuffer(onFrame),onFailure:onFailure)
     }
-    private func start(adbURL:URL,serverURL:URL,serial:String,displayID:Int,
+    private func start(adbURL:URL,serverURL:URL,serial:String,displayID:Int,serverSocket:String?,
                        output:H264Decoder.Output,
                        onFailure:@escaping @Sendable (String)->Void) async throws {
         guard displayID >= 0, !serial.isEmpty, !serial.contains("\n"),
               FileManager.default.fileExists(atPath:serverURL.path) else {
             throw ScanError("手机镜像参数或 scrcpy 服务文件无效。")
         }
-        let (epoch,scid,group)=try begin(adbURL:adbURL,serial:serial,onFailure:onFailure)
+        let (epoch,scid,group)=try begin(adbURL:adbURL,serial:serial,serverSocket:serverSocket,onFailure:onFailure)
         do {
             try await withCheckedThrowingContinuation { (continuation:CheckedContinuation<Void,Error>) in
                 DispatchQueue.global(qos:.userInitiated).async {
                     defer {group.leave()}
                     do {
                         try self.prepare(adbURL:adbURL,serverURL:serverURL,serial:serial,
-                                         displayID:displayID,scid:scid,epoch:epoch)
+                                         displayID:displayID,scid:scid,epoch:epoch,serverSocket:serverSocket)
                         continuation.resume()
                     } catch {continuation.resume(throwing:error)}
                 }
@@ -405,24 +405,24 @@ final class MirrorSession: @unchecked Sendable {
     private func isCurrent(_ epoch:Int)->Bool {
         lock.lock();defer {lock.unlock()};return started && generation==epoch
     }
-    private func adb(_ args:[String],url:URL,serial:String,timeout:TimeInterval=15,cancelEpoch:Int?=nil) throws -> String {
-        try ShellCommand.run(url,["-s",serial]+args,timeout:timeout,cancellationRequested:{ [weak self] in
+    private func adb(_ args:[String],url:URL,serial:String,serverSocket:String?,timeout:TimeInterval=15,cancelEpoch:Int?=nil) throws -> String {
+        try ShellCommand.run(url,(serverSocket.map { ["-L", $0] } ?? []) + ["-s",serial]+args,timeout:timeout,cancellationRequested:{ [weak self] in
             guard let cancelEpoch else{return false}
             return self?.isCurrent(cancelEpoch) != true
         })
     }
     private func prepare(adbURL:URL,serverURL:URL,serial:String,displayID:Int,
-                         scid:String,epoch:Int) throws {
+                         scid:String,epoch:Int,serverSocket:String?) throws {
         guard isCurrent(epoch) else {throw ScanError("手机镜像已停止。")}
         lock.lock();let path=remotePath!, name=socketName!;lock.unlock()
-        _=try adb(["push",serverURL.path,path],url:adbURL,serial:serial,timeout:30,cancelEpoch:epoch)
+        _=try adb(["push",serverURL.path,path],url:adbURL,serial:serial,serverSocket:serverSocket,timeout:30,cancelEpoch:epoch)
         guard isCurrent(epoch) else {throw ScanError("手机镜像已停止。")}
-        let forwarded=try adb(["forward","tcp:0","localabstract:"+name],url:adbURL,serial:serial,cancelEpoch:epoch)
+        let forwarded=try adb(["forward","tcp:0","localabstract:"+name],url:adbURL,serial:serial,serverSocket:serverSocket,cancelEpoch:epoch)
         guard let port=UInt16(forwarded),port>0 else {throw ScanError("无法建立手机镜像 USB 转发。")}
         lock.lock();self.port=port;lock.unlock()
         let process=Process(), pipe=Pipe()
         process.executableURL=adbURL
-        process.arguments=["-s",serial,"shell",
+        process.arguments=(serverSocket.map { ["-L", $0] } ?? []) + ["-s",serial,"shell",
             "CLASSPATH=\(path) app_process / com.genymobile.scrcpy.Server 5.0.1 scid=\(scid) tunnel_forward=true video=true audio=false control=true display_id=\(displayID) video_codec=h264 max_size=1600 max_fps=60 clipboard_autosync=false send_device_meta=false send_dummy_byte=true cleanup=true"]
         process.standardOutput=pipe;process.standardError=pipe
         // Drain stderr/stdout continuously: a full ADB pipe would stall the server.
@@ -579,9 +579,9 @@ final class MirrorSession: @unchecked Sendable {
             video?.interrupt();control?.interrupt()
             DispatchQueue.global(qos:.utility).async {
                 preparing?.wait()
-                let (server,adbURL,serial,port,name,path) = self.lock.withLock { () -> (Process?,URL?,String?,UInt16?,String?,String?) in
-                    let snapshot=(self.server,self.adbURL,self.serial,self.port,self.socketName,self.remotePath)
-                    self.video=nil;self.control=nil;self.server=nil;self.port=nil
+                let (server,adbURL,serial,serverSocket,port,name,path) = self.lock.withLock { () -> (Process?,URL?,String?,String?,UInt16?,String?,String?) in
+                    let snapshot=(self.server,self.adbURL,self.serial,self.serverSocket,self.port,self.socketName,self.remotePath)
+                    self.video=nil;self.control=nil;self.server=nil;self.serverSocket=nil;self.port=nil
                     self.width=0;self.height=0;self.preparing=nil
                     return snapshot
                 }
@@ -593,11 +593,11 @@ final class MirrorSession: @unchecked Sendable {
                     return
                 }
                 if let port,let name,
-                   let listing=try? self.adb(["forward","--list"],url:adbURL,serial:serial),
+                   let listing=try? self.adb(["forward","--list"],url:adbURL,serial:serial,serverSocket:serverSocket),
                    listing.split(separator:"\n").contains(where:{$0 == "\(serial) tcp:\(port) localabstract:\(name)"}) {
-                    _=try? self.adb(["forward","--remove","tcp:\(port)"],url:adbURL,serial:serial)
+                    _=try? self.adb(["forward","--remove","tcp:\(port)"],url:adbURL,serial:serial,serverSocket:serverSocket)
                 }
-                if let path { _=try? self.adb(["shell","rm","-f",path],url:adbURL,serial:serial) }
+                if let path { _=try? self.adb(["shell","rm","-f",path],url:adbURL,serial:serial,serverSocket:serverSocket) }
                 let waiters=self.finishStopping()
                 continuation.resume()
                 for waiter in waiters {waiter.resume()}

@@ -114,6 +114,7 @@ info={
     'DesktopScannerRelease':'0.4.0-preview.1',
     'CFBundleIconFile':'AppIcon.icns',
     'LSMinimumSystemVersion':'14.4','NSHighResolutionCapable':True,
+    'NSLocalNetworkUsageDescription':'连接同一局域网内已由你配对授权的 Android 手机，以显示镜像并发送点击。',
     'NSScreenCaptureUsageDescription':'将手机镜像窗口后方的桌面画面送给你的手机微信扫一扫。',
     'NSPrincipalClass':'NSApplication',
 }
