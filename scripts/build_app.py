@@ -94,7 +94,7 @@ subprocess.run(['python3',str(ROOT/'scripts/build.py')],check=True)
 subprocess.run(['python3',str(ROOT/'scripts/bootstrap_mirror.py')],check=True)
 icon_tool=ROOT/'build/generate-icon'
 subprocess.run(['swiftc','-swift-version','5','-O','-target','arm64-apple-macos14.4',
-                '-module-cache-path',str(ROOT/'.tools/swift-cache'),
+                '-module-cache-path',str(ROOT/'.local/swift-cache'),
                 str(ROOT/'scripts/icon.swift'),'-o',str(icon_tool)],check=True)
 subprocess.run([str(icon_tool)],cwd=ROOT,check=True)
 contents=APP/'Contents'
@@ -126,7 +126,7 @@ revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).
 subprocess.run(['swiftc','-swift-version','5','-O','-target','arm64-apple-macos14.4',
                 '-file-prefix-map',str(ROOT)+'=/source/desktop-wechat-scanner',
                 '-debug-prefix-map',str(ROOT)+'=/source/desktop-wechat-scanner',
-                '-module-cache-path',str(ROOT/'.tools/swift-cache'),*map(str,sorted((ROOT/'mac').glob('*.swift'))),'-o',str(binary/'DesktopWeChatScanner')],check=True)
+                '-module-cache-path',str(ROOT/'.local/swift-cache'),*map(str,sorted((ROOT/'mac').glob('*.swift'))),'-o',str(binary/'DesktopWeChatScanner')],check=True)
 # A Documents File Provider continuously adds FinderInfo to .app roots.
 # Build there, then sign and verify a metadata-free staging copy outside it.
 # Only the ZIP (or an explicit --install target) is a deliverable.

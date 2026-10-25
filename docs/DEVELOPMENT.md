@@ -11,8 +11,8 @@ App 使用 AppKit、ScreenCaptureKit、VideoToolbox 和 Vision；手机端 Java 
 例如在项目目录：
 
 ```sh
-mkdir -p .tools/swift-cache .local
-swiftc -swift-version 5 -O -target arm64-apple-macos14.4 -module-cache-path .tools/swift-cache mac/PhoneSession.swift mac/DesktopCapture.swift mac/CameraPumpMailbox.swift tests/CameraPumpMailboxTests.swift -o .local/mailbox-tests
+mkdir -p .local/swift-cache .local
+swiftc -swift-version 5 -O -target arm64-apple-macos14.4 -module-cache-path .local/swift-cache mac/PhoneSession.swift mac/DesktopCapture.swift mac/CameraPumpMailbox.swift tests/CameraPumpMailboxTests.swift -o .local/mailbox-tests
 .local/mailbox-tests
 ```
 

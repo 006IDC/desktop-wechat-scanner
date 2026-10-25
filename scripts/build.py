@@ -40,7 +40,7 @@ if not key.exists():
 subprocess.run([str(java),'-jar',str(tools/'lib/apksigner.jar'),'sign','--ks',str(key),'--ks-pass','env:QR_PROBE_TEST_PASS','--out',str(root/'build/qr-self-test.apk'),str(root/'build/test-unsigned.apk')],env=env,check=True)
 subprocess.run([str(java),'-jar',str(tools/'lib/apksigner.jar'),'verify',str(root/'build/qr-self-test.apk')],check=True)
 print('Built and signature-verified build/qr-self-test.apk (test key only)')
-cache=root/'.tools/swift-cache'
+cache=root/'.local/swift-cache'
 cache.mkdir(parents=True,exist_ok=True)
 for source,output in [('qr.swift','qr-helper'),('desktop_source.swift','desktop-source')]:
     subprocess.run(['swiftc','-module-cache-path',str(cache),str(root/'scripts'/source),'-o',str(root/'build'/output)],check=True)
