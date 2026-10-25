@@ -17,6 +17,9 @@ parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--install',type=Path,metavar='PATH',
                     help='install the verified app at this explicit .app path')
 args=parser.parse_args()
+revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
+if subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip():
+    raise RuntimeError('Commit all source changes before building a public app')
 
 def copy_without_metadata(source: str, destination: str) -> str:
     """Copy bytes and POSIX mode; never transfer FinderInfo or ResourceFork."""
@@ -121,12 +124,13 @@ for name in ('LICENSE','NOTICE','THIRD_PARTY.md'):
     shutil.copy2(ROOT/name,resources/name)
 if (resources/'adb').exists():
     raise RuntimeError('Public build must not contain a bundled adb')
-revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
 (resources/'SOURCE-REVISION.txt').write_text(revision+'\n')
 subprocess.run(['swiftc','-swift-version','5','-O','-target','arm64-apple-macos14.4',
                 '-file-prefix-map',str(ROOT)+'=/source/desktop-wechat-scanner',
                 '-debug-prefix-map',str(ROOT)+'=/source/desktop-wechat-scanner',
                 '-module-cache-path',str(ROOT/'.local/swift-cache'),*map(str,sorted((ROOT/'mac').glob('*.swift'))),'-o',str(binary/'DesktopWeChatScanner')],check=True)
+if subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip() != revision or subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip():
+    raise RuntimeError('Source changed during build; refuse to package')
 # A Documents File Provider continuously adds FinderInfo to .app roots.
 # Build there, then sign and verify a metadata-free staging copy outside it.
 # Only the ZIP (or an explicit --install target) is a deliverable.

@@ -85,6 +85,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             panel.message="请选择解压后的 platform-tools 文件夹内的 adb 文件。"
             panel.canChooseFiles=true;panel.canChooseDirectories=false;panel.allowsMultipleSelection=false
             panel.prompt="选择 adb"
+            let hints=ADBConfiguration.candidates(savedPath:UserDefaults.standard.string(forKey:ADBConfiguration.defaultsKey))
+            if let hint=hints.first(where:{FileManager.default.fileExists(atPath:$0.path)}) {
+                panel.directoryURL=hint.deletingLastPathComponent()
+                panel.nameFieldStringValue="adb"
+            }
             guard panel.runModal() == .OK,let url=panel.url else{return nil}
             try Task.checkCancellation()
             do {

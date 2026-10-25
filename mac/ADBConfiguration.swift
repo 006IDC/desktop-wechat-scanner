@@ -46,13 +46,13 @@ enum ADBConfiguration {
         }, onCancel: { task.cancel() })
     }
 
+    /// Revalidate only a path the user already selected. Common locations are
+    /// hints for the chooser and must never be executed on first connection.
     static func discover(savedPath: String?) async throws -> URL? {
-        for url in candidates(savedPath: savedPath) {
-            try Task.checkCancellation()
-            do { return try await validateAsync(url) }
-            catch is CancellationError { throw CancellationError() }
-            catch { continue }
-        }
-        return nil
+        try Task.checkCancellation()
+        guard let savedPath, !savedPath.isEmpty else { return nil }
+        do { return try await validateAsync(URL(fileURLWithPath: savedPath)) }
+        catch is CancellationError { throw CancellationError() }
+        catch { return nil }
     }
 }

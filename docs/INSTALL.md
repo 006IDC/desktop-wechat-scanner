@@ -17,7 +17,7 @@
 1. 打开 [Google 官方 Platform-Tools](https://developer.android.com/tools/releases/platform-tools)，阅读并接受其条款，下载 Mac 版本并解压。
 2. 将解压后的 `platform-tools` 文件夹放在固定位置，避免放在随后删除的临时目录。
 3. 在 App 中点击连接。未发现 adb 时选择“选择 adb…”，选中该目录的 `adb` 文件；“官方下载”会打开上述网页。
-4. 已有 Homebrew/Android SDK 的常见 adb 安装也可自动发现。移动或升级工具后，可在 App 菜单中重新设置。
+4. 已有 Homebrew/Android SDK 用户可选择原安装目录的 adb。首次选择后会记住位置；移动或升级工具后，可在 App 菜单中重新设置。
 
 App 会执行所选 adb 的 `version` 检查；只选择可信来源的工具。它使用你本机 ADB 的密钥和 USB 授权，不上传这些资料。
 

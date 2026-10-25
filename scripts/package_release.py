@@ -58,7 +58,7 @@ def main():
     if any((OUT/name).exists() for name in names):
         raise RuntimeError('Release outputs already exist; do not overwrite a published artifact')
     revision = run('git', 'rev-parse', 'HEAD')
-    if run('git', 'status', '--porcelain', '--untracked-files=no'):
+    if run('git', 'status', '--porcelain'):
         raise RuntimeError('Commit source changes before packaging')
     with tempfile.TemporaryDirectory(prefix='wechat-release-') as temporary:
         temp = Path(temporary)

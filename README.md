@@ -25,7 +25,7 @@
 ## 使用与升级
 
 1. 下载 DMG，将“桌面微信扫码.app”拖入“应用程序”；ZIP 用户先解压，再移动 App。
-2. 安装 [Google 官方 Platform-Tools](https://developer.android.com/tools/releases/platform-tools) 并解压。本发行包不包含 adb。首次点连接时可以直接选择解压目录中的 `adb`，无需运行终端命令；已有常见 SDK/Homebrew 安装可被自动发现。
+2. 安装 [Google 官方 Platform-Tools](https://developer.android.com/tools/releases/platform-tools) 并解压。本发行包不包含 adb。首次点连接时可以直接选择解压目录中的 `adb`，无需运行终端命令；已有 SDK/Homebrew 用户也可选择自己的 adb，后续连接复用保存的位置。
 3. 手机启用开发者选项与 USB 调试，通过数据线连接、解锁，并在手机上允许此 Mac 调试。部分小米系统还需要允许 USB 调试安全设置；无需 Root。
 4. App 点连接，进入微信“＋ → 扫一扫”，或点工具栏扫码图标。按提示授予本 App 屏幕录制权限并重启。
 5. 拖动**窗口标题栏**覆盖电脑上的二维码。普通页面使用手机主屏镜像；扫码时微信任务会暂时迁到同一手机的虚拟显示，手机物理屏与 Mac 可能不同。结果页会尝试移回物理屏。
