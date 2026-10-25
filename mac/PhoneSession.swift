@@ -1,0 +1,530 @@
+import Foundation
+import Darwin
+
+struct ScanError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+    init(_ message: String) { self.message = message }
+}
+
+enum ShellCommand {
+    static func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval = 15, cancellable:Bool = true,
+                    cancellationRequested:(@Sendable ()->Bool)? = nil) throws -> String {
+        let process = Process(), pipe = Pipe(), done = DispatchSemaphore(value: 0)
+        let readerDone = DispatchSemaphore(value: 0)
+        var outputData = Data()
+        process.executableURL = executable; process.arguments = arguments
+        process.standardOutput = pipe; process.standardError = pipe
+        process.terminationHandler = { _ in done.signal() }
+        try process.run()
+        DispatchQueue.global(qos:.userInitiated).async {
+            outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+            readerDone.signal()
+        }
+        let deadline=Date().addingTimeInterval(timeout)
+        var finished=false
+        while Date()<deadline && !(cancellable && Task.isCancelled) && cancellationRequested?() != true {
+            if done.wait(timeout:.now()+0.1) == .success {finished=true;break}
+        }
+        if !finished {
+            process.terminate()
+            if done.wait(timeout: .now()+2) == .timedOut { kill(process.processIdentifier, SIGKILL) }
+            if (cancellable && Task.isCancelled) || cancellationRequested?() == true {throw CancellationError()}
+            throw ScanError("手机操作超时，请检查 USB 连接和手机授权。")
+        }
+        guard readerDone.wait(timeout:.now()+2) == .success else {throw ScanError("读取手机响应超时。")}
+        let output = String(data: outputData, encoding: .utf8) ?? ""
+        guard process.terminationStatus == 0 else { throw ScanError(String(output.prefix(700)).trimmingCharacters(in: .whitespacesAndNewlines)) }
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Blocking framed transport. Only PhoneSession's actor accesses this socket.
+final class CameraSocket {
+    private var descriptor: Int32 = -1
+    init(port: UInt16, token: String) throws {
+        descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw ScanError("无法建立本机图像通道。") }
+        var timeout = timeval(tv_sec: 5, tv_usec: 0), one: Int32 = 1
+        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET); address.sin_port = port.bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let result = withUnsafePointer(to: &address) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        guard result == 0 else { close(); throw ScanError("无法连接手机图像通道，请重新连接。") }
+        try send(Data(token.utf8))
+    }
+    deinit { close() }
+    func close() { if descriptor >= 0 { Darwin.close(descriptor); descriptor = -1 } }
+    private func send(_ data: Data) throws {
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var sent = 0
+            while sent < raw.count {
+                let count = Darwin.send(descriptor, base.advanced(by: sent), raw.count-sent, 0)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw ScanError("手机图像连接已中断。") }
+                sent += count
+            }
+        }
+    }
+    private func read(_ count: Int) throws -> Data {
+        var data = Data(count: count)
+        try data.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var received = 0
+            while received < count {
+                let n = Darwin.recv(descriptor, base.advanced(by: received), count-received, 0)
+                if n < 0 && errno == EINTR { continue }
+                guard n > 0 else { throw ScanError("手机图像连接已中断或超时。") }
+                received += n
+            }
+        }
+        return data
+    }
+    func request(_ command: UInt8, _ body: Data = Data()) throws -> Data {
+        guard body.count <= 4*1024*1024+8 else { throw ScanError("图像过大。") }
+        var request = Data([command]); var length = UInt32(body.count).bigEndian
+        withUnsafeBytes(of: &length) { request.append(contentsOf: $0) }
+        request.append(body); try send(request)
+        let header = try read(5)
+        let size = header.dropFirst().reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        guard size <= 4*1024*1024 else { throw ScanError("手机返回了无效图像长度。") }
+        let result = try read(Int(size))
+        guard header[0] == 0 else { throw ScanError(String(data: result, encoding: .utf8) ?? "手机处理图像失败。") }
+        return result
+    }
+}
+
+final class ServerLog {
+    private let condition = NSCondition()
+    private var buffer = "", fields: [String:String] = [:]
+    func append(_ data: Data) {
+        condition.lock(); defer { condition.unlock() }
+        buffer += String(data: data, encoding: .utf8) ?? ""
+        while let newline = buffer.firstIndex(of: "\n") {
+            let line = String(buffer[..<newline]); buffer.removeSubrange(...newline)
+            if line.hasPrefix("QR_LIVE "), let equal = line.firstIndex(of: "=") {
+                fields[String(line[line.index(line.startIndex, offsetBy: 8)..<equal])] = String(line[line.index(after: equal)...])
+            }
+        }
+        condition.broadcast()
+    }
+    func dimensions() -> (Int,Int) {
+        condition.lock();defer {condition.unlock()}
+        return (Int(fields["display_width"] ?? "") ?? 720,Int(fields["display_height"] ?? "") ?? 1280)
+    }
+    func waitReady() throws -> (Int,Int,Int) {
+        condition.lock(); defer { condition.unlock() }
+        let end = Date().addingTimeInterval(25)
+        while fields["ready"] != "1" && fields["error"] == nil && Date() < end && !Task.isCancelled {
+            condition.wait(until:min(end,Date().addingTimeInterval(0.2)))
+        }
+        if Task.isCancelled {throw CancellationError()}
+        if let error = fields["error"] { throw ScanError("手机暂不支持：\(error)") }
+        guard fields["ready"] == "1", let device = Int(fields["device_id"] ?? ""),
+              let display = Int(fields["display_id"] ?? ""), let pid = Int(fields["pid"] ?? ""),
+              device > 0, display > 0, pid > 0 else {
+            throw ScanError("手机虚拟摄像头未能启动。请保持手机解锁后重试。")
+        }
+        return (device,display,pid)
+    }
+}
+
+private struct Recovery: Codable {
+    var serial: String, suffix: String, token: String, mac: String
+    var association: Int? = nil
+    var port: UInt16? = nil
+    var display: Int? = nil
+    var device: Int? = nil
+    var pid: Int? = nil
+    var path: String { "/data/local/tmp/006idc-scan-" + suffix }
+    var socketName: String { "006idc_scan_" + suffix }
+    var valid: Bool {
+        suffix.range(of: "^[0-9a-f]{8}$",options: .regularExpression) != nil &&
+        token.range(of: "^[0-9a-f]{32}$",options: .regularExpression) != nil &&
+        mac.range(of: "^02:06:1D:([0-9A-F]{2}:){2}[0-9A-F]{2}$", options: .regularExpression) != nil &&
+        !serial.isEmpty && !serial.contains("\n") &&
+        (association == nil || association! > 0) &&
+        (device == nil || device! > 0) && (pid == nil || pid! > 0)
+    }
+}
+
+private struct VirtualRecord {
+    let device: Int
+    let association: Int
+    let owner: String
+}
+
+struct CameraFrameExpiredError: LocalizedError {
+    var errorDescription:String? {"本次桌面坐标已过时。"}
+}
+
+actor PhoneSession {
+    private let adbURL: URL, jarURL: URL, recoveryURL: URL
+    private var recovery: Recovery?
+    private var server: Process?, serverPipe: Pipe?, channel: CameraSocket?
+    private var displayWidth=720, displayHeight=1280
+    private var displayID: Int?
+    private var cleaning=false
+    init(resources: URL, adbURL: URL? = nil) {
+        self.adbURL = adbURL ?? resources.appendingPathComponent("adb")
+        jarURL = resources.appendingPathComponent("camera-probe.jar")
+        let support = FileManager.default.urls(for: .applicationSupportDirectory,in: .userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
+        recoveryURL = support.appendingPathComponent("session.json")
+    }
+    private func adb(_ args: [String], serial: String? = nil, timeout: TimeInterval = 15) throws -> String {
+        let selected = serial ?? recovery?.serial
+        return try ShellCommand.run(adbURL, (selected.map { ["-s",$0] } ?? []) + args, timeout: timeout,cancellable:!cleaning)
+    }
+    private func shell(_ command: String) throws -> String { try adb(["shell",command]) }
+    private func save() throws {
+        guard let state = recovery else { return }
+        try FileManager.default.createDirectory(at: recoveryURL.deletingLastPathComponent(),withIntermediateDirectories:true)
+        try JSONEncoder().encode(state).write(to: recoveryURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:recoveryURL.path)
+    }
+    func connect(openWechatOnConnect: Bool = true, progress: @escaping @Sendable (String) -> Void) async throws -> String {
+        guard server == nil else { throw ScanError("手机已经连接。") }
+        do {
+            progress("正在检查 USB 连接…")
+            let listing = try adb(["devices","-l"])
+            let lines = listing.split(separator:"\n").map { $0.split(whereSeparator:{$0==" " || $0=="\t"}).map(String.init) }
+            let devices = lines.filter { $0.count >= 2 && $0[1] == "device" && $0.contains(where:{$0.hasPrefix("usb:")}) }
+            if devices.isEmpty {
+                if lines.contains(where:{$0.count>=2 && $0[1]=="unauthorized"}) { throw ScanError("请解锁手机，并在手机上允许这台 Mac 的 USB 调试。") }
+                throw ScanError("未发现已授权的 USB 手机。请使用数据线连接并开启 USB 调试。")
+            }
+            guard devices.count == 1 else { throw ScanError("检测到多台 USB 手机，请只保留要扫码的那一台。") }
+            let serial = devices[0][0]
+            if FileManager.default.fileExists(atPath: recoveryURL.path) {
+                let old = try JSONDecoder().decode(Recovery.self,from:Data(contentsOf:recoveryURL))
+                guard old.valid,old.serial==serial else { throw ScanError("上次会话尚未清理，请连接上次使用的手机再试。") }
+                recovery=old
+                progress("正在清理上次未结束的连接…")
+                let problems = disconnect()
+                guard problems.isEmpty else { throw ScanError(problems) }
+            }
+            let api = Int(try adb(["shell","getprop ro.build.version.sdk"],serial:serial)) ?? 0
+            guard api >= 36 else { throw ScanError("此版本需要 Android 16 或更新系统。") }
+            let wechat = try adb(["shell","cmd package list packages com.tencent.mm"],serial:serial)
+            guard wechat.split(separator:"\n").contains("package:com.tencent.mm") else { throw ScanError("手机主用户中没有找到微信，请先安装并登录微信。") }
+            let suffix = String(UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased().prefix(8))
+            let token = UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
+            let hex = Array(suffix.uppercased())
+            let mac = "02:06:1D:" + stride(from:0,to:6,by:2).map { String(hex[$0...$0+1]) }.joined(separator:":")
+            recovery=Recovery(serial:serial,suffix:suffix,token:token,mac:mac)
+            try save(); try Task.checkCancellation()
+            let r = recovery!
+            _ = try shell("mkdir \(r.path) && printf '%s' '\(r.token)' > \(r.path)/owner")
+            progress("正在创建临时手机摄像头…")
+            _ = try shell("cmd companiondevice associate 0 com.android.shell \(r.mac) android.app.role.COMPANION_DEVICE_APP_STREAMING")
+            let entries = try shell("cmd companiondevice list 0").split(separator:"\n").map { $0.split(separator:"|").map { $0.trimmingCharacters(in:.whitespaces) } }
+            guard let entry = entries.first(where:{$0.count==3 && $0[1]=="com.android.shell" && $0[2].uppercased()==r.mac}), let association=Int(entry[0]) else { throw ScanError("手机未返回有效的临时连接编号。") }
+            recovery?.association=association; try save()
+            _ = try adb(["push",jarURL.path,r.path+"/server.jar"])
+            try Task.checkCancellation()
+            let process=Process(), pipe=Pipe(), log=ServerLog()
+            process.executableURL=adbURL
+            process.arguments=["-s",r.serial,"shell","CLASSPATH=\(r.path)/server.jar app_process / LiveCameraServer \(association) \(r.socketName) \(r.token)"]
+            process.standardOutput=pipe;process.standardError=pipe
+            pipe.fileHandleForReading.readabilityHandler = { handle in let data=handle.availableData; if !data.isEmpty {log.append(data)} }
+            server=process;serverPipe=pipe;try process.run()
+            let (device,display,pid)=try log.waitReady()
+            (displayWidth,displayHeight)=log.dimensions()
+            displayID=display;recovery?.display=display;recovery?.device=device;recovery?.pid=pid;try save()
+            let portText=try adb(["forward","tcp:0","localabstract:"+r.socketName])
+            guard let port=UInt16(portText), port>0 else {throw ScanError("USB 图像通道创建失败。")}
+            recovery?.port=port;try save()
+            channel=try CameraSocket(port:port,token:r.token)
+            if openWechatOnConnect {
+                progress("正在打开手机微信…")
+                try openWechat()
+            }
+            try Task.checkCancellation()
+            return try shell("getprop ro.product.model")
+        } catch {
+            let cleanup=disconnect()
+            throw ScanError(error.localizedDescription + (cleanup.isEmpty ? "" : "\n"+cleanup))
+        }
+    }
+    private func epochBytes(_ epoch: Int) throws -> Data {
+        guard epoch >= 0 else { throw ScanError("扫码帧序号无效。") }
+        var value = UInt64(epoch).bigEndian
+        return withUnsafeBytes(of: &value) { Data($0) }
+    }
+    func frame(_ data: Data, epoch: Int, selectedAt:TimeInterval?=nil) throws {
+        try Task.checkCancellation()
+        if let selectedAt,ProcessInfo.processInfo.systemUptime-selectedAt>0.5 {
+            throw CameraFrameExpiredError()
+        }
+        guard let channel else {throw ScanError("手机未连接。")}
+        guard data.count <= 4*1024*1024 else {throw ScanError("图像过大。")}
+        var body = try epochBytes(epoch)
+        body.append(data)
+        _ = try channel.request(1,body)
+    }
+    func clear(epoch: Int) throws {
+        guard let channel else {return}
+        _ = try channel.request(3,epochBytes(epoch))
+    }
+    func heartbeat() throws { guard let channel else {throw ScanError("手机未连接。")};_ = try channel.request(4) }
+    func screenshot() throws -> Data { guard let channel else {throw ScanError("手机未连接。")};return try channel.request(2) }
+    func tap(x: Int,y: Int) throws {
+        guard let displayID else {return}
+        let result=try shell("input -d \(displayID) tap \(min(displayWidth-1,max(0,x*displayWidth/720))) \(min(displayHeight-1,max(0,y*displayHeight/1280)))")
+        if result.contains("Exception") || result.contains("Permission") || result.contains("Error") {throw ScanError(String(result.prefix(400)))}
+    }
+    func back() throws { if let displayID {_ = try shell("input -d \(displayID) keyevent KEYCODE_BACK")} }
+    func mirrorEndpoint() throws -> (serial: String, display: Int) {
+        guard let state=recovery,let displayID,channel != nil else {throw ScanError("手机未连接。")}
+        return (state.serial,displayID)
+    }
+    /// Return only a foreground component, never task extras, URLs or chat text.
+    func foreground(onVirtualDisplay: Bool) async throws -> String? {
+        guard let displayID, let state=recovery else {return nil}
+        let target=onVirtualDisplay ? displayID : 0, adb=adbURL, serial=state.serial
+        // Read-only monitoring must not hold the camera actor while ADB waits.
+        let dump=try await Task.detached {
+            try ShellCommand.run(adb,["-s",serial,"shell","dumpsys activity activities"],timeout:5)
+        }.value
+        return Self.foregroundComponent(in:dump,display:target)
+    }
+    static func foregroundComponent(in dump:String,display:Int) -> String? {
+        var current:Int?, resumed:String?
+        for raw in dump.split(separator:"\n") {
+            let line=raw.trimmingCharacters(in:.whitespaces)
+            if line.hasPrefix("Display #") {
+                current=Int(line.dropFirst(9).prefix(while:{$0.isNumber}))
+            } else if current==display && (line.contains("topResumedActivity=") || line.contains("mResumedActivity:")) {
+                let fields=line.split(whereSeparator:{$0==" " || $0=="\t" || $0=="}"})
+                if let component=fields.first(where:{$0.contains("/") && !$0.contains("://")}) {
+                    resumed=String(component)
+                }
+            }
+        }
+        return resumed
+    }
+    func moveWechat(toVirtualDisplay:Bool) throws {
+        guard let displayID else {throw ScanError("手机未连接。")}
+        let source=toVirtualDisplay ? 0 : displayID, destination=toVirtualDisplay ? displayID : 0
+        let dump=try shell("dumpsys activity activities")
+        var current:Int?, task:Int?
+        for raw in dump.split(separator:"\n") {
+            let line=raw.trimmingCharacters(in:.whitespaces)
+            if line.hasPrefix("Display #") {current=Int(line.dropFirst(9).prefix(while:{$0.isNumber}))}
+            else if current==source && (line.contains("topResumedActivity=") || line.contains("mResumedActivity:")) && line.contains("com.tencent.mm/") {
+                for field in line.split(whereSeparator:{$0==" " || $0=="}"}) {
+                    if field.first=="t",let value=Int(field.dropFirst()),value>0 {task=value}
+                }
+            }
+        }
+        guard let task else {throw ScanError("未找到当前微信窗口，请回到微信后重试。")}
+        let result=try shell("am display move-stack \(task) \(destination)")
+        guard !result.lowercased().contains("exception") && !result.lowercased().contains("error") else {throw ScanError("微信窗口切换失败。")}
+    }
+    func mainHome() throws { _ = try shell("input -d 0 keyevent KEYCODE_HOME") }
+    /// Open only the normal launcher on the display owned by this session.
+    func openWechat(onVirtualDisplay:Bool = true) throws {
+        guard let displayID,let state=recovery,state.device != nil else {
+            throw ScanError("手机临时屏幕尚未准备好。")
+        }
+        let target=onVirtualDisplay ? displayID : 0
+        let trust=try shell("dumpsys trust")
+        guard let owner=trust.split(separator:"\n").map(String.init)
+            .first(where:{$0.contains("(id=0,") && $0.contains("(current)")}) else {
+            throw ScanError("无法确认手机主用户的锁屏状态，请保持手机解锁后重试。")
+        }
+        if owner.contains("deviceLocked=1") {
+            throw ScanError("请先解锁手机，再点开始扫码。")
+        }
+        guard owner.contains("deviceLocked=0") else {
+            throw ScanError("无法确认手机是否已解锁，请解锁后重试。")
+        }
+        let launch=try shell("am start --display \(target) --activity-clear-top -n com.tencent.mm/.ui.LauncherUI")
+        let lower=launch.lowercased()
+        if lower.contains("error:") || lower.contains("exception") {
+            throw ScanError("微信未能在手机临时屏幕启动："+String(launch.prefix(300)))
+        }
+        for _ in 0..<5 {
+            Thread.sleep(forTimeInterval:0.25)
+            let activities=try shell("dumpsys activity activities")
+            var onOurDisplay=false
+            for line in activities.split(separator:"\n") {
+                let value=line.trimmingCharacters(in:.whitespaces)
+                if value.hasPrefix("Display #") {
+                    let number=value.dropFirst("Display #".count).prefix(while:{$0.isNumber})
+                    onOurDisplay=Int(number)==target
+                } else if onOurDisplay && value.contains("com.tencent.mm/") {
+                    return
+                }
+            }
+        }
+        throw ScanError("微信没有出现在本次手机临时屏幕，请保持手机解锁后重试。")
+    }
+    private func virtualRecords() throws -> [VirtualRecord] {
+        let dump=try shell("dumpsys virtualdevice")
+        guard let start=dump.range(of:"Created virtual devices:") else {
+            throw ScanError("手机没有返回虚拟设备创建列表，已保留恢复记录。")
+        }
+        var created=String(dump[start.upperBound...])
+        if let end=created.range(of:"VirtualDevice Log:") {created=String(created[..<end.lowerBound])}
+        let blocks=created.components(separatedBy:"\n  VirtualDevice:").dropFirst()
+        return try blocks.map { block in
+            func value(_ key:String)->String? {
+                block.split(separator:"\n").map { $0.trimmingCharacters(in:.whitespaces) }
+                    .first(where:{$0.hasPrefix(key+":")})?
+                    .dropFirst(key.count+1).trimmingCharacters(in:.whitespaces)
+            }
+            guard let device=Int(value("mDeviceId") ?? ""),
+                  let association=Int(value("mAssociationId") ?? ""),
+                  let owner=value("mOwnerPackageName") else {
+                throw ScanError("手机虚拟设备列表格式无法核实，已保留恢复记录。")
+            }
+            return VirtualRecord(device:device,association:association,owner:owner)
+        }
+    }
+
+    private func ownedDevice(_ state: Recovery) throws -> VirtualRecord? {
+        let records=try virtualRecords()
+        if let id=state.device, let record=records.first(where:{$0.device==id}) {
+            guard record.owner=="com.android.shell",record.association==state.association else {
+                throw ScanError("原虚拟设备编号现属于其他连接，已停止自动清理。")
+            }
+            return record
+        }
+        guard let association=state.association else {return nil}
+        let matches=records.filter{$0.association==association && $0.owner=="com.android.shell"}
+        guard matches.count<=1 else {throw ScanError("临时连接对应多个虚拟设备，已停止自动清理。")}
+        if let match=matches.first,let id=state.device,id != match.device {
+            throw ScanError("原虚拟设备编号已变化，已停止自动清理。")
+        }
+        return matches.first
+    }
+
+    private func associationPresent(_ state: Recovery) throws -> Bool {
+        let rows=try shell("cmd companiondevice list 0").split(separator:"\n")
+        let matches=rows.map{$0.split(separator:"|").map{$0.trimmingCharacters(in:.whitespaces)}}
+            .filter{$0.count==3 && $0[1]=="com.android.shell" && $0[2].uppercased()==state.mac}
+        guard matches.count<=1 else {throw ScanError("存在多个同名临时连接，已停止自动清理。")}
+        if let row=matches.first,let expected=state.association,Int(row[0]) != expected {
+            throw ScanError("临时连接编号不匹配，已停止自动清理。")
+        }
+        return !matches.isEmpty
+    }
+
+    private func processExists(_ pid:Int) throws -> Bool {
+        try shell("if test -d /proc/\(pid); then printf yes; else printf no; fi")=="yes"
+    }
+
+    private func isOwnedProcess(_ pid:Int,_ state:Recovery) throws -> Bool {
+        guard try processExists(pid) else {return false}
+        let args=try shell("cat /proc/\(pid)/cmdline").split(separator:"\0").map(String.init)
+        guard args.contains("LiveCameraServer"),args.contains(state.socketName),args.contains(state.token),
+              state.association.map({args.contains(String($0))}) ?? false else {return false}
+        let environment=try shell("cat /proc/\(pid)/environ").split(separator:"\0").map(String.init)
+        return environment.contains("CLASSPATH=\(state.path)/server.jar")
+    }
+
+    private func findOwnedProcess(_ state:Recovery) throws -> Int? {
+        if let pid=state.pid {return try isOwnedProcess(pid,state) ? pid : nil}
+        // Old journals had no PID. Enumerate only candidate command lines, then
+        // verify every argument and the exact CLASSPATH before any signal.
+        let lines=try shell("ps -A -o PID,ARGS").split(separator:"\n")
+        let candidates=lines.filter{$0.contains("LiveCameraServer") && $0.contains(state.socketName) && $0.contains(state.token)}
+            .compactMap{$0.split(whereSeparator:{$0==" " || $0=="\t"}).first.flatMap{Int($0)}}
+        let owned=try candidates.filter{try isOwnedProcess($0,state)}
+        guard owned.count<=1 else {throw ScanError("发现多个相同会话进程，已停止自动清理。")}
+        return owned.first
+    }
+
+    private func waitForOwnedProcessExit(_ pid:Int,_ state:Recovery,seconds:TimeInterval) throws -> Bool {
+        let end=Date().addingTimeInterval(seconds)
+        while Date()<end {
+            if try !isOwnedProcess(pid,state) {return true}
+            Thread.sleep(forTimeInterval:0.1)
+        }
+        return try !isOwnedProcess(pid,state)
+    }
+
+    private func waitForDeviceGone(_ state:Recovery,seconds:TimeInterval) throws -> Bool {
+        let end=Date().addingTimeInterval(seconds)
+        while Date()<end {
+            if try ownedDevice(state)==nil {return true}
+            Thread.sleep(forTimeInterval:0.15)
+        }
+        return try ownedDevice(state)==nil
+    }
+
+    /// Synchronous inside this actor so connect/quit cannot enter cleanup twice.
+    func disconnect() -> String {
+        cleaning=true;defer {cleaning=false}
+        if let channel {_ = try? channel.request(9);channel.close()}
+        channel=nil
+        if let server,server.isRunning {
+            let end=Date().addingTimeInterval(5)
+            while server.isRunning && Date()<end {Thread.sleep(forTimeInterval:0.1)}
+        }
+        guard var state=recovery else {
+            serverPipe?.fileHandleForReading.readabilityHandler=nil
+            serverPipe=nil;server=nil;displayID=nil
+            return ""
+        }
+        guard state.valid else {return "连接恢复记录无效，已停止自动清理。"}
+        do {
+            // A mismatched owner marker makes both the directory and phone
+            // association unsafe to touch, even if the old journal is valid.
+            let owner=try shell("if test -d \(state.path); then cat \(state.path)/owner; else printf absent; fi")
+            guard owner==state.token || owner=="absent" else {
+                throw ScanError("手机临时目录的会话标记不匹配，已保留恢复记录。")
+            }
+            if let found=try ownedDevice(state),state.device==nil {
+                state.device=found.device;recovery=state;try save()
+            }
+            if state.pid==nil,let found=try findOwnedProcess(state) {
+                state.pid=found;recovery=state;try save()
+            }
+            if let pid=try findOwnedProcess(state) {
+                // The local command may be hung after its remote service died.
+                // Signal only an exact PID whose arguments and jar path match.
+                _ = try shell("kill -TERM \(pid)")
+                if try !waitForOwnedProcessExit(pid,state,seconds:3) {
+                    guard try isOwnedProcess(pid,state) else {throw ScanError("进程身份已变化，已停止自动清理。")}
+                    _ = try shell("kill -KILL \(pid)")
+                    guard try waitForOwnedProcessExit(pid,state,seconds:2) else {
+                        throw ScanError("本次手机进程尚未退出。")
+                    }
+                }
+            }
+            guard try waitForDeviceGone(state,seconds:4) else {
+                throw ScanError("本次虚拟设备尚未关闭，已保留恢复记录。")
+            }
+            if try associationPresent(state) {
+                _ = try shell("cmd companiondevice disassociate 0 com.android.shell \(state.mac)")
+            }
+            if owner != "absent" {
+                _ = try shell("rm -f \(state.path)/server.jar \(state.path)/owner && rmdir \(state.path)")
+            }
+            if let port=state.port {_ = try? adb(["forward","--remove","tcp:\(port)"])}
+            guard try ownedDevice(state)==nil,
+                  try findOwnedProcess(state)==nil,
+                  try !associationPresent(state),
+                  try shell("if test -e \(state.path); then printf present; else printf absent; fi")=="absent" else {
+                throw ScanError("手机临时资源未全部消失，已保留恢复记录。")
+            }
+            if let server,server.isRunning {server.terminate()}
+            serverPipe?.fileHandleForReading.readabilityHandler=nil
+            serverPipe=nil;server=nil;displayID=nil
+            try FileManager.default.removeItem(at:recoveryURL)
+            recovery=nil
+            return ""
+        } catch {
+            return "清理未完成；请连接同一手机后再次点连接："+error.localizedDescription
+        }
+    }
+}

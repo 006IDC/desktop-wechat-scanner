@@ -1,0 +1,465 @@
+import android.content.Context;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.hardware.camera2.CameraMetadata;
+import android.hardware.display.DisplayManager;
+import android.hardware.display.VirtualDisplay;
+import android.media.Image;
+import android.media.ImageReader;
+import android.net.LocalServerSocket;
+import android.net.LocalSocket;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.Process;
+import android.os.UserHandle;
+import android.view.Surface;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/** One authenticated USB-forwarded session, scoped to its own Android virtual device. */
+public final class LiveCameraServer {
+    private static final String PREFIX = "QR_LIVE ";
+    private static final String WECHAT = "com.tencent.mm";
+    private static final int MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+    private static final int MAX_IMAGE_SIDE = 2048;
+    private int displayWidth = 720;
+    private int displayHeight = 1280;
+    private int displayDpi = 320;
+    private static final int SOCKET_IDLE_MS = 90_000;
+    private static final int FIRST_CONNECTION_MS = 60_000;
+
+    private final Object cameraLock = new Object();
+    private final Object frameLock = new Object();
+    private final Map<Integer, Surface> streams = new ConcurrentHashMap<>();
+    private final ExecutorService callbacks = Executors.newSingleThreadExecutor();
+    private final ScheduledExecutorService painter = Executors.newSingleThreadScheduledExecutor();
+    private final ExecutorService acceptor = Executors.newSingleThreadExecutor();
+    // At most one queued paint besides the one currently running. Every paint,
+    // including the idle refresh, stays on this one executor: never parallel Canvas.
+    private final AtomicBoolean paintPending = new AtomicBoolean();
+    private volatile long lastCameraUpdateNanos = System.nanoTime();
+    private volatile boolean stopping;
+    private Image latestDisplayImage;
+    private Context context;
+    private Bitmap cameraFrame;
+    private Object device;
+    private Object camera;
+    private VirtualDisplay display;
+    private ImageReader displayReader;
+    private HandlerThread imageThread;
+    private LocalServerSocket server;
+    private LocalSocket client;
+    private int deviceId = -1;
+    private boolean wechatCameraGranted;
+    // Only the authenticated command reader changes this value. A clear advances
+    // the epoch so a frame captured before pause cannot revive the camera.
+    private long currentEpoch;
+
+    private static void log(String key, Object value) {
+        System.out.println(PREFIX + key + "=" + value);
+        System.out.flush();
+    }
+
+    private static Object call(Object target, String method, Class<?>[] types, Object... values) throws Exception {
+        return CameraProbe.call(target, method, types, values);
+    }
+
+    private void createVirtualDevice(int associationId) throws Exception {
+        Class<?> paramsClass = Class.forName("android.companion.virtual.VirtualDeviceParams");
+        Object builder = Class.forName(paramsClass.getName() + "$Builder").getConstructor().newInstance();
+        call(builder, "setName", new Class[]{String.class}, "006IDC desktop scanner");
+        int cameraPolicy = paramsClass.getField("POLICY_TYPE_CAMERA").getInt(null);
+        int customPolicy = paramsClass.getField("DEVICE_POLICY_CUSTOM").getInt(null);
+        call(builder, "setDevicePolicy", new Class[]{int.class, int.class}, cameraPolicy, customPolicy);
+        Object params = call(builder, "build", new Class[]{});
+        device = call(CameraProbe.manager(), "createVirtualDevice", new Class[]{int.class, paramsClass}, associationId, params);
+        deviceId = (Integer) call(device, "getDeviceId", new Class[]{});
+        if (deviceId <= 0) throw new IllegalStateException("Expected a non-default virtual device");
+        log("device_id", deviceId);
+    }
+
+    private void grantWechatCamera() throws Exception {
+        Context virtualContext = context.createDeviceContext(deviceId);
+        if (virtualContext.getDeviceId() != deviceId) throw new IllegalStateException("Virtual context mismatch");
+        PackageManager pm = virtualContext.getPackageManager();
+        pm.getClass().getMethod("grantRuntimePermission", String.class, String.class, UserHandle.class)
+                .invoke(pm, WECHAT, "android.permission.CAMERA", Process.myUserHandle());
+        wechatCameraGranted = true;
+        log("camera_permission", "granted_virtual_device_only");
+    }
+
+    private void revokeWechatCamera() throws Exception {
+        if (!wechatCameraGranted || deviceId <= 0) return;
+        Context virtualContext = context.createDeviceContext(deviceId);
+        if (virtualContext.getDeviceId() != deviceId) throw new IllegalStateException("Virtual context mismatch on revoke");
+        PackageManager pm = virtualContext.getPackageManager();
+        pm.getClass().getMethod("revokeRuntimePermission", String.class, String.class, UserHandle.class)
+                .invoke(pm, WECHAT, "android.permission.CAMERA", Process.myUserHandle());
+        wechatCameraGranted = false;
+        log("camera_permission", "revoked_virtual_device_only");
+    }
+
+    private void createVirtualCamera() throws Exception {
+        Class<?> callbackClass = Class.forName("android.companion.virtual.camera.VirtualCameraCallback");
+        Object callback = Proxy.newProxyInstance(callbackClass.getClassLoader(), new Class[]{callbackClass},
+                (proxy, method, args) -> {
+                    if (method.getDeclaringClass() == Object.class) {
+                        if ("hashCode".equals(method.getName())) return System.identityHashCode(proxy);
+                        if ("equals".equals(method.getName())) return proxy == args[0];
+                        return "006IDC live camera callback";
+                    }
+                    if ("onStreamConfigured".equals(method.getName())) {
+                        streams.put((Integer) args[0], (Surface) args[1]);
+                        requestPaint();
+                    } else if ("onStreamClosed".equals(method.getName())) {
+                        streams.remove((Integer) args[0]);
+                    }
+                    return null;
+                });
+        Class<?> configClass = Class.forName("android.companion.virtual.camera.VirtualCameraConfig");
+        Object builder = Class.forName(configClass.getName() + "$Builder").getConstructor(String.class)
+                .newInstance("006IDC live desktop camera");
+        call(builder, "addStreamConfig", new Class[]{int.class, int.class, int.class, int.class},
+                1280, 720, PixelFormat.RGBA_8888, 30);
+        call(builder, "setLensFacing", new Class[]{int.class}, CameraMetadata.LENS_FACING_BACK);
+        call(builder, "setSensorOrientation", new Class[]{int.class}, 90);
+        call(builder, "setVirtualCameraCallback", new Class[]{Executor.class, callbackClass}, callbacks, callback);
+        Object config = call(builder, "build", new Class[]{});
+        camera = call(device, "createVirtualCamera", new Class[]{configClass}, config);
+        log("camera_id", call(camera, "getId", new Class[]{}));
+        painter.scheduleWithFixedDelay(() -> {
+            // Arrival-driven drawing already supplies the active 30fps stream.
+            // Only refresh idle content; otherwise an unrelated tick could post
+            // an old image just before the next arrival and add camera backpressure.
+            if (System.nanoTime() - lastCameraUpdateNanos >= TimeUnit.MILLISECONDS.toNanos(66))
+                requestPaint();
+        }, 33, 33, TimeUnit.MILLISECONDS);
+    }
+
+    private void requestPaint() {
+        if (stopping || !paintPending.compareAndSet(false, true)) return;
+        try {
+            painter.execute(() -> {
+                // Release the slot before drawing: an arrival during a slow
+                // lockCanvas/draw/post can request exactly one subsequent pass.
+                // That pass reads the latest cameraFrame, never a captured Bitmap.
+                paintPending.set(false);
+                if (stopping) return;
+                for (Surface surface : streams.values()) paint(surface);
+            });
+        } catch (RejectedExecutionException closed) {
+            paintPending.set(false); // shutdown raced with a callback/command
+        }
+    }
+
+    private void paint(Surface surface) {
+        if (stopping || !surface.isValid()) return;
+        Canvas canvas = null;
+        try {
+            canvas = surface.lockCanvas(null);
+            canvas.drawColor(Color.WHITE);
+            synchronized (cameraLock) {
+                if (cameraFrame != null) {
+                    int width = canvas.getWidth();
+                    int height = canvas.getHeight();
+                    canvas.save();
+                    canvas.translate(width / 2f, height / 2f);
+                    canvas.rotate(-90);
+                    int portraitWidth = height, portraitHeight = width;
+                    float scale = Math.min((float) portraitWidth / cameraFrame.getWidth(), (float) portraitHeight / cameraFrame.getHeight());
+                    int drawWidth = Math.round(cameraFrame.getWidth() * scale);
+                    int drawHeight = Math.round(cameraFrame.getHeight() * scale);
+                    Rect destination = new Rect(-drawWidth / 2, -drawHeight / 2,
+                            drawWidth / 2, drawHeight / 2);
+                    Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
+                    canvas.drawBitmap(cameraFrame, null, destination, paint);
+                    canvas.restore();
+                }
+            }
+        } catch (Exception e) {
+            if (!stopping) log("paint_error", e.toString());
+        } finally {
+            if (canvas != null) try { surface.unlockCanvasAndPost(canvas); } catch (Exception ignored) {}
+        }
+    }
+
+    private void createVirtualDisplay() throws Exception {
+        imageThread = new HandlerThread("006IDC-live-display");
+        imageThread.start();
+        android.util.DisplayMetrics metrics = new android.util.DisplayMetrics();
+        DisplayManager manager = context.getSystemService(DisplayManager.class);
+        android.view.Display primary = manager.getDisplay(android.view.Display.DEFAULT_DISPLAY);
+        primary.getRealMetrics(metrics);
+        displayWidth = metrics.widthPixels;
+        displayHeight = metrics.heightPixels;
+        displayDpi = metrics.densityDpi;
+        if (displayWidth <= 0 || displayHeight <= 0 || displayWidth > 4096 || displayHeight > 4096 || displayDpi <= 0)
+            throw new IllegalStateException("Invalid primary display geometry");
+        displayReader = ImageReader.newInstance(displayWidth, displayHeight, PixelFormat.RGBA_8888, 3);
+        // Keep one GPU-backed image. Read pixels only for an explicit screenshot;
+        // scrcpy consumes the display independently, with no full-frame CPU copy.
+        displayReader.setOnImageAvailableListener(reader -> {
+            try {
+                Image image = reader.acquireLatestImage();
+                if (image == null) return;
+                synchronized (frameLock) {
+                    if (stopping) { image.close(); return; }
+                    if (latestDisplayImage != null) latestDisplayImage.close();
+                    latestDisplayImage = image;
+                }
+            } catch (Exception e) {
+                if (!stopping) log("display_error", e.toString());
+            }
+        }, new Handler(imageThread.getLooper()));
+        int flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY |
+                CameraProbe.DISPLAY_SUPPORTS_TOUCH | CameraProbe.DISPLAY_TRUSTED | CameraProbe.DISPLAY_OWN_FOCUS;
+        display = (VirtualDisplay) call(device, "createVirtualDisplay",
+                new Class[]{int.class, int.class, int.class, Surface.class, int.class, Executor.class, VirtualDisplay.Callback.class},
+                displayWidth, displayHeight, displayDpi, displayReader.getSurface(), flags,
+                callbacks, new VirtualDisplay.Callback() {});
+        log("display_id", display.getDisplay().getDisplayId());
+        log("display_width", displayWidth); log("display_height", displayHeight); log("display_dpi", displayDpi);
+    }
+
+    private static boolean isSupportedImage(byte[] bytes) {
+        boolean jpeg = bytes.length >= 3 && (bytes[0] & 255) == 0xff && (bytes[1] & 255) == 0xd8 && (bytes[2] & 255) == 0xff;
+        boolean png = bytes.length >= 8 && (bytes[0] & 255) == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4e && bytes[3] == 0x47 &&
+                bytes[4] == 0x0d && bytes[5] == 0x0a && bytes[6] == 0x1a && bytes[7] == 0x0a;
+        return jpeg || png;
+    }
+
+    private void setCameraFrame(byte[] bytes) throws IOException {
+        if (bytes.length == 0 || bytes.length > MAX_IMAGE_BYTES || !isSupportedImage(bytes))
+            throw new IOException("Expected JPEG/PNG, 1..4 MiB");
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0 || bounds.outWidth > MAX_IMAGE_SIDE || bounds.outHeight > MAX_IMAGE_SIDE)
+            throw new IOException("Image dimensions must be 1..2048 on each side");
+        Bitmap decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+        if (decoded == null) throw new IOException("Cannot decode image");
+        synchronized (cameraLock) {
+            Bitmap previous = cameraFrame;
+            cameraFrame = decoded;
+            if (previous != null) previous.recycle();
+        }
+        lastCameraUpdateNanos = System.nanoTime();
+        requestPaint();
+    }
+
+    private void clearCameraFrame() {
+        synchronized (cameraLock) {
+            Bitmap previous = cameraFrame;
+            cameraFrame = null;
+            if (previous != null) previous.recycle();
+        }
+        lastCameraUpdateNanos = System.nanoTime();
+        requestPaint();
+    }
+
+    private static void reply(DataOutputStream output, boolean success, byte[] body) throws IOException {
+        output.writeByte(success ? 0 : 1);
+        output.writeInt(body.length);
+        output.write(body);
+        output.flush();
+    }
+
+    private static void error(DataOutputStream output, String message) throws IOException {
+        reply(output, false, message.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private boolean handleSession(LocalSocket socket) throws IOException {
+        socket.setSoTimeout(SOCKET_IDLE_MS);
+        DataInputStream input = new DataInputStream(socket.getInputStream());
+        DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+        while (!stopping) {
+            int command;
+            try { command = input.readUnsignedByte(); } catch (EOFException eof) { return false; }
+            int length = input.readInt();
+            if (length < 0 || length > MAX_IMAGE_BYTES + Long.BYTES) {
+                error(output, "Invalid payload length");
+                return false;
+            }
+            byte[] body = new byte[length];
+            input.readFully(body);
+            if (command == 1) {
+                if (length <= Long.BYTES) { error(output, "Frame needs an epoch and image"); continue; }
+                long epoch = new DataInputStream(new ByteArrayInputStream(body, 0, Long.BYTES)).readLong();
+                if (epoch < 0) { error(output, "Epoch must be nonnegative"); continue; }
+                if (epoch != currentEpoch) { reply(output, true, new byte[0]); continue; }
+                try {
+                    setCameraFrame(Arrays.copyOfRange(body, Long.BYTES, body.length));
+                    reply(output, true, new byte[0]);
+                }
+                catch (Exception e) { error(output, e.getMessage() == null ? "Invalid camera frame" : e.getMessage()); }
+            } else if (command == 2) {
+                if (length != 0) { error(output, "Screenshot request must be empty"); continue; }
+                byte[] encoded = null;
+                synchronized (frameLock) {
+                    if (latestDisplayImage != null) {
+                        Image image = latestDisplayImage;
+                        Image.Plane plane = image.getPlanes()[0];
+                        int paddedWidth = plane.getRowStride() / plane.getPixelStride();
+                        Bitmap padded = Bitmap.createBitmap(paddedWidth, image.getHeight(), Bitmap.Config.ARGB_8888);
+                        Bitmap cropped = null;
+                        try {
+                            plane.getBuffer().rewind();
+                            padded.copyPixelsFromBuffer(plane.getBuffer());
+                            cropped = Bitmap.createBitmap(padded, 0, 0, image.getWidth(), image.getHeight());
+                            ByteArrayOutputStream jpeg = new ByteArrayOutputStream(256 * 1024);
+                            if (!cropped.compress(Bitmap.CompressFormat.JPEG, 85, jpeg))
+                                throw new IOException("Display JPEG encoding failed");
+                            encoded = jpeg.toByteArray();
+                        } finally {
+                            if (cropped != null && cropped != padded) cropped.recycle();
+                            padded.recycle();
+                        }
+                    }
+                }
+                if (encoded == null) error(output, "Virtual display frame not ready");
+                else reply(output, true, encoded);
+            } else if (command == 3) {
+                if (length != Long.BYTES) { error(output, "Clear request needs an 8-byte epoch"); continue; }
+                long epoch = new DataInputStream(new ByteArrayInputStream(body)).readLong();
+                if (epoch < 0) { error(output, "Epoch must be nonnegative"); continue; }
+                if (epoch > currentEpoch) {
+                    currentEpoch = epoch;
+                    clearCameraFrame();
+                }
+                reply(output, true, new byte[0]);
+            } else if (command == 4) {
+                if (length != 0) { error(output, "Heartbeat must be empty"); continue; }
+                reply(output, true, new byte[0]);
+            } else if (command == 9) {
+                if (length != 0) { error(output, "Stop request must be empty"); continue; }
+                reply(output, true, new byte[0]);
+                return true;
+            } else {
+                error(output, "Unknown command");
+            }
+        }
+        return false;
+    }
+
+    private void serve(String name, byte[] expectedToken) throws Exception {
+        server = new LocalServerSocket(name);
+        log("ready", 1);
+        long deadline = android.os.SystemClock.uptimeMillis() + FIRST_CONNECTION_MS;
+        while (!stopping) {
+            long remaining = deadline - android.os.SystemClock.uptimeMillis();
+            if (remaining <= 0) throw new IOException("No authenticated Mac connection within 60 seconds");
+            Future<LocalSocket> wait = acceptor.submit(() -> server.accept());
+            LocalSocket incoming;
+            try { incoming = wait.get(remaining, TimeUnit.MILLISECONDS); }
+            catch (java.util.concurrent.TimeoutException timeout) {
+                server.close();
+                throw new IOException("No authenticated Mac connection within 60 seconds", timeout);
+            }
+            incoming.setSoTimeout((int) Math.min(remaining, 10_000));
+            byte[] token = new byte[32];
+            try {
+                new DataInputStream(incoming.getInputStream()).readFully(token);
+                if (!MessageDigest.isEqual(expectedToken, token)) {
+                    incoming.close();
+                    continue;
+                }
+            } catch (IOException e) {
+                incoming.close();
+                continue;
+            }
+            client = incoming;
+            log("client", "authenticated");
+            try { handleSession(incoming); }
+            finally { incoming.close(); client = null; }
+            return; // A single authenticated session owns this virtual device.
+        }
+    }
+
+    private synchronized void close() {
+        if (stopping) return;
+        stopping = true;
+        boolean clean = true;
+        boolean deviceClosed = false;
+        if (client != null) try { client.close(); } catch (Exception e) { clean = false; log("cleanup_error", e); }
+        if (server != null) try { server.close(); } catch (Exception e) { clean = false; log("cleanup_error", e); }
+        try { revokeWechatCamera(); } catch (Exception e) { clean = false; log("cleanup_error", "virtual camera permission: " + e); }
+        painter.shutdownNow();
+        if (display != null) try { display.release(); } catch (Exception e) { clean = false; log("cleanup_error", e); }
+        synchronized (frameLock) {
+            if (latestDisplayImage != null) latestDisplayImage.close();
+            latestDisplayImage = null;
+        }
+        if (displayReader != null) try { displayReader.close(); } catch (Exception e) { clean = false; log("cleanup_error", e); }
+        for (Object owned : new Object[]{camera, device}) {
+            if (owned != null) try {
+                call(owned, "close", new Class[]{});
+                if (owned == device) deviceClosed = true;
+            } catch (Exception e) { clean = false; log("cleanup_error", e); }
+        }
+        callbacks.shutdownNow();
+        acceptor.shutdownNow();
+        if (imageThread != null) imageThread.quitSafely();
+        clearCameraFrame();
+        synchronized (frameLock) {
+            if (latestDisplayImage != null) latestDisplayImage.close();
+            latestDisplayImage = null;
+        }
+        log("cleanup", device == null ? "no_device_created" :
+                (clean && deviceClosed ? "closed_owned_session" : "partial_close_failed"));
+    }
+
+    public static void main(String[] args) {
+        LiveCameraServer live = new LiveCameraServer();
+        int result = 0;
+        try {
+            if (args.length != 3 || !args[1].matches("006idc_scan_[0-9a-f]{8}") || !args[2].matches("[0-9a-f]{32}"))
+                throw new IllegalArgumentException("Expected associationId 006idc_scan_<8 hex> <32 hex token>");
+            int association = Integer.parseInt(args[0]);
+            if (association <= 0) throw new IllegalArgumentException("Association ID must be positive");
+            byte[] token = args[2].getBytes(StandardCharsets.US_ASCII);
+            live.context = CameraProbe.shellContext();
+            CameraProbe.context = live.context;
+            log("pid", Process.myPid());
+            Runtime.getRuntime().addShutdownHook(new Thread(live::close));
+            live.createVirtualDevice(association);
+            live.grantWechatCamera();
+            live.createVirtualCamera();
+            live.createVirtualDisplay();
+            live.serve(args[1], token);
+        } catch (Throwable error) {
+            while (error instanceof InvocationTargetException && error.getCause() != null) error = error.getCause();
+            log("error", error.getClass().getName() + ": " + error.getMessage());
+            error.printStackTrace(System.err);
+            result = 1;
+        } finally {
+            live.close();
+        }
+        System.exit(result);
+    }
+}

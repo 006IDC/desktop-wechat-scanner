@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Build a signed Mac app ZIP. build/*.app is an unsigned intermediate only."""
+import argparse
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import stat
+import subprocess
+import tempfile
+import zipfile
+
+ROOT=Path(__file__).resolve().parents[1]
+APP=ROOT/'build/桌面微信扫码.app'
+ZIP=ROOT/'build/桌面微信扫码.zip'
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--install',type=Path,metavar='PATH',
+                    help='install the verified app at this explicit .app path')
+args=parser.parse_args()
+
+def copy_without_metadata(source: str, destination: str) -> str:
+    """Copy bytes and POSIX mode; never transfer FinderInfo or ResourceFork."""
+    shutil.copyfile(source,destination)
+    os.chmod(destination,stat.S_IMODE(os.stat(source).st_mode))
+    return destination
+
+def verify(path: Path) -> None:
+    subprocess.run(['codesign','--verify','--deep','--strict',str(path)],check=True)
+
+def package_zip(staged: Path) -> None:
+    temporary=ZIP.with_name(ZIP.name+'.tmp')
+    try:
+        with zipfile.ZipFile(temporary,'w',compression=zipfile.ZIP_DEFLATED,
+                             compresslevel=9,allowZip64=True) as archive:
+            for path in sorted(staged.rglob('*')):
+                if path.is_symlink():
+                    raise RuntimeError(f'Unexpected symlink in app bundle: {path}')
+                if not path.is_file():
+                    continue
+                relative=Path(APP.name)/path.relative_to(staged)
+                entry=zipfile.ZipInfo.from_file(path,arcname=str(relative))
+                entry.compress_type=zipfile.ZIP_DEFLATED
+                entry.create_system=3
+                with path.open('rb') as source, archive.open(entry,'w') as output:
+                    shutil.copyfileobj(source,output)
+        with zipfile.ZipFile(temporary,'r') as archive:
+            corrupt=archive.testzip()
+            if corrupt:
+                raise RuntimeError(f'ZIP CRC failed: {corrupt}')
+            for name in ('Contents/MacOS/DesktopWeChatScanner',):
+                entry=archive.getinfo(f'{APP.name}/{name}')
+                if not (entry.external_attr >> 16) & 0o111:
+                    raise RuntimeError(f'ZIP lost executable mode: {name}')
+        temporary.replace(ZIP)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+def install(staged: Path, target: Path, bundle_id: str) -> None:
+    target=target.expanduser()
+    if not target.is_absolute() or target.suffix != '.app':
+        raise ValueError('--install requires an absolute .app path')
+    if not target.parent.is_dir() or target.is_symlink():
+        raise ValueError('Install parent must exist and target cannot be a symlink')
+    if target.exists():
+        if not target.is_dir():
+            raise ValueError('Install target is not an app directory')
+        try:
+            with (target/'Contents/Info.plist').open('rb') as stream:
+                installed=plistlib.load(stream)
+        except (OSError,ValueError) as error:
+            raise ValueError('Cannot identify existing app; refusing to overwrite') from error
+        if installed.get('CFBundleIdentifier') != bundle_id:
+            raise ValueError('Existing app has a different bundle identifier; refusing to overwrite')
+    with tempfile.TemporaryDirectory(prefix='006idc-app-install-',dir=target.parent) as folder:
+        work=Path(folder)
+        candidate=work/APP.name
+        backup=work/'previous.app'
+        shutil.copytree(staged,candidate,copy_function=copy_without_metadata)
+        verify(candidate)
+        had_previous=target.exists()
+        if had_previous:
+            target.rename(backup)
+        try:
+            candidate.rename(target)
+            verify(target)
+        except Exception:
+            if target.exists():
+                shutil.rmtree(target)
+            if had_previous and backup.exists():
+                backup.rename(target)
+            raise
+
+subprocess.run(['python3',str(ROOT/'scripts/build.py')],check=True)
+subprocess.run(['python3',str(ROOT/'scripts/bootstrap_mirror.py')],check=True)
+icon_tool=ROOT/'build/generate-icon'
+subprocess.run(['swiftc','-swift-version','5','-O','-target','arm64-apple-macos14.4',
+                '-module-cache-path',str(ROOT/'.tools/swift-cache'),
+                str(ROOT/'scripts/icon.swift'),'-o',str(icon_tool)],check=True)
+subprocess.run([str(icon_tool)],cwd=ROOT,check=True)
+contents=APP/'Contents'
+resources=contents/'Resources'
+binary=contents/'MacOS'
+resources.mkdir(parents=True,exist_ok=True)
+binary.mkdir(parents=True,exist_ok=True)
+info={
+    'CFBundleIdentifier':'com.idc006.DesktopWeChatScanner',
+    'CFBundleName':'桌面微信扫码','CFBundleDisplayName':'桌面微信扫码',
+    'CFBundleExecutable':'DesktopWeChatScanner','CFBundlePackageType':'APPL',
+    'CFBundleShortVersionString':'0.3.2','CFBundleVersion':'11',
+    'DesktopScannerRelease':'0.3.2-preview.1',
+    'CFBundleIconFile':'AppIcon.icns',
+    'LSMinimumSystemVersion':'14.4','NSHighResolutionCapable':True,
+    'NSScreenCaptureUsageDescription':'将手机镜像窗口后方的桌面画面送给你的手机微信扫一扫。',
+    'NSPrincipalClass':'NSApplication',
+}
+with (contents/'Info.plist').open('wb') as stream:plistlib.dump(info,stream)
+for source,dest in [('build/camera-probe.jar','camera-probe.jar'),('.tools/scrcpy/scrcpy-server-v5.0.1','scrcpy-server'),('third_party/scrcpy/LICENSE','SCRCPY-LICENSE.txt')]:
+    shutil.copy2(ROOT/source,resources/dest)
+shutil.copy2(ROOT/'build/AppIcon.icns',resources/'AppIcon.icns')
+for name in ('LICENSE','NOTICE','THIRD_PARTY.md'):
+    shutil.copy2(ROOT/name,resources/name)
+if (resources/'adb').exists():
+    raise RuntimeError('Public build must not contain a bundled adb')
+revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
+(resources/'SOURCE-REVISION.txt').write_text(revision+'\n')
+subprocess.run(['swiftc','-swift-version','5','-O','-target','arm64-apple-macos14.4',
+                '-file-prefix-map',str(ROOT)+'=/source/desktop-wechat-scanner',
+                '-debug-prefix-map',str(ROOT)+'=/source/desktop-wechat-scanner',
+                '-module-cache-path',str(ROOT/'.tools/swift-cache'),*map(str,sorted((ROOT/'mac').glob('*.swift'))),'-o',str(binary/'DesktopWeChatScanner')],check=True)
+# A Documents File Provider continuously adds FinderInfo to .app roots.
+# Build there, then sign and verify a metadata-free staging copy outside it.
+# Only the ZIP (or an explicit --install target) is a deliverable.
+with tempfile.TemporaryDirectory(prefix='006idc-app-sign-') as temp:
+    staged=Path(temp)/APP.name
+    shutil.copytree(APP,staged,copy_function=copy_without_metadata)
+    # copytree may preserve directory xattrs even when its file copier does not.
+    for name in ('com.apple.FinderInfo','com.apple.ResourceFork'):
+        subprocess.run(['xattr','-dr',name,str(staged)],
+                       stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    subprocess.run(['codesign','--force','--sign','-','--identifier',info['CFBundleIdentifier'],str(staged)],check=True)
+    verify(staged)
+    package_zip(staged)
+    if args.install:
+        install(staged,args.install,info['CFBundleIdentifier'])
+        print(f'Installed and verified: {args.install}')
+print(f'Verified ZIP: {ZIP}')
+print(f'Intermediate only (may receive Finder metadata): {APP}')

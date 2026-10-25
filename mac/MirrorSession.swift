@@ -1,0 +1,485 @@
+import Foundation
+import Darwin
+import CoreImage
+import CoreMedia
+import CoreVideo
+import VideoToolbox
+
+/// Wire format from Genymobile/scrcpy v5.0.1 Streamer and ControlMessageReader.
+enum MirrorProtocol {
+    enum Header: Equatable {
+        case session(width: Int, height: Int, clientResized: Bool)
+        case packet(length: Int, config: Bool, keyFrame: Bool, pts: UInt64)
+    }
+    static func header(_ bytes: Data) throws -> Header {
+        guard bytes.count == 12 else { throw ScanError("手机镜像包头长度无效。") }
+        let b = Array(bytes)
+        func u32(_ i: Int) -> UInt32 {
+            (UInt32(b[i]) << 24) | (UInt32(b[i+1]) << 16) | (UInt32(b[i+2]) << 8) | UInt32(b[i+3])
+        }
+        if b[0] & 0x80 != 0 {
+            let flags = u32(0), width = Int(u32(4)), height = Int(u32(8))
+            guard flags & 0x7fff_fffe == 0, width > 0, height > 0,
+                  width <= 8192, height <= 8192 else { throw ScanError("手机镜像尺寸无效。") }
+            return .session(width:width,height:height,clientResized:flags & 1 != 0)
+        }
+        let high = UInt64(u32(0)), low = UInt64(u32(4)), length = Int(u32(8))
+        guard length > 0 && length <= 8 * 1024 * 1024 else { throw ScanError("手机镜像帧长度无效。") }
+        let flags = high << 32 | low
+        return .packet(length:length,config:flags & (1 << 62) != 0,
+                       keyFrame:flags & (1 << 61) != 0,pts:flags & ((1 << 61)-1))
+    }
+    static func nalUnits(_ annexB: Data) throws -> [Data] {
+        let b = Array(annexB)
+        var starts: [(Int,Int)] = [], i = 0
+        while i + 3 <= b.count {
+            if i + 4 <= b.count && b[i] == 0 && b[i+1] == 0 && b[i+2] == 0 && b[i+3] == 1 {
+                starts.append((i,i+4)); i += 4
+            } else if b[i] == 0 && b[i+1] == 0 && b[i+2] == 1 {
+                starts.append((i,i+3)); i += 3
+            } else { i += 1 }
+        }
+        guard !starts.isEmpty, starts[0].0 == 0 else { throw ScanError("手机镜像 H.264 数据缺少起始码。") }
+        return try starts.enumerated().map { index, start in
+            let end = index + 1 < starts.count ? starts[index+1].0 : b.count
+            guard end > start.1 else { throw ScanError("手机镜像 H.264 空单元。") }
+            return Data(b[start.1..<end])
+        }
+    }
+    static func touch(action: UInt8, x: Double, y: Double, width: Int, height: Int) -> Data? {
+        guard x.isFinite, y.isFinite, width > 0, height > 0,
+              width <= 65535, height <= 65535 else { return nil }
+        func be<T: FixedWidthInteger>(_ value: T) -> [UInt8] {
+            withUnsafeBytes(of: value.bigEndian) { Array($0) }
+        }
+        let px = UInt32((min(1,max(0,x)) * Double(width-1)).rounded())
+        let py = UInt32((min(1,max(0,y)) * Double(height-1)).rounded())
+        var data = Data([2, action]) // inject touch, Android ACTION_DOWN/MOVE/UP
+        data.append(contentsOf: be(UInt64.max - 1)) // SC_POINTER_ID_GENERIC_FINGER (-2)
+        data.append(contentsOf: be(px)); data.append(contentsOf: be(py))
+        data.append(contentsOf: be(UInt16(width))); data.append(contentsOf: be(UInt16(height)))
+        data.append(contentsOf: be(UInt16(action == 1 ? 0 : 0xffff))) // pressure
+        data.append(contentsOf: be(UInt32(0))); data.append(contentsOf: be(UInt32(0)))
+        return data
+    }
+    static func key(action: UInt8, code: Int) -> Data? {
+        guard code >= 0 && code <= Int(Int32.max) else { return nil }
+        var data = Data([0,action]); var value = UInt32(code).bigEndian
+        withUnsafeBytes(of:&value) { data.append(contentsOf:$0) }
+        data.append(Data(repeating:0,count:8)) // repeat, meta state
+        return data
+    }
+}
+
+private final class MirrorSocket {
+    private(set) var fd: Int32 = -1
+    init(port: UInt16) throws {
+        let socketFD = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard socketFD >= 0 else { throw ScanError("无法建立镜像连接。") }
+        fd = socketFD
+        var timeout = timeval(tv_sec:2,tv_usec:0), one:Int32 = 1
+        setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&one,socklen_t(MemoryLayout<Int32>.size))
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let result = withUnsafePointer(to:&address) { p in
+            p.withMemoryRebound(to:sockaddr.self,capacity:1) {
+                Darwin.connect(fd,$0,socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if result != 0 { Darwin.close(fd);fd = -1;throw ScanError("镜像服务尚未就绪。") }
+    }
+    deinit { if fd>=0 {Darwin.close(fd)} }
+    func interrupt() { Darwin.shutdown(fd,SHUT_RDWR) }
+    func read(_ length: Int, timeout: TimeInterval? = nil) throws -> Data {
+        let deadline=timeout.map {Date().addingTimeInterval($0)}
+        var data = Data(count:length)
+        try data.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var offset = 0
+            while offset < length {
+                let count = Darwin.recv(fd,base.advanced(by:offset),length-offset,0)
+                if count < 0 && errno == EINTR { continue }
+                if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if let deadline, Date() >= deadline {throw ScanError("读取手机镜像数据超时。")}
+                    continue // an unchanged display may legitimately emit no new frame
+                }
+                guard count > 0 else { throw ScanError("手机镜像连接中断。") }
+                offset += count
+            }
+        }
+        return data
+    }
+    func write(_ data: Data) throws {
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var offset = 0
+            while offset < raw.count {
+                let count = Darwin.send(fd,base.advanced(by:offset),raw.count-offset,0)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw ScanError("手机控制连接中断。") }
+                offset += count
+            }
+        }
+    }
+}
+
+private final class H264Decoder: @unchecked Sendable {
+    enum Output {
+        case image(@Sendable (CGImage) -> Void)
+        case pixelBuffer(@Sendable (CVPixelBuffer) -> Void)
+    }
+    private var sps: Data?, pps: Data?, format: CMVideoFormatDescription?, decoder: VTDecompressionSession?
+    private let output:Output
+    private let context:CIContext?
+    init(output:Output) {
+        self.output=output
+        if case .image = output {context=CIContext(options:[.useSoftwareRenderer:false])}
+        else {context=nil}
+    }
+    deinit { if let decoder { VTDecompressionSessionInvalidate(decoder) } }
+    func reset() {
+        if let decoder { VTDecompressionSessionInvalidate(decoder) }
+        decoder=nil; format=nil; sps=nil; pps=nil
+    }
+    private func configure() throws {
+        guard let sps, let pps else { return }
+        if let decoder { VTDecompressionSessionInvalidate(decoder) }
+        self.decoder=nil; self.format=nil
+        let status = try sps.withUnsafeBytes { s in
+            try pps.withUnsafeBytes { p -> OSStatus in
+                guard let sb = s.baseAddress?.assumingMemoryBound(to:UInt8.self),
+                      let pb = p.baseAddress?.assumingMemoryBound(to:UInt8.self) else {
+                    throw ScanError("手机镜像 H.264 配置为空。")
+                }
+                var pointers:[UnsafePointer<UInt8>] = [sb,pb]
+                var lengths:[Int] = [s.count,p.count]
+                return CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    allocator:kCFAllocatorDefault,parameterSetCount:2,
+                    parameterSetPointers:&pointers,parameterSetSizes:&lengths,
+                    nalUnitHeaderLength:4,formatDescriptionOut:&format)
+            }
+        }
+        guard status == noErr, let format else { throw ScanError("手机镜像 H.264 参数无效。") }
+        let callback:VTDecompressionOutputCallback = { ref, _, status, _, image, _, _ in
+            guard status == noErr, let image, let ref else { return }
+            let owner = Unmanaged<H264Decoder>.fromOpaque(ref).takeUnretainedValue()
+            switch owner.output {
+            case let .pixelBuffer(onFrame):
+                onFrame(image)
+            case let .image(onFrame):
+                let ci = CIImage(cvPixelBuffer:image)
+                if let frame = owner.context?.createCGImage(ci,from:ci.extent) {onFrame(frame)}
+            }
+        }
+        var record = VTDecompressionOutputCallbackRecord(decompressionOutputCallback:callback,
+                                                         decompressionOutputRefCon:Unmanaged.passUnretained(self).toOpaque())
+        let attributes:[NSString:Any] = [kCVPixelBufferPixelFormatTypeKey:kCVPixelFormatType_32BGRA]
+        let hardware:[NSString:Any] = [kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder:true]
+        let created = VTDecompressionSessionCreate(allocator:kCFAllocatorDefault,
+                            formatDescription:format,decoderSpecification:hardware as CFDictionary,
+                            imageBufferAttributes:attributes as CFDictionary,
+                            outputCallback:&record,decompressionSessionOut:&decoder)
+        guard created == noErr else { throw ScanError("Mac 无法创建 H.264 硬件解码器。") }
+    }
+    func feed(_ payload:Data, config:Bool) throws {
+        let units = try MirrorProtocol.nalUnits(payload)
+        var changed = false
+        for unit in units {
+            switch unit[unit.startIndex] & 0x1f {
+            case 7: if sps != unit {sps=unit;changed=true}
+            case 8: if pps != unit {pps=unit;changed=true}
+            default: break
+            }
+        }
+        if changed {try configure()}
+        if config {return}
+        guard let decoder, let format else { return } // wait for SPS/PPS and an IDR
+        let media = units.filter { let type=$0[$0.startIndex] & 0x1f; return type != 7 && type != 8 }
+        guard !media.isEmpty else { return }
+        var avcc = Data()
+        for unit in media {
+            var length=UInt32(unit.count).bigEndian
+            withUnsafeBytes(of:&length) {avcc.append(contentsOf:$0)}
+            avcc.append(unit)
+        }
+        var block:CMBlockBuffer?
+        let created = avcc.withUnsafeBytes { raw -> OSStatus in
+            guard raw.baseAddress != nil else {return -1}
+            return CMBlockBufferCreateWithMemoryBlock(allocator:kCFAllocatorDefault,
+                memoryBlock:nil,blockLength:raw.count,blockAllocator:kCFAllocatorDefault,
+                customBlockSource:nil,offsetToData:0,dataLength:raw.count,flags:0,blockBufferOut:&block)
+        }
+        guard created == noErr, let block else {throw ScanError("H.264 帧内存分配失败。")}
+        let copy = avcc.withUnsafeBytes { raw in
+            CMBlockBufferReplaceDataBytes(with:raw.baseAddress!,blockBuffer:block,offsetIntoDestination:0,dataLength:raw.count)
+        }
+        guard copy == noErr else {throw ScanError("H.264 帧拷贝失败。")}
+        var sample:CMSampleBuffer?, size=avcc.count
+        let sampleStatus=CMSampleBufferCreateReady(allocator:kCFAllocatorDefault,dataBuffer:block,
+            formatDescription:format,sampleCount:1,sampleTimingEntryCount:0,
+            sampleTimingArray:nil,sampleSizeEntryCount:1,sampleSizeArray:&size,sampleBufferOut:&sample)
+        guard sampleStatus == noErr, let sample else {throw ScanError("H.264 样本无效。")}
+        var flags:VTDecodeInfoFlags=[]
+        let status=VTDecompressionSessionDecodeFrame(decoder,sampleBuffer:sample,
+                                flags:[],frameRefcon:nil,infoFlagsOut:&flags)
+        guard status == noErr else {throw ScanError("H.264 硬件解码失败（\(status)）。")}
+    }
+}
+
+final class MirrorSession: @unchecked Sendable {
+    private let lock=NSLock()
+    private let inputQueue=DispatchQueue(label:"com.idc006.mirror.input",qos:.userInitiated)
+    private var generation=0, video:MirrorSocket?, control:MirrorSocket?, server:Process?
+    private var adbURL:URL?, serial:String?, port:UInt16?, socketName:String?, remotePath:String?
+    private var width=0, height=0
+    private var started=false, stopping=false
+    private var preparing:DispatchGroup?
+    private var failureCallback: (@Sendable (String)->Void)?
+    private var stopWaiters:[CheckedContinuation<Void,Never>]=[]
+    private func begin(adbURL:URL,serial:String,
+                       onFailure:@escaping @Sendable (String)->Void) throws -> (Int,String,DispatchGroup) {
+        lock.lock();defer {lock.unlock()}
+        guard !started && !stopping else {throw ScanError("手机镜像已经运行或正在关闭。")}
+        started=true;generation += 1
+        self.adbURL=adbURL;self.serial=serial
+        failureCallback=onFailure
+        let token=UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
+        let scid="0"+String(token.prefix(7)) // 31-bit signed scid, 8 hex digits
+        socketName="scrcpy_"+scid
+        remotePath="/data/local/tmp/006idc-mirror-\(token).jar"
+        let group=DispatchGroup();group.enter();preparing=group
+        return (generation,scid,group)
+    }
+    func start(adbURL:URL,serverURL:URL,serial:String,displayID:Int,
+               onFrame:@escaping @Sendable (CGImage)->Void,
+               onFailure:@escaping @Sendable (String)->Void) async throws {
+        try await start(adbURL:adbURL,serverURL:serverURL,serial:serial,displayID:displayID,
+                        output:.image(onFrame),onFailure:onFailure)
+    }
+    /// Delivers the decoder's pixel buffer directly. The receiver must retain it
+    /// (for example, in a latest-only mailbox) before this callback returns.
+    func startVideo(adbURL:URL,serverURL:URL,serial:String,displayID:Int,
+                    onFrame:@escaping @Sendable (CVPixelBuffer)->Void,
+                    onFailure:@escaping @Sendable (String)->Void) async throws {
+        try await start(adbURL:adbURL,serverURL:serverURL,serial:serial,displayID:displayID,
+                        output:.pixelBuffer(onFrame),onFailure:onFailure)
+    }
+    private func start(adbURL:URL,serverURL:URL,serial:String,displayID:Int,
+                       output:H264Decoder.Output,
+                       onFailure:@escaping @Sendable (String)->Void) async throws {
+        guard displayID >= 0, !serial.isEmpty, !serial.contains("\n"),
+              FileManager.default.fileExists(atPath:serverURL.path) else {
+            throw ScanError("手机镜像参数或 scrcpy 服务文件无效。")
+        }
+        let (epoch,scid,group)=try begin(adbURL:adbURL,serial:serial,onFailure:onFailure)
+        do {
+            try await withCheckedThrowingContinuation { (continuation:CheckedContinuation<Void,Error>) in
+                DispatchQueue.global(qos:.userInitiated).async {
+                    defer {group.leave()}
+                    do {
+                        try self.prepare(adbURL:adbURL,serverURL:serverURL,serial:serial,
+                                         displayID:displayID,scid:scid,epoch:epoch)
+                        continuation.resume()
+                    } catch {continuation.resume(throwing:error)}
+                }
+            }
+            let deliver:H264Decoder.Output
+            switch output {
+            case let .image(onFrame):
+                deliver = .image { [weak self] image in
+                    guard let self, self.isCurrent(epoch) else {return}
+                    onFrame(image)
+                }
+            case let .pixelBuffer(onFrame):
+                deliver = .pixelBuffer { [weak self] pixelBuffer in
+                    guard let self, self.isCurrent(epoch) else {return}
+                    onFrame(pixelBuffer)
+                }
+            }
+            let decoder=H264Decoder(output:deliver)
+            DispatchQueue.global(qos:.userInitiated).async { [weak self] in
+                guard let self else {return}
+                do {try self.receive(epoch:epoch,decoder:decoder)}
+                catch {
+                    if self.isCurrent(epoch) {onFailure(error.localizedDescription)}
+                }
+            }
+        } catch {
+            // A canceled preparation may complete after a newer start. It must
+            // never stop that newer session from its delayed error path.
+            if isCurrent(epoch) {await stop()}
+            throw error
+        }
+    }
+    private func isCurrent(_ epoch:Int)->Bool {
+        lock.lock();defer {lock.unlock()};return started && generation==epoch
+    }
+    private func adb(_ args:[String],url:URL,serial:String,timeout:TimeInterval=15,cancelEpoch:Int?=nil) throws -> String {
+        try ShellCommand.run(url,["-s",serial]+args,timeout:timeout,cancellationRequested:{ [weak self] in
+            guard let cancelEpoch else{return false}
+            return self?.isCurrent(cancelEpoch) != true
+        })
+    }
+    private func prepare(adbURL:URL,serverURL:URL,serial:String,displayID:Int,
+                         scid:String,epoch:Int) throws {
+        guard isCurrent(epoch) else {throw ScanError("手机镜像已停止。")}
+        lock.lock();let path=remotePath!, name=socketName!;lock.unlock()
+        _=try adb(["push",serverURL.path,path],url:adbURL,serial:serial,timeout:30,cancelEpoch:epoch)
+        guard isCurrent(epoch) else {throw ScanError("手机镜像已停止。")}
+        let forwarded=try adb(["forward","tcp:0","localabstract:"+name],url:adbURL,serial:serial,cancelEpoch:epoch)
+        guard let port=UInt16(forwarded),port>0 else {throw ScanError("无法建立手机镜像 USB 转发。")}
+        lock.lock();self.port=port;lock.unlock()
+        let process=Process(), pipe=Pipe()
+        process.executableURL=adbURL
+        process.arguments=["-s",serial,"shell",
+            "CLASSPATH=\(path) app_process / com.genymobile.scrcpy.Server 5.0.1 scid=\(scid) tunnel_forward=true video=true audio=false control=true display_id=\(displayID) video_codec=h264 max_size=1600 max_fps=60 clipboard_autosync=false send_device_meta=false send_dummy_byte=true cleanup=true"]
+        process.standardOutput=pipe;process.standardError=pipe
+        // Drain stderr/stdout continuously: a full ADB pipe would stall the server.
+        pipe.fileHandleForReading.readabilityHandler={handle in
+            if handle.availableData.isEmpty {handle.readabilityHandler=nil}
+        }
+        try process.run()
+        lock.lock();server=process;lock.unlock()
+        let deadline=Date().addingTimeInterval(12)
+        var video:MirrorSocket?
+        while Date()<deadline && isCurrent(epoch) {
+            if let connected=try? MirrorSocket(port:port),
+               let dummy=try? connected.read(1,timeout:min(2,deadline.timeIntervalSinceNow)),
+               dummy==Data([0]) {video=connected;break}
+            if !process.isRunning {break}
+            Thread.sleep(forTimeInterval:0.12)
+        }
+        guard let video, isCurrent(epoch) else {throw ScanError("手机镜像服务未启动，请检查手机连接。")}
+        let control=try MirrorSocket(port:port)
+        lock.lock()
+        if generation==epoch && started {self.video=video;self.control=control}
+        lock.unlock()
+        guard isCurrent(epoch) else {video.interrupt();control.interrupt();throw ScanError("手机镜像已停止。")}
+    }
+    private func receive(epoch:Int,decoder:H264Decoder) throws {
+        lock.lock();let video=self.video;lock.unlock()
+        guard let video else {throw ScanError("手机镜像连接丢失。")}
+        // A prewarmed empty virtual display may not emit codec data until a task arrives.
+        // The visible-route first-frame deadline is owned by AppController; stop interrupts this read.
+        let codec=try video.read(4)
+        guard codec==Data([0x68,0x32,0x36,0x34]) else {throw ScanError("手机未提供 H.264 镜像流。")}
+        while isCurrent(epoch) {
+            let header=try MirrorProtocol.header(video.read(12))
+            switch header {
+            case let .session(width,height,_):
+                lock.lock();self.width=width;self.height=height;lock.unlock()
+                decoder.reset()
+            case let .packet(length,config,_,_):
+                let payload=try video.read(length,timeout:10)
+                if isCurrent(epoch) {try decoder.feed(payload,config:config)}
+            }
+        }
+    }
+    func tap(x:Double,y:Double) {
+        guard let epoch=currentEpoch() else {return}
+        inputQueue.async { [weak self] in
+            guard let self else {return}
+            do {
+                try self.sendTouch(0,x,y,epoch:epoch)
+                try self.sendTouch(1,x,y,epoch:epoch)
+            } catch {self.reportInputFailure(error,epoch:epoch)}
+        }
+    }
+    func swipe(x1:Double,y1:Double,x2:Double,y2:Double) {
+        guard let epoch=currentEpoch() else {return}
+        inputQueue.async { [weak self] in
+            guard let self else {return}
+            do {
+                try self.sendTouch(0,x1,y1,epoch:epoch)
+                for step in 1...8 {
+                    guard self.isCurrent(epoch) else {return}
+                    let t=Double(step)/8
+                    try self.sendTouch(2,x1+(x2-x1)*t,y1+(y2-y1)*t,epoch:epoch)
+                    Thread.sleep(forTimeInterval:0.012)
+                }
+                try self.sendTouch(1,x2,y2,epoch:epoch)
+            } catch {self.reportInputFailure(error,epoch:epoch)}
+        }
+    }
+    func key(_ code:Int) {
+        guard let epoch=currentEpoch(),let down=MirrorProtocol.key(action:0,code:code),
+              let up=MirrorProtocol.key(action:1,code:code) else {return}
+        inputQueue.async { [weak self] in
+            guard let self else {return}
+            do {try self.send(down,epoch:epoch);try self.send(up,epoch:epoch)}
+            catch {self.reportInputFailure(error,epoch:epoch)}
+        }
+    }
+    private func currentEpoch()->Int? {
+        lock.withLock {started ? generation:nil}
+    }
+    private func sendTouch(_ action:UInt8,_ x:Double,_ y:Double,epoch:Int) throws {
+        let (w,h)=lock.withLock {(width,height)}
+        guard let message=MirrorProtocol.touch(action:action,x:x,y:y,width:w,height:h) else {
+            if isCurrent(epoch) {throw ScanError("手机镜像画面尚未就绪。")}
+            return
+        }
+        try send(message,epoch:epoch)
+    }
+    private func send(_ data:Data,epoch:Int) throws {
+        let (current,channel)=lock.withLock {(started && generation==epoch,control)}
+        guard current else {return}
+        guard let channel else {throw ScanError("手机控制连接尚未就绪。")}
+        try channel.write(data)
+    }
+    private func reportInputFailure(_ error:Error,epoch:Int) {
+        let callback=lock.withLock {started && generation==epoch ? failureCallback:nil}
+        callback?(error.localizedDescription)
+    }
+    func stop() async {
+        await withCheckedContinuation { (continuation:CheckedContinuation<Void,Never>) in
+            let state: (MirrorSocket?,MirrorSocket?,DispatchGroup?)? = lock.withLock {
+                if stopping {
+                    stopWaiters.append(continuation)
+                    return nil
+                }
+                stopping=true;generation += 1;started=false
+                return (video,control,preparing)
+            }
+            guard let (video,control,preparing)=state else {return}
+            video?.interrupt();control?.interrupt()
+            DispatchQueue.global(qos:.utility).async {
+                preparing?.wait()
+                let (server,adbURL,serial,port,name,path) = self.lock.withLock { () -> (Process?,URL?,String?,UInt16?,String?,String?) in
+                    let snapshot=(self.server,self.adbURL,self.serial,self.port,self.socketName,self.remotePath)
+                    self.video=nil;self.control=nil;self.server=nil;self.port=nil
+                    self.width=0;self.height=0;self.preparing=nil
+                    return snapshot
+                }
+                if let server,server.isRunning {server.terminate()}
+                guard let adbURL,let serial else {
+                    let waiters=self.finishStopping()
+                    continuation.resume()
+                    for waiter in waiters {waiter.resume()}
+                    return
+                }
+                if let port,let name,
+                   let listing=try? self.adb(["forward","--list"],url:adbURL,serial:serial),
+                   listing.split(separator:"\n").contains(where:{$0 == "\(serial) tcp:\(port) localabstract:\(name)"}) {
+                    _=try? self.adb(["forward","--remove","tcp:\(port)"],url:adbURL,serial:serial)
+                }
+                if let path { _=try? self.adb(["shell","rm","-f",path],url:adbURL,serial:serial) }
+                let waiters=self.finishStopping()
+                continuation.resume()
+                for waiter in waiters {waiter.resume()}
+            }
+        }
+    }
+    private func finishStopping()->[CheckedContinuation<Void,Never>] {
+        lock.withLock {
+            stopping=false;failureCallback=nil
+            let waiters=stopWaiters;stopWaiters=[]
+            return waiters
+        }
+    }
+}
