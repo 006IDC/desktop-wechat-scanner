@@ -30,7 +30,22 @@ struct AndroidAppDisplay: Codable, Identifiable, Equatable, Sendable {
     let width: Int
     let height: Int
     let dpi: Int
+    var independentLock: Bool? = nil
     var isValid: Bool { id > 0 && (1...4096).contains(width) && (1...4096).contains(height) && (1...2000).contains(dpi) }
+}
+
+/// Ephemeral authenticated stream; never persist or log its token.
+struct DirectMirrorDescriptor: Codable, Sendable {
+    let display:Int
+    let socket:String
+    let token:String
+    let width:Int
+    let height:Int
+    var isValid:Bool {
+        display>0 && (1...4096).contains(width) && (1...4096).contains(height) &&
+        socket.range(of:"^006idc_video_[0-9a-f]{32}$",options:.regularExpression) != nil &&
+        token.range(of:"^[0-9a-f]{32}$",options:.regularExpression) != nil
+    }
 }
 
 /// Only identifiers needed for moving a task back; no intent extras or content.

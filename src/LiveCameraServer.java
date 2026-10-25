@@ -25,6 +25,8 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Process;
 import android.os.UserHandle;
+import android.os.UserManager;
+import android.view.Display;
 import android.view.Surface;
 
 import java.io.ByteArrayInputStream;
@@ -60,6 +62,8 @@ public final class LiveCameraServer {
     private int displayDpi = 320;
     private static final int SOCKET_IDLE_MS = 90_000;
     private static final int FIRST_CONNECTION_MS = 60_000;
+    private static final String INDEPENDENT_LOCK_PERMISSION = "android.permission.ADD_ALWAYS_UNLOCKED_DISPLAY";
+    private boolean independentLockRequested;
 
     private final Object cameraLock = new Object();
     private final Object frameLock = new Object();
@@ -79,12 +83,13 @@ public final class LiveCameraServer {
     private Object camera;
     private VirtualDisplay display;
     private ImageReader displayReader;
+    private final Map<Integer, DirectDisplayStream> directStreams = new ConcurrentHashMap<>();
     private final Map<Integer, AppDisplay> appDisplays = new ConcurrentHashMap<>();
     private static final class AppDisplay {
         final VirtualDisplay display;
         final ImageReader reader;
         AppDisplay(VirtualDisplay display, ImageReader reader) { this.display = display; this.reader = reader; }
-        void close() { display.release(); reader.close(); }
+        void close() { try { display.release(); } finally { reader.close(); } }
     }
     private HandlerThread imageThread;
     private LocalServerSocket server;
@@ -104,13 +109,119 @@ public final class LiveCameraServer {
         return CameraProbe.call(target, method, types, values);
     }
 
+    static boolean requestedIndependentLock(String[] args) {
+        if ((args.length != 3 && args.length != 4) || !args[1].matches("006idc_scan_[0-9a-f]{8}") ||
+                !args[2].matches("[0-9a-f]{32}") || (args.length == 4 && !"independent-lock".equals(args[3])))
+            throw new IllegalArgumentException("Expected associationId 006idc_scan_<8 hex> <32 hex token> [independent-lock]");
+        return args.length == 4;
+    }
+
+    static void requireIndependentLockPrerequisites(int userId, boolean userUnlocked, boolean permissionGranted) {
+        if (userId != 0) throw new SecurityException("Independent app displays require the primary Android user");
+        if (!userUnlocked) throw new SecurityException("Unlock the primary phone user normally once after boot before enabling independent app displays");
+        if (!permissionGranted) throw new SecurityException("Independent app displays require existing android.permission.ADD_ALWAYS_UNLOCKED_DISPLAY permission; no permission was granted");
+    }
+
+    static boolean verifyIndependentDisplayFlags(boolean requested, int displayId, boolean valid, int flags, int alwaysUnlockedFlag) {
+        if (!requested) return false;
+        // AOSP Android 16 android.view.Display.FLAG_ALWAYS_UNLOCKED is 1<<9.
+        // This is NOT DisplayManager.VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED (1<<12).
+        if (alwaysUnlockedFlag != (1 << 9))
+            throw new IllegalStateException("Unsupported actual Display.FLAG_ALWAYS_UNLOCKED value");
+        if (!valid || displayId <= Display.DEFAULT_DISPLAY || (flags & alwaysUnlockedFlag) == 0)
+            throw new IllegalStateException("Independent lock policy was requested but is not active on the created app display; display creation was cancelled");
+        return true;
+    }
+
+    private boolean verifyIndependentLock(VirtualDisplay candidate) throws Exception {
+        if (!independentLockRequested) return false;
+        final int actualFlag;
+        try { actualFlag = Display.class.getField("FLAG_ALWAYS_UNLOCKED").getInt(null); }
+        catch (ReflectiveOperationException unsupported) {
+            throw new IllegalStateException("System does not expose the required Display.FLAG_ALWAYS_UNLOCKED verification", unsupported);
+        }
+        Display actual = candidate == null ? null : candidate.getDisplay();
+        return verifyIndependentDisplayFlags(true, actual == null ? -1 : actual.getDisplayId(),
+                actual != null && actual.isValid(), actual == null ? 0 : actual.getFlags(), actualFlag);
+    }
+
+    static boolean independentDisplayOn(int displayId, boolean valid, int state) {
+        if (!valid || displayId <= Display.DEFAULT_DISPLAY)
+            throw new IllegalStateException("Independent display power verification requires a valid owned non-default display");
+        return state == Display.STATE_ON;
+    }
+
+    static void verifyPrimaryDisplayPower(int before, int after) {
+        if (before == Display.STATE_OFF && after == Display.STATE_ON)
+            throw new IllegalStateException("Independent display wakeUp also turned the primary display ON; screen-off independent use is unsupported");
+    }
+
+    private int primaryDisplayState() {
+        DisplayManager manager = context.getSystemService(DisplayManager.class);
+        Display primary = manager == null ? null : manager.getDisplay(Display.DEFAULT_DISPLAY);
+        if (primary == null || !primary.isValid())
+            throw new IllegalStateException("Cannot read primary display power state for independent wake verification");
+        return primary.getState();
+    }
+
+    private void wakeIndependentDisplay(VirtualDisplay candidate) throws Exception {
+        if (!independentLockRequested) return;
+        Display actual = candidate == null ? null : candidate.getDisplay();
+        if (actual == null || actual.getDisplayId() <= Display.DEFAULT_DISPLAY || !actual.isValid())
+            throw new IllegalStateException("Cannot wake an invalid independent app display");
+        final int ownedId = actual.getDisplayId();
+        final int primaryBefore = primaryDisplayState();
+        log("primary_display_state_before", String.valueOf(primaryBefore));
+        try {
+            try {
+                // AOSP Android 16 VirtualDevice.wakeUp() operates only this device's
+                // trusted owned display groups. Never use PowerManager/display 0.
+                call(device, "wakeUp", new Class[]{});
+            } catch (NoSuchMethodException unsupported) {
+                throw new UnsupportedOperationException("Independent virtual-device wakeUp is unsupported on this system", unsupported);
+            } catch (InvocationTargetException rejected) {
+                throw new IllegalStateException("Independent virtual-device wakeUp was rejected by the system", rejected.getCause());
+            }
+            final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            int lastState = Integer.MIN_VALUE;
+            do {
+                actual = candidate.getDisplay();
+                if (actual == null || actual.getDisplayId() != ownedId || !actual.isValid())
+                    throw new IllegalStateException("Owned independent app display disappeared while waiting for power ON");
+                int state = actual.getState();
+                if (state != lastState) {
+                    log("independent_display_state", "display_id:" + ownedId + ",state:" + state);
+                    lastState = state;
+                }
+                if (independentDisplayOn(ownedId, actual.isValid(), state)) return;
+                Thread.sleep(25);
+            } while (System.nanoTime() < deadline);
+            throw new IOException("Timed out after 2 seconds waiting for owned independent display ON; display_id=" + ownedId + ", state=" + lastState);
+        } finally {
+            // Read-only physical display check; never compensate by changing its power.
+            int primaryAfter = primaryDisplayState();
+            log("primary_display_state_after", String.valueOf(primaryAfter));
+            verifyPrimaryDisplayPower(primaryBefore, primaryAfter);
+        }
+    }
+
     private void createVirtualDevice(int associationId) throws Exception {
+        if (independentLockRequested) {
+            UserManager users = context.getSystemService(UserManager.class);
+            requireIndependentLockPrerequisites(Process.myUid() / 100000, users != null && users.isUserUnlocked(),
+                    context.checkSelfPermission(INDEPENDENT_LOCK_PERMISSION) == PackageManager.PERMISSION_GRANTED);
+        }
         Class<?> paramsClass = Class.forName("android.companion.virtual.VirtualDeviceParams");
         Object builder = Class.forName(paramsClass.getName() + "$Builder").getConstructor().newInstance();
         call(builder, "setName", new Class[]{String.class}, "006IDC desktop scanner");
         int cameraPolicy = paramsClass.getField("POLICY_TYPE_CAMERA").getInt(null);
         int customPolicy = paramsClass.getField("DEVICE_POLICY_CUSTOM").getInt(null);
         call(builder, "setDevicePolicy", new Class[]{int.class, int.class}, cameraPolicy, customPolicy);
+        if (independentLockRequested) {
+            // Official SystemApi; scope is this temporary virtual device only.
+            int lockState = paramsClass.getField("LOCK_STATE_ALWAYS_UNLOCKED").getInt(null);
+            call(builder, "setLockState", new Class[]{int.class}, lockState);
+        }
         Object params = call(builder, "build", new Class[]{});
         device = call(CameraProbe.manager(), "createVirtualDevice", new Class[]{int.class, paramsClass}, associationId, params);
         deviceId = (Integer) call(device, "getDeviceId", new Class[]{});
@@ -257,6 +368,11 @@ public final class LiveCameraServer {
                 new Class[]{int.class, int.class, int.class, Surface.class, int.class, Executor.class, VirtualDisplay.Callback.class},
                 displayWidth, displayHeight, displayDpi, displayReader.getSurface(), flags,
                 callbacks, new VirtualDisplay.Callback() {});
+        // On failure main's finally releases this display, reader, camera and
+        // virtual device before exiting; do not serve an unverified session.
+        boolean independentLockReady = verifyIndependentLock(display);
+        wakeIndependentDisplay(display);
+        log("independent_lock_ready", independentLockReady ? 1 : 0);
         log("display_id", display.getDisplay().getDisplayId());
         log("display_width", displayWidth); log("display_height", displayHeight); log("display_dpi", displayDpi);
     }
@@ -299,14 +415,16 @@ public final class LiveCameraServer {
             created = (VirtualDisplay) call(device, "createVirtualDisplay",
                     new Class[]{int.class, int.class, int.class, Surface.class, int.class, Executor.class, VirtualDisplay.Callback.class},
                     displayWidth, displayHeight, displayDpi, reader.getSurface(), flags, callbacks, new VirtualDisplay.Callback() {});
+            boolean independentLock = verifyIndependentLock(created);
+            wakeIndependentDisplay(created);
             int id = created.getDisplay().getDisplayId();
             byte[] response = new JSONObject().put("id", id).put("width", displayWidth).put("height", displayHeight)
-                    .put("dpi", displayDpi).toString().getBytes(StandardCharsets.UTF_8);
+                    .put("dpi", displayDpi).put("independentLock", independentLock).toString().getBytes(StandardCharsets.UTF_8);
             appDisplays.put(id, new AppDisplay(created, reader));
             return response;
         } catch (Exception failure) {
-            if (created != null) created.release();
-            reader.close();
+            if (created != null) try { created.release(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
+            try { reader.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
         }
     }
@@ -314,8 +432,51 @@ public final class LiveCameraServer {
     private void releaseAppDisplay(int id) throws IOException {
         AppDisplay owned = appDisplays.get(id);
         if (owned == null) throw new IOException("Display does not belong to this session");
+        stopDirectStream(id);
         owned.close();
         appDisplays.remove(id);
+    }
+
+    private VirtualDisplay ownedDisplay(int id) throws IOException {
+        if (id <= 0) throw new IOException("A positive owned display is required");
+        if (display != null && display.getDisplay() != null && display.getDisplay().getDisplayId() == id) return display;
+        AppDisplay owned = appDisplays.get(id);
+        if (owned == null) throw new IOException("Display does not belong to this session");
+        return owned.display;
+    }
+
+    private byte[] startDirectStream(int id) throws Exception {
+        if (!independentLockRequested) throw new IOException("Direct video requires independent-lock mode");
+        VirtualDisplay target = ownedDisplay(id);
+        if (!verifyIndependentLock(target)) throw new IOException("Independent lock policy is not active");
+        stopDirectStream(id);
+        Surface original = target == display ? displayReader.getSurface() : appDisplays.get(id).reader.getSurface();
+        DirectDisplayStream stream = new DirectDisplayStream(target, original, displayWidth, displayHeight, () -> {
+            if (stopping || ownedDisplay(id) != target || !verifyIndependentLock(target))
+                throw new IOException("Direct display is no longer owned and independently unlocked");
+        });
+        // Register ownership before startup so failed initialization cannot lose
+        // a codec/surface whose cleanup has not completed.
+        directStreams.put(id, stream);
+        try {
+            stream.start();
+            return new JSONObject().put("display", id).put("socket", stream.socketName).put("token", stream.token)
+                    .put("width", displayWidth).put("height", displayHeight).toString().getBytes(StandardCharsets.UTF_8);
+        } catch (Exception failure) {
+            stream.close();
+            try { stream.awaitClosed(); directStreams.remove(id, stream); }
+            catch (IOException cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
+    }
+
+    private void stopDirectStream(int id) throws IOException {
+        ownedDisplay(id); // Even idempotent stops must stay inside this session.
+        DirectDisplayStream stream = directStreams.get(id);
+        if (stream != null) {
+            stream.close(); stream.awaitClosed();
+            directStreams.remove(id, stream);
+        }
     }
 
     private static boolean isSupportedImage(byte[] bytes) {
@@ -439,6 +600,13 @@ public final class LiveCameraServer {
                         reply(output, true, new byte[0]);
                     }
                 } catch (Exception failure) { error(output, "App operation failed: " + failure.getClass().getSimpleName()); }
+            } else if (command == 20 || command == 21) {
+                if (length != Integer.BYTES) { error(output, "Direct stream request needs a display ID"); continue; }
+                int id = new DataInputStream(new ByteArrayInputStream(body)).readInt();
+                try {
+                    if (command == 20) reply(output, true, startDirectStream(id));
+                    else { stopDirectStream(id); reply(output, true, new byte[0]); }
+                } catch (Exception failure) { error(output, "Direct stream operation failed: " + failure.getClass().getSimpleName()); }
             } else if (command == 9) {
                 if (length != 0) { error(output, "Stop request must be empty"); continue; }
                 reply(output, true, new byte[0]);
@@ -493,6 +661,20 @@ public final class LiveCameraServer {
         if (server != null) try { server.close(); } catch (Exception e) { clean = false; log("cleanup_error", e); }
         try { revokeWechatCamera(); } catch (Exception e) { clean = false; log("cleanup_error", "virtual camera permission: " + e); }
         painter.shutdownNow();
+        for (Map.Entry<Integer, DirectDisplayStream> entry : directStreams.entrySet()) {
+            DirectDisplayStream stream = entry.getValue();
+            try { stream.close(); stream.awaitClosed(); directStreams.remove(entry.getKey(), stream); }
+            catch (Exception e) { clean = false; log("cleanup_error", "direct stream cleanup failed; resources retained until process termination"); }
+        }
+        if (!directStreams.isEmpty()) {
+            // A worker may still be using its codec/display. Do not release any
+            // underlying VD, reader or VirtualDevice; process exit reclaims binder
+            // resources. Never claim complete cleanup in this partial path.
+            callbacks.shutdownNow();
+            acceptor.shutdownNow();
+            log("cleanup", "partial_close_failed");
+            return;
+        }
         for (AppDisplay owned : appDisplays.values()) try { owned.close(); } catch (Exception e) { clean = false; log("cleanup_error", e); }
         appDisplays.clear();
         if (display != null) try { display.release(); } catch (Exception e) { clean = false; log("cleanup_error", e); }
@@ -523,8 +705,7 @@ public final class LiveCameraServer {
         LiveCameraServer live = new LiveCameraServer();
         int result = 0;
         try {
-            if (args.length != 3 || !args[1].matches("006idc_scan_[0-9a-f]{8}") || !args[2].matches("[0-9a-f]{32}"))
-                throw new IllegalArgumentException("Expected associationId 006idc_scan_<8 hex> <32 hex token>");
+            live.independentLockRequested = requestedIndependentLock(args);
             int association = Integer.parseInt(args[0]);
             if (association <= 0) throw new IllegalArgumentException("Association ID must be positive");
             byte[] token = args[2].getBytes(StandardCharsets.US_ASCII);

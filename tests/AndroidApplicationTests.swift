@@ -17,6 +17,20 @@ import Foundation
         require(AndroidAppDisplay(id: 8, width: 1080, height: 2400, dpi: 420).isValid, "Valid geometry refused")
         require(!AndroidAppDisplay(id: 0, width: 1080, height: 2400, dpi: 420).isValid, "Physical display accepted")
         require(!AndroidAppDisplay(id: 8, width: 5000, height: 2400, dpi: 420).isValid, "Invalid geometry accepted")
+        let legacyDisplay=try JSONDecoder().decode(AndroidAppDisplay.self,from:Data(#"{"id":8,"width":720,"height":1280,"dpi":320}"#.utf8))
+        require(legacyDisplay.independentLock != true,"Old recovery must not grant independent lock access")
+        let log=ServerLog()
+        log.append(Data("QR_LIVE independent_lock_ready=1\n".utf8))
+        require(!log.independentLockReady(),"Policy alone must not authorize a server before ready")
+        log.append(Data("QR_LIVE rea".utf8));log.append(Data("dy=1\n".utf8))
+        require(log.independentLockReady(),"Fragmented verified readiness was lost")
+        let oldLog=ServerLog();oldLog.append(Data("QR_LIVE ready=1\n".utf8))
+        require(!oldLog.independentLockReady(),"Legacy server readiness must not imply independent lock support")
+        let nonce=String(repeating:"a",count:32)
+        require(DirectMirrorDescriptor(display:8,socket:"006idc_video_"+nonce,token:nonce,width:720,height:1280).isValid,"Valid direct stream rejected")
+        require(!DirectMirrorDescriptor(display:0,socket:"006idc_video_"+nonce,token:nonce,width:720,height:1280).isValid,"Direct physical display accepted")
+        require(!DirectMirrorDescriptor(display:8,socket:"scrcpy_12345678",token:nonce,width:720,height:1280).isValid,"Unscoped direct socket accepted")
+        require(!DirectMirrorDescriptor(display:8,socket:"006idc_video_"+nonce,token:nonce+"\n",width:720,height:1280).isValid,"Invalid direct token accepted")
         let dump = """
         Display #0 (activities from top to bottom):
           * Task{abc #10 type=standard}

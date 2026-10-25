@@ -116,6 +116,10 @@ final class ServerLog {
         condition.broadcast()
     }
     func dpi() -> Int { condition.lock(); defer { condition.unlock() }; return Int(fields["display_dpi"] ?? "") ?? 320 }
+    func independentLockReady() -> Bool {
+        condition.lock();defer {condition.unlock()}
+        return fields["ready"] == "1" && fields["independent_lock_ready"] == "1"
+    }
     func dimensions() -> (Int,Int) {
         condition.lock();defer {condition.unlock()}
         return (Int(fields["display_width"] ?? "") ?? 720,Int(fields["display_height"] ?? "") ?? 1280)
@@ -179,6 +183,7 @@ actor PhoneSession {
     private var server: Process?, serverPipe: Pipe?, channel: CameraSocket?
     private var displayWidth=720, displayHeight=1280, displayDpi=320
     private var displayID: Int?
+    private(set) var independentApplicationsWhenLocked=false
     private var cleaning=false
     init(resources: URL, adbURL: URL? = nil, serverSocket: String? = nil) {
         self.serverSocket = serverSocket
@@ -198,7 +203,7 @@ actor PhoneSession {
         try JSONEncoder().encode(state).write(to: recoveryURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:recoveryURL.path)
     }
-    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, progress: @escaping @Sendable (String) -> Void) async throws -> String {
+    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
         guard server == nil else { throw ScanError("手机已经连接。") }
         do {
             progress("正在检查手机连接…")
@@ -242,13 +247,16 @@ actor PhoneSession {
             try Task.checkCancellation()
             let process=Process(), pipe=Pipe(), log=ServerLog()
             process.executableURL=adbURL
-            process.arguments=(serverSocket.map { ["-L", $0] } ?? []) + ["-s",r.serial,"shell","CLASSPATH=\(r.path)/server.jar app_process / LiveCameraServer \(association) \(r.socketName) \(r.token)"]
+            let lockArgument=allowLockedApplications ? " independent-lock":""
+            process.arguments=(serverSocket.map { ["-L", $0] } ?? []) + ["-s",r.serial,"shell","CLASSPATH=\(r.path)/server.jar app_process / LiveCameraServer \(association) \(r.socketName) \(r.token)\(lockArgument)"]
             process.standardOutput=pipe;process.standardError=pipe
             pipe.fileHandleForReading.readabilityHandler = { handle in let data=handle.availableData; if !data.isEmpty {log.append(data)} }
             server=process;serverPipe=pipe;try process.run()
             let (device,display,pid)=try log.waitReady()
             (displayWidth,displayHeight)=log.dimensions(); displayDpi=log.dpi()
             displayID=display;recovery?.display=display;recovery?.device=device;recovery?.pid=pid;try save()
+            independentApplicationsWhenLocked=allowLockedApplications && log.independentLockReady()
+            if allowLockedApplications && !independentApplicationsWhenLocked {throw ScanError("手机没有确认独立窗口的锁屏策略，已停止连接。")}
             let portText=try adb(["forward","tcp:0","localabstract:"+r.socketName])
             guard let port=UInt16(portText), port>0 else {throw ScanError("USB 图像通道创建失败。")}
             recovery?.port=port;try save()
@@ -299,6 +307,27 @@ actor PhoneSession {
     func mirrorEndpoint(display: Int) throws -> (serial: String, display: Int) {
         guard let state = recovery, channel != nil, ownsDisplay(display) else { throw ScanError("屏幕不属于本次手机连接。") }
         return (state.serial, display)
+    }
+    func directMirror(display target:Int) throws -> DirectMirrorDescriptor? {
+        guard independentApplicationsWhenLocked,target != 0 else{return nil}
+        guard let channel,ownsDisplay(target),let id=Int32(exactly:target) else {throw ScanError("直连画面不属于当前应用窗口。")}
+        try requireApplicationAccess(on:target)
+        var value=id.bigEndian
+        let payload=withUnsafeBytes(of:&value){Data($0)}
+        do {
+            let descriptor=try JSONDecoder().decode(DirectMirrorDescriptor.self,from:channel.request(20,payload))
+            guard descriptor.isValid,descriptor.display==target else {throw ScanError("手机返回的直连画面信息无效。")}
+            return descriptor
+        } catch {
+            _=try? channel.request(21,payload)
+            throw error
+        }
+    }
+    func stopDirectMirror(display target:Int) throws {
+        guard independentApplicationsWhenLocked else{return}
+        guard let channel,ownsDisplay(target),let id=Int32(exactly:target) else {throw ScanError("直连画面不属于当前应用窗口。")}
+        var value=id.bigEndian
+        _=try channel.request(21,withUnsafeBytes(of:&value){Data($0)})
     }
     /// Return only a foreground component, never task extras, URLs or chat text.
     func foreground(onVirtualDisplay: Bool) async throws -> String? {
@@ -395,7 +424,7 @@ actor PhoneSession {
     }
     func scannerDisplay() -> AndroidAppDisplay? {
         guard let displayID else { return nil }
-        return AndroidAppDisplay(id: displayID, width: displayWidth, height: displayHeight, dpi: displayDpi)
+        return AndroidAppDisplay(id: displayID, width: displayWidth, height: displayHeight, dpi: displayDpi, independentLock:independentApplicationsWhenLocked)
     }
     func applications() async throws -> [AndroidApplication] {
         guard let channel else { throw ScanError("手机未连接。") }
@@ -426,13 +455,23 @@ actor PhoneSession {
             recovery?.appDisplays?.removeAll(where: { $0.id == created.id })
             throw error
         }
+        if independentApplicationsWhenLocked && created.independentLock != true {
+            try closeAppDisplay(created.id)
+            throw ScanError("新应用窗口未确认锁屏独立显示，已关闭该临时屏幕。")
+        }
         return created
     }
-    private func requireUnlocked() throws {
+    func primaryUserUnlocked() throws -> Bool {
         let trust = try shell("dumpsys trust")
-        guard let owner = trust.split(separator: "\n").first(where: { $0.contains("(id=0,") && $0.contains("(current)") }), owner.contains("deviceLocked=0") else {
-            throw ScanError("请先解锁手机，再打开应用窗口。")
-        }
+        guard let owner = trust.split(separator: "\n").first(where: { $0.contains("(id=0,") && $0.contains("(current)") }) else {throw ScanError("无法确认手机主用户的锁屏状态。")}
+        if owner.contains("deviceLocked=0") {return true}
+        if owner.contains("deviceLocked=1") {return false}
+        throw ScanError("无法确认手机主用户的锁屏状态。")
+    }
+    private func requireApplicationAccess(on target:Int) throws {
+        let confirmed=target==displayID || recovery?.appDisplays?.contains(where:{$0.id==target && $0.independentLock==true})==true
+        if independentApplicationsWhenLocked && target>0 && ownsDisplay(target) && confirmed {return}
+        guard try primaryUserUnlocked() else {throw ScanError("手机已锁定。请解锁，或重新连接并开启“手机锁屏时继续使用独立应用”。")}
     }
     private func tasks(requiredDisplay: Int? = nil) throws -> [AndroidTaskSnapshot] {
         let dump = try shell("dumpsys activity activities")
@@ -453,7 +492,7 @@ actor PhoneSession {
     }
     func launchApplication(_ app: AndroidApplication, on target: Int) throws {
         guard let state = recovery, channel != nil, ownsDisplay(target), app.isValid else { throw ScanError("应用或屏幕不属于本次连接。") }
-        try requireUnlocked()
+        try requireApplicationAccess(on:target)
         // Revalidate against the authenticated launcher catalog, never execute an arbitrary component.
         guard let channel, try catalog(channel).contains(where: { $0.canonicalComponent == app.canonicalComponent }) else { throw ScanError("手机主用户中未找到此应用入口。") }
         let before = try tasks()
@@ -642,6 +681,7 @@ actor PhoneSession {
 
     /// Synchronous inside this actor so connect/quit cannot enter cleanup twice.
     func disconnect() -> String {
+        independentApplicationsWhenLocked=false
         cleaning=true;defer {cleaning=false}
         if let state = recovery {
             do {

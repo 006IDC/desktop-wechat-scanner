@@ -33,6 +33,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var wirelessEndpoint:String?
     private var adbSettingsItem:NSMenuItem?
     private var connected=false, busy=false, paused=true, stopping=false
+    private var independentApplicationsWhenLocked=false, primaryLocked=false
     private var cameraActive=false, cameraSuppressed=false, mode=Mode.phone
     private var cameraPump:CameraPumpMailbox?,cameraFramesBase=0
     private var nextCameraDiagnostic=0.0
@@ -57,21 +58,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         control.onScan={ [weak self] in self?.enterWechat(scan:true) }
         control.onPause={ [weak self] in self?.togglePause() }
         control.onBack={ [weak self] in self?.back() }
-        control.onHome={ [weak self] in self?.physicalMirror.session.key(3) }
+        control.onHome={ [weak self] in self?.home() }
         control.onWechat={ [weak self] in self?.enterWechat(scan:false) }
         control.onApplications={ [weak self] in self?.showApplications() }
         control.onPermissionSettings={ [weak self] in self?.permissionSettings() }
         control.onRelaunch={ [weak self] in self?.relaunch() }
         control.onTouch={ [weak self] action,x,y in
-            guard let self,self.connected,!self.stopping else{return}
+            guard let self,self.connected,!self.stopping,!self.primaryLocked else{return}
             self.lastUserInput=Date();self.physicalMirror.session.touch(action:action,x:x,y:y)
         }
         control.onTap={ [weak self] x,y in
-            guard let self,self.connected,!self.stopping else{return}
+            guard let self,self.connected,!self.stopping,!self.primaryLocked else{return}
             self.lastUserInput=Date();self.physicalMirror.session.tap(x:x,y:y)
         }
         control.onSwipe={ [weak self] x1,y1,x2,y2 in
-            guard let self,self.connected,!self.busy else{return}
+            guard let self,self.connected,!self.busy,!self.primaryLocked else{return}
             self.lastUserInput=Date();self.physicalMirror.session.swipe(x1:x1,y1:y1,x2:x2,y2:y2)
         }
         control.showWindow(nil);refresh();writeDiagnosticState()
@@ -182,14 +183,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // experiment hides its controls and does not match the reference video.
         control.setLocalScanPreview(false)
         if wechatWindow != nil {
-            mainControl.update(status:connected ? "手机镜像 · \(model)" : currentStatus,detail:"通过应用列表拖出应用，分别在 Mac 窗口里使用。",connected:connected,busy:stopping,paused:true)
+            mainControl.update(status:primaryLocked ? "手机主屏已锁定" : (connected ? "手机镜像 · \(model)" : currentStatus),detail:primaryLocked ? "独立应用仍可使用；正常解锁手机后恢复主屏镜像。" : "通过应用列表拖出应用，分别在 Mac 窗口里使用。",connected:connected,busy:stopping,paused:true)
         }
         control.setMode(cameraActive ? "桌面相机" : (mode == .phone ? "手机镜像" : "微信"))
     }
     private func writeDiagnosticState(){
         let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
         try? FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
-        let value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":CGPreflightScreenCaptureAccess(),"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
+        let value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":CGPreflightScreenCaptureAccess(),"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"independentApplicationsWhenLocked":independentApplicationsWhenLocked,"primaryLocked":primaryLocked,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
         if let data=try? JSONSerialization.data(withJSONObject:value,options:.sortedKeys){try? data.write(to:folder.appendingPathComponent("diagnostic-state.json"),options:.atomic)}
     }
     private func connect(){
@@ -203,13 +204,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let chooser=ConnectionWindowController(adbURL:selected) { [weak self] device in
                     guard let self else{return}
                     let window=self.connectionWindow
+                    let allowLockedApplications=window?.allowsLockedApplications ?? false
                     self.status("正在连接","正在收束连接设置…")
                     self.connectionTask=Task {
                         let clean=await window?.waitForCleanup() ?? true
                         let ownedServer=window?.takeSelectedWirelessServer()
                         guard !self.stopping,!Task.isCancelled else{await ownedServer?.stop();return}
                         self.connectionWindow=nil
-                        if clean {self.wirelessServer=ownedServer;self.connectDevice(device,adb:selected)}
+                        if clean {self.wirelessServer=ownedServer;self.connectDevice(device,adb:selected,allowLockedApplications:allowLockedApplications)}
                         else {
                             await ownedServer?.stop()
                             if device.serverSocket == nil,device.transport == .wireless,let endpoint=try? ADBEndpoint(device.serial).value {
@@ -233,20 +235,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } catch is CancellationError {} catch {busy=false;status("连接未完成",error.localizedDescription)}
         }
     }
-    private func connectDevice(_ device:ADBDevice,adb selected:URL){
+    private func connectDevice(_ device:ADBDevice,adb selected:URL,allowLockedApplications:Bool){
         guard !connected,!stopping else{return}
-        busy=true;status("正在连接","请保持手机解锁。")
+        busy=true;status("正在连接",allowLockedApplications ? "正在确认手机的独立应用锁屏支持…" : "请保持手机解锁。")
         connectionTask=Task { [self] in
             do {
                 guard device.serverSocket == nil || wirelessServer?.socket == device.serverSocket else {throw ScanError("无线服务已结束，请重新建立连接。")}
                 adbServerSocket=device.serverSocket
                 wirelessEndpoint=device.transport == .wireless ? (try? ADBEndpoint(device.serial).value):nil
                 adbURL=selected;phoneSession=PhoneSession(resources:Bundle.main.resourceURL!,adbURL:selected,serverSocket:adbServerSocket)
-                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
+                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial,allowLockedApplications:allowLockedApplications){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
                 try Task.checkCancellation();connected=true;mode = .phone;mirrorGeneration+=1
-                try await showMirror(display:0)
+                independentApplicationsWhenLocked=await phone.independentApplicationsWhenLocked
+                primaryLocked=independentApplicationsWhenLocked ? !(try await phone.primaryUserUnlocked()) : false
+                if !primaryLocked {try await showMirror(display:0)}
                 try Task.checkCancellation();busy=false
-                status("已连接 · \(model)","直接点击或滑动手机画面；点微信后可在这里使用桌面扫码。")
+                status(primaryLocked ? "手机主屏已锁定" : "已连接 · \(model)",primaryLocked ? "可以直接打开微信或手机应用；主屏镜像将在手机正常解锁后恢复。" : "直接点击或滑动手机画面；点微信后可在这里使用桌面扫码。")
                 detachedApplications=DetachedApplications(phone:phone,adb:selected,server:Bundle.main.resourceURL!.appendingPathComponent("scrcpy-server"),serverSocket:adbServerSocket)
                 startLoop()
                 // The empty secondary display is warmed while the user operates the
@@ -275,10 +279,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc private func presentMirrorFrame(){
         updateCameraTick();detachedApplications?.present()
-        if wechatWindow != nil,let frame=physicalMirror.frames.takeLatest(),frame.generation==physicalMirror.incarnation {
+        if primaryLocked {_=physicalMirror.frames.takeLatest()}
+        else if wechatWindow != nil,let frame=physicalMirror.frames.takeLatest(),frame.generation==physicalMirror.incarnation {
             physicalFrame=frame.pixelBuffer;mainControl.setPhonePixelBuffer(frame.pixelBuffer)
         }
-        guard connected,!stopping,mirrorDisplay != nil,let frame=activeRoute.frames.takeLatest(),frame.generation==activeRoute.incarnation else{return}
+        guard connected,!stopping,mirrorDisplay != nil,!(primaryLocked && mirrorDisplay == 0),let frame=activeRoute.frames.takeLatest(),frame.generation==activeRoute.incarnation else{return}
         present(frame)
     }
     private func prepareMirror(display:Int) async throws {
@@ -298,12 +303,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             try Task.checkCancellation()
             guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
             guard let adbURL else {throw ScanError("请先设置 ADB。")}
-            try await route.session.startVideo(adbURL:adbURL,serverURL:resources.appendingPathComponent("scrcpy-server"),serial:endpoint.serial,displayID:display,serverSocket:adbServerSocket,onFrame:{ [frames=route.frames] pixels in
+            let direct=try await phone.directMirror(display:display)
+            try Task.checkCancellation()
+            guard connected,!stopping,mirrorGeneration==generation,route.incarnation==incarnation else {throw CancellationError()}
+            try await route.session.startVideo(adbURL:adbURL,serverURL:resources.appendingPathComponent("scrcpy-server"),serial:endpoint.serial,displayID:display,serverSocket:adbServerSocket,direct:direct,onFrame:{ [frames=route.frames] pixels in
                 frames.publish(pixels,generation:incarnation)
             },onFailure:{ [weak self,weak route] message in
                 Task { @MainActor in
                     guard let self,let route,self.connected,self.mirrorGeneration==generation,route.incarnation==incarnation,!self.stopping else{return}
                     route.failure=message
+                    // A main-screen stream cannot take independent applications down.
+                    if self.independentApplicationsWhenLocked,route === self.physicalMirror {
+                        self.physicalFrame=nil;self.mainControl.setPhonePixelBuffer(nil)
+                        return
+                    }
                     if self.activeRoute === route {
                         self.status("镜像连接中断",message);self.disconnect(preserveError:true)
                     }
@@ -313,7 +326,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         route.startup=task
         do {try await task.value}
         catch {
-            if mirrorGeneration==generation,route.incarnation==incarnation {route.startup=nil;route.failure=error.localizedDescription}
+            if mirrorGeneration==generation,route.incarnation==incarnation {
+                if display>0 {try? await phone.stopDirectMirror(display:display)}
+                route.startup=nil;route.failure=error.localizedDescription
+            }
             throw error
         }
     }
@@ -335,6 +351,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             try await Task.sleep(nanoseconds:16_000_000)
         }
         throw ScanError("手机镜像首帧未就绪，请解锁手机后重新连接。")
+    }
+    /// Poll only the primary user's state. Never dismiss keyguard or inject an unlock.
+    private func updatePrimaryLock() async throws {
+        guard independentApplicationsWhenLocked else{return}
+        let wasLocked=primaryLocked
+        let locked = !(try await phone.primaryUserUnlocked())
+        guard connected,!stopping,!Task.isCancelled else{return}
+        primaryLocked=locked
+        if locked {
+            physicalFrame=nil;mainControl.setPhonePixelBuffer(nil)
+            if mode == .phone {latestPhoneFrame=nil;mirrorDisplay=nil}
+            if !wasLocked,mode == .phone {status("手机主屏已锁定","独立应用仍可使用；正常解锁手机后恢复主屏镜像。")}
+        } else {
+            // Retry only the physical stream; independent windows retain their session.
+            try await prepareMirror(display:0)
+            guard connected,!stopping,!Task.isCancelled else{return}
+            if mode == .phone {mirrorDisplay=0}
+            if wasLocked,mode == .phone {status("手机镜像","手机已解锁，正在恢复主屏画面。")}
+        }
+        refresh()
     }
     private func stopMirrors() async {
         physicalMirror.startup?.cancel();scannerMirror.startup?.cancel()
@@ -435,9 +471,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             await opening?.value
             do {
                 await clearCamera();try await phone.restoreScannerApplications();try Task.checkCancellation()
-                wechatWindow?.window?.orderOut(nil);wechatWindow=nil;mode = .phone;mirrorDisplay=0
+                wechatWindow?.window?.orderOut(nil);wechatWindow=nil;mode = .phone;mirrorDisplay=primaryLocked ? nil : 0
                 if let physicalFrame {latestPhoneFrame=physicalFrame;mainControl.setPhonePixelBuffer(physicalFrame)}
-                cameraSuppressed=false;busy=false;status("手机镜像","微信已移回手机。")
+                cameraSuppressed=false;busy=false;status(primaryLocked ? "手机主屏已锁定" : "手机镜像",primaryLocked ? "微信已移回手机；可再次打开独立应用，或正常解锁手机查看主屏。" : "微信已移回手机。")
             } catch {
                 guard connected && !stopping && !Task.isCancelled else{return}
                 busy=false;status("返回手机未完成",error.localizedDescription)
@@ -446,7 +482,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func home(){
         guard connected && !stopping else{return}
-        physicalMirror.session.key(3);showMainWindow()
+        if !primaryLocked {physicalMirror.session.key(3)}
+        showMainWindow()
     }
     private func startCamera(){
         guard connected && !busy && !stopping && !cameraSuppressed else{return}
@@ -503,6 +540,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 if Date()>=nextHeartbeat && !Task.isCancelled {
                     do {try await phone.heartbeat();failures=0} catch {failures+=1}
+                    // A physical mirror failure does not invalidate the authenticated
+                    // virtual-device heartbeat or close independent windows.
+                    if !busy {try? await updatePrimaryLock()}
                     nextHeartbeat=Date().addingTimeInterval(2)
                 }
                 if failures>=4 && !Task.isCancelled {
@@ -707,7 +747,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !networkProblem.isEmpty {problem += " " + networkProblem}
             if !chooserClean {problem += " 部分未选中的无线连接未清理，请在手机关闭无线调试。"}
             wechatWindow?.window?.orderOut(nil);wechatWindow=nil;applicationLibrary?.close();applicationLibrary=nil
-            connected=false;busy=false;stopping=false;mirrorDisplay=nil;latestPhoneFrame=nil;control.setPhoneImage(nil)
+            connected=false;busy=false;stopping=false;independentApplicationsWhenLocked=false;primaryLocked=false;mirrorDisplay=nil;latestPhoneFrame=nil;control.setPhoneImage(nil)
             if !problem.isEmpty {status("需要重新连接以清理",problem)}
             else if !preserveError {status("已断开","可以拔线，下次直接连接即可。")}
             else {refresh();writeDiagnosticState()}

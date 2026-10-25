@@ -49,7 +49,9 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
                 let display = try await phone.createAppDisplay(); entry.display = display.id
                 try Task.checkCancellation()
                 let endpoint = try await phone.mirrorEndpoint(display: display.id)
-                try await entry.mirror.startVideo(adbURL: adb, serverURL: server, serial: endpoint.serial, displayID: display.id, serverSocket: serverSocket,
+                let direct=try await phone.directMirror(display:display.id)
+                try Task.checkCancellation()
+                try await entry.mirror.startVideo(adbURL: adb, serverURL: server, serial: endpoint.serial, displayID: display.id, serverSocket: serverSocket, direct: direct,
                     onFrame: { [frames=entry.frames] pixels in frames.publish(pixels, generation: 1) },
                     onFailure: { [weak entry] _ in Task { @MainActor in
                         guard let entry, !entry.closing else { return }

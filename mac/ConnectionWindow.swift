@@ -10,7 +10,9 @@ private final class ConnectionDocumentView: NSView {
 /// Explicit connects remain owned until their bounded reply, then are cleaned.
 @MainActor
 final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    private static let lockedApplicationsPreferenceKey = "allowsLockedApplications.v1"
     var onCancel: (() -> Void)?
+    var allowsLockedApplications: Bool { lockedApplicationsCheckbox.state == .on }
     private let onSelect: (ADBDevice) -> Void
     private let manager: ADBConnectionManager
     private let adbURL: URL
@@ -37,6 +39,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     private let progress = NSProgressIndicator()
     private let refreshButton = NSButton(title: "刷新设备", target: nil, action: nil)
     private let selectButton = NSButton(title: "连接所选手机", target: nil, action: nil)
+    private let lockedApplicationsCheckbox = NSButton(checkboxWithTitle: "手机锁屏时继续使用独立应用", target: nil, action: nil)
     private let pairButton = NSButton(title: "配对", target: nil, action: nil)
     private let connectButton = NSButton(title: "建立无线连接", target: nil, action: nil)
     private let discoverButton = NSButton(title: "查找无线设备", target: nil, action: nil)
@@ -53,6 +56,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 640, height: 560)
         window.delegate = self
+        lockedApplicationsCheckbox.state = UserDefaults.standard.bool(forKey: Self.lockedApplicationsPreferenceKey) ? .on : .off
         buildContent(window)
         window.center()
     }
@@ -133,6 +137,8 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         selectButton.keyEquivalent = "\r"
         let devicesActions = row([refreshButton, spacer(), selectButton])
         let chooseHint = note("无线连接建立后，请在上方列表中选择已授权的手机。不会自动打开其他手机。")
+        lockedApplicationsCheckbox.setAccessibilityLabel("手机锁屏时继续使用独立应用")
+        let lockedApplicationsHint = note("开启后，本次连接的独立应用窗口可在手机主屏锁定时使用；手机主屏仍需正常解锁。仅在你信任这台 Mac 时开启。首次连接或手机重启后，需先解锁手机一次。")
 
         pairEndpoint.placeholderString = "例如 192.168.1.20:37123"
         pairEndpoint.setAccessibilityLabel("配对地址与端口，来自手机配对码窗口")
@@ -181,7 +187,8 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         let footer = row([progress, status, cancel])
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let stack = NSStackView(views: [title, intro, deviceTitle, scroll, devicesActions, chooseHint, box])
+        let stack = NSStackView(views: [title, intro, deviceTitle, scroll, devicesActions, chooseHint,
+                                        lockedApplicationsCheckbox, lockedApplicationsHint, box])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         let page = NSScrollView()
@@ -286,6 +293,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         servicePicker.isEnabled = !busy && !services.isEmpty
         table.isEnabled = !busy
         selectButton.isEnabled = !busy && selectedDevice != nil
+        lockedApplicationsCheckbox.isEnabled = !busy
         if busy { progress.startAnimation(nil) } else { progress.stopAnimation(nil) }
     }
 
@@ -408,6 +416,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     @objc private func selectDevice() {
         guard !busy, !closed, let device = selectedDevice else { return }
         didSelect = true
+        UserDefaults.standard.set(allowsLockedApplications, forKey: Self.lockedApplicationsPreferenceKey)
         if device.transport == .wireless && device.serverSocket != nil {
             reconnectStore.save(selectedSerial: device.serial, services: services)
         }
