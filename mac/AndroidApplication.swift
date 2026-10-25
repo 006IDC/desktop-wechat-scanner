@@ -46,29 +46,82 @@ struct AndroidTaskSnapshot: Equatable {
     let display: Int
     let packageName: String
     let rootID: Int
-    static func parse(_ dump: String) -> [Self] {
-        var display: Int?, tasks: [Int: Self] = [:]
-        var roots: [(indent: Int, id: Int)] = []
-        let taskPattern = try! NSRegularExpression(pattern: "^\\* Task\\{[^}]* #([0-9]+)")
-        let activity = try! NSRegularExpression(pattern: "ActivityRecord\\{[^}]* u0 ([A-Za-z_][A-Za-z0-9_.]*)/[^ }]+ t([0-9]+)")
+    /// Convenience for historical fixtures; production must use parseChecked.
+    static func parse(_ dump: String) -> [Self] { (try? scan(dump, strict: false, requiredDisplay: nil)) ?? [] }
+    static func parseChecked(_ dump: String, requiredDisplay: Int? = nil) throws -> [Self] {
+        try scan(dump, strict: true, requiredDisplay: requiredDisplay)
+    }
+    private struct TaskNode {
+        let indent: Int
+        let id: Int
+        let size: Int?
+        var childTasks = 0
+        var histories = 0
+    }
+    private static func scan(_ dump: String, strict: Bool, requiredDisplay: Int?) throws -> [Self] {
+        var display: Int?, displayIndent = -1, tasks: [Int: Self] = [:]
+        var displays = Set<Int>(), containerDiagnostics = false
+        var nodes: [TaskNode] = [], roots: [Int] = []
+        let displayPattern = try! NSRegularExpression(pattern: "^Display #([0-9]+) \\(activities from top to bottom\\):$")
+        let taskPattern = try! NSRegularExpression(pattern: "^\\*\\s+Task\\{[^}]* #([0-9]+)(?:[ }])")
+        let sizePattern = try! NSRegularExpression(pattern: "(?:^|\\s)sz=([0-9]+)(?:[ }])")
+        let historyStart = try! NSRegularExpression(pattern: "^(?:\\*\\s*)?Hist\\b")
+        let historyPattern = try! NSRegularExpression(pattern: "^\\*\\s+Hist\\s+#[0-9]+:\\s+ActivityRecord\\{[^}]* u([0-9]+) ([A-Za-z_][A-Za-z0-9_.]*)/[^ }]+ t([0-9]+)(?:[ }])")
+        let invalid = ScanError("无法完整核实手机任务树，已保留窗口和恢复记录。")
         for raw in dump.split(separator: "\n") {
             let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("Display #") {
-                display = Int(line.dropFirst(9).prefix(while: \.isNumber)); roots.removeAll()
-            }
-            let indent = raw.prefix(while: { $0 == " " }).count
-            let taskLine = line as NSString
-            if let match = taskPattern.firstMatch(in: line, range: NSRange(location: 0, length: taskLine.length)),
-               let id = Int(taskLine.substring(with: match.range(at: 1))) {
-                while let last = roots.last, last.indent >= indent { roots.removeLast() }
-                roots.append((indent, id))
-            }
-            guard let display else { continue }
+            let indent = raw.prefix(while: { $0 == " " || $0 == "\t" }).count
             let ns = line as NSString
-            for match in activity.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
-                guard let id = Int(ns.substring(with: match.range(at: 2))), id > 0 else { continue }
-                if line.contains("ResumedActivity"), tasks[id] != nil { continue }
-                tasks[id] = Self(id: id, display: display, packageName: ns.substring(with: match.range(at: 1)), rootID: roots.first?.id ?? id)
+            let range = NSRange(location: 0, length: ns.length)
+            if line.hasPrefix("RootWindowContainer") || line.hasPrefix("WindowContainer") || line.hasPrefix("mRootWindowContainer") {
+                containerDiagnostics = true; display = nil; roots.removeAll(); continue
+            }
+            guard !containerDiagnostics else { continue }
+            if let match = displayPattern.firstMatch(in: line, range: range), let id = Int(ns.substring(with: match.range(at: 1))) {
+                if strict && !displays.insert(id).inserted { throw invalid }
+                displays.insert(id); display = id; displayIndent = indent; roots.removeAll(); continue
+            }
+            if line.hasPrefix("Display #") {
+                if strict { throw invalid }
+                display = nil; roots.removeAll(); continue
+            }
+            guard let currentDisplay = display else { continue }
+            if indent <= displayIndent { display = nil; roots.removeAll(); continue }
+            while let last = roots.last, nodes[last].indent >= indent { roots.removeLast() }
+            if let match = taskPattern.firstMatch(in: line, range: range), let id = Int(ns.substring(with: match.range(at: 1))), id > 0 {
+                let size = sizePattern.firstMatch(in: line, range: range).flatMap { Int(ns.substring(with: $0.range(at: 1))) }
+                if strict && line.contains("sz=") && size == nil { throw invalid }
+                if let parent = roots.last { nodes[parent].childTasks += 1 }
+                nodes.append(TaskNode(indent: indent, id: id, size: size)); roots.append(nodes.count - 1); continue
+            }
+            if strict && line.hasPrefix("*") && line.dropFirst().trimmingCharacters(in: .whitespaces).hasPrefix("Task") { throw invalid }
+            guard historyStart.firstMatch(in: line, range: range) != nil else { continue }
+            guard let leaf = roots.last, let root = roots.first,
+                  let match = historyPattern.firstMatch(in: line, range: range),
+                  let user = Int(ns.substring(with: match.range(at: 1))),
+                  let id = Int(ns.substring(with: match.range(at: 3))), id == nodes[leaf].id else {
+                if strict { throw invalid }; continue
+            }
+            nodes[leaf].histories += 1
+            guard user == 0 else {
+                if strict { throw invalid }
+                continue
+            }
+            let entry = Self(id: id, display: currentDisplay, packageName: ns.substring(with: match.range(at: 2)), rootID: nodes[root].id)
+            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID { throw invalid }
+            tasks[id] = entry
+        }
+        if strict {
+            guard !displays.isEmpty, requiredDisplay.map({ displays.contains($0) }) ?? true else { throw invalid }
+            for node in nodes {
+                let recognizedChildren = node.childTasks + node.histories
+                if let size = node.size {
+                    // sz counts direct children, not activities in descendants:
+                    // a split root with two empty child tasks is legitimately sz=2.
+                    guard recognizedChildren == size else { throw invalid }
+                } else {
+                    guard recognizedChildren > 0 else { throw invalid }
+                }
             }
         }
         return tasks.values.sorted { $0.id < $1.id }

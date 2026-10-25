@@ -12,7 +12,7 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-RELEASE = '0.4.0-preview.1'
+RELEASE = '0.4.0-preview.2'
 APP_NAME = '桌面微信扫码.app'
 STEM = f'DesktopWeChatScanner-{RELEASE}-macOS-arm64'
 OUT = ROOT / 'build/release' / RELEASE
@@ -79,7 +79,7 @@ def main():
         if (resources/'SOURCE-REVISION.txt').read_text().strip() != revision:
             raise RuntimeError('App source revision does not match current commit')
         info = plistlib.loads((app/'Contents/Info.plist').read_bytes())
-        if (info['CFBundleShortVersionString'], info['CFBundleVersion'], info['DesktopScannerRelease']) != ('0.4.0', '12', RELEASE):
+        if (info['CFBundleShortVersionString'], info['CFBundleVersion'], info['DesktopScannerRelease']) != ('0.4.0', '13', RELEASE):
             raise RuntimeError('Release/Info.plist mismatch')
         executable = app/'Contents/MacOS/DesktopWeChatScanner'
         if run('lipo', '-archs', str(executable)) != 'arm64' or not os.access(executable, os.X_OK):
@@ -108,7 +108,7 @@ def main():
         if set(bundle) != allowed:
             raise RuntimeError('Incomplete bundle')
         readme = stage/'安装说明.txt'
-        readme.write_text('桌面微信扫码 0.4.0-preview.1\n\n'
+        readme.write_text('桌面微信扫码 0.4.0-preview.2\n\n'
                           '将桌面微信扫码.app拖到应用程序目录。仅支持Apple Silicon、macOS 14.4+。\n'
                           '预览版：Android 16目标环境；无线配对和应用独立窗口有设备兼容性限制。\n'
                           '已内置开源ADB，无需额外安装。无线连接需在手机允许配对，配对码只填入App。\n'
@@ -151,7 +151,7 @@ def main():
                 raise RuntimeError('Release ZIP lost executable permission')
         manifest = {'release':'v'+RELEASE, 'source_repository':'https://github.com/006IDC/desktop-wechat-scanner',
                     'source_commit':revision, 'architecture':'arm64', 'minimum_macos':'14.4',
-                    'app_version':'0.4.0', 'app_build':'12', 'signature':'ad-hoc', 'notarized':False,
+                    'app_version':'0.4.0', 'app_build':'13', 'signature':'ad-hoc', 'notarized':False,
                     'bundled_adb':True, 'adb_source_version':'37.0.0-android-tools',
                     'known_limitations':['desktop camera round-trip latency remains', 'app pairing UI not yet verified',
                     'manual wireless endpoints required; bundled adb has no mDNS discovery',

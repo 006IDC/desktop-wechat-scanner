@@ -34,6 +34,119 @@ import Foundation
         require(tasks.count == 3 && tasks[0].id == 12 && tasks[0].rootID == 10 && tasks[0].display == 0, "Nested root task parsing failed")
         require(tasks[1].rootID == 20 && tasks[2].display == 8 && tasks[2].rootID == 30, "Display task isolation failed")
         require(PhoneSession.foregroundComponent(in: dump, display: 8) == "org.example.window/.Main", "Foreground display selection")
-        print("PASS authenticated catalog bounds, strict launcher identifiers, display geometry, nested task roots, primary-user isolation and foreground parsing")
+        // Redacted shape of the real failure: an empty split root followed by
+        // orientation/focus diagnostics must not invent a WeChat task under it.
+        let staleReferences = """
+        ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)
+          Display #0 (activities from top to bottom):
+            * Task{home #7 type=home}
+              * Task{homeLeaf #700 type=home}
+                * Hist #0: ActivityRecord{homeRecord u0 org.example.launcher/.Home t700}
+            * Task{emptySplit #6 type=undefined}
+            mResumedActivity: ActivityRecord{stale u0 com.tencent.mm/.ui.LauncherUI t5385}
+          mFocusedApp=ActivityRecord{stale u0 com.tencent.mm/.ui.LauncherUI t5385}
+          RootWindowContainer:
+            Display #0 displayId=0
+              * Task{duplicate #6 type=undefined}
+                * Hist #0: ActivityRecord{duplicate u0 com.tencent.mm/.ui.LauncherUI t5385}
+          mLastOrientationSource=ActivityRecord{stale u0 com.tencent.mm/.ui.LauncherUI t5385}
+        """
+        let staleTasks = AndroidTaskSnapshot.parse(staleReferences)
+        require(staleTasks.count == 1 && staleTasks[0].id == 700 && staleTasks[0].rootID == 7 && staleTasks[0].packageName == "org.example.launcher", "Non-authoritative or mismatched task records invented a WeChat task")
+        let authoritative = """
+          Display #0 (activities from top to bottom):
+            topResumedActivity=ActivityRecord{stale u0 com.tencent.mm/.ui.LauncherUI t5385}
+            * Task{root #10 type=standard}
+              * Task{leaf #12 type=standard}
+                * Hist #0: ActivityRecord{real u0 org.example.app/.Main t12}
+              * Task{empty #6 type=undefined}
+                mResumedActivity: ActivityRecord{stale u0 com.tencent.mm/.ui.LauncherUI t5385}
+                * Hist #0: ActivityRecord{wrongTask u0 com.tencent.mm/.ui.LauncherUI t5385}
+          Display #8 (activities from top to bottom):
+            * Task{window #30 type=standard}
+              * Hist #0: ActivityRecord{real u0 org.example.window/.Main t30}
+          mFocusedApp=ActivityRecord{stale u0 org.example.app/.Wrong t12}
+          mLastOrientationSource=ActivityRecord{stale u0 com.tencent.mm/.ui.LauncherUI t5385}
+          RootWindowContainer:
+            Display #0 (activities from top to bottom):
+              * Task{duplicate #12 type=standard}
+                * Hist #0: ActivityRecord{duplicate u0 org.example.app/.Wrong t12}
+        """
+        let authoritativeTasks = AndroidTaskSnapshot.parse(authoritative)
+        require(authoritativeTasks.count == 2 && authoritativeTasks[0].id == 12 && authoritativeTasks[0].display == 0 && authoritativeTasks[0].rootID == 10 && authoritativeTasks[0].packageName == "org.example.app", "Tail diagnostics changed an authoritative root/display")
+        require(authoritativeTasks[1].id == 30 && authoritativeTasks[1].rootID == 30 && authoritativeTasks[1].display == 8, "Authoritative second display was lost")
+        // Android's actual formatting has two spaces after Hist; this must
+        // produce a real task, rather than a falsely safe empty cleanup list.
+        let canonicalSpacing = """
+        Display #0 (activities from top to bottom):
+          * Task{emptySplit #6 type=undefined}
+          * Task{wechatRoot #5385 type=standard}
+              * Hist  #0: ActivityRecord{realWechat u0 com.tencent.mm/.ui.LauncherUI t5385}
+        Display #9 (activities from top to bottom):
+          * Task{nestedRoot #40 type=standard}
+            * Task{nestedLeaf #41 type=standard}
+              * Hist  #0: ActivityRecord{nested u0 org.example.window/.Main t41}
+        """
+        let spacedTasks = AndroidTaskSnapshot.parse(canonicalSpacing)
+        require(spacedTasks.count == 2 && spacedTasks.contains(where: { $0.id == 5385 && $0.rootID == 5385 && $0.display == 0 && $0.packageName == "com.tencent.mm" }), "Actual double-space Hist formatting lost a real WeChat task")
+        require(spacedTasks.contains(where: { $0.id == 41 && $0.rootID == 40 && $0.display == 9 }), "Actual double-space Hist formatting lost nested task ownership")
+        let invalidTrees = """
+        Display #0 (activities from top to bottom):
+          * Hist #0: ActivityRecord{noTask u0 org.example.app/.Main t12}
+          * Task{empty #6 type=undefined}
+            * Hist #0: ActivityRecord{mismatch u0 org.example.app/.Main t12}
+        Display #8:
+          * Task{notAnActivitiesTree #30 type=standard}
+            * Hist #0: ActivityRecord{wrongTree u0 org.example.window/.Main t30}
+        """
+        require(AndroidTaskSnapshot.parse(invalidTrees).isEmpty, "Unverified task nesting or non-activity display accepted")
+        let checkedEmpty = """
+        Display #0 (activities from top to bottom):
+          * Task{split #6 type=undefined sz=2}
+            * Task{emptyLeft #7 type=undefined sz=0}
+            * Task{emptyRight #8 type=undefined sz=0}
+        Display #9 (activities from top to bottom):
+        """
+        require(try AndroidTaskSnapshot.parseChecked(checkedEmpty, requiredDisplay: 9).isEmpty, "Trusted empty display or split container child counts rejected")
+        let checkedHistory = """
+        Display #0 (activities from top to bottom):
+          * Task{root #10 type=standard sz=1}
+            * Task{leaf #12 type=standard sz=1}
+              * Hist  #0: ActivityRecord{real u0 org.example.app/.Main t12}
+        Display #9 (activities from top to bottom):
+          * Task{empty #6 type=undefined sz=0}
+        """
+        let checkedTasks = try AndroidTaskSnapshot.parseChecked(checkedHistory, requiredDisplay: 0)
+        require(checkedTasks.count == 1 && checkedTasks[0].id == 12 && checkedTasks[0].rootID == 10, "Checked parser lost real double-space Hist")
+        let multipleHistory = """
+        Display #0 (activities from top to bottom):
+          * Task{splitRoot #6 type=undefined sz=2}
+            * Task{empty #7 type=undefined sz=0}
+            * Task{twoActivities #12 type=standard sz=2}
+              * Hist  #1: ActivityRecord{top u0 org.example.app/.Second t12}
+              * Hist  #0: ActivityRecord{base u0 org.example.app/.Main t12}
+        """
+        let multiTasks = try AndroidTaskSnapshot.parseChecked(multipleHistory, requiredDisplay: 0)
+        require(multiTasks.count == 1 && multiTasks[0].id == 12 && multiTasks[0].rootID == 6, "sz direct child task count was confused with descendant Hist count")
+        do {
+            _ = try AndroidTaskSnapshot.parseChecked(multipleHistory + "\nDisplay #8 (activities from top to bottom):\n  * Task{foreign #9 sz=1}\n    * Hist  #0: ActivityRecord{x u10 org.example.other/.Main t9}")
+            fatalError("Foreign user was omitted from a production move snapshot")
+        } catch {}
+        let rejectedTrees = [
+            "Display #0 (unknown tree):\n  * Task{x #6 sz=0}",
+            "Display #0 (activities from top to bottom):\n  * Task{x #6 sz=1}",
+            "Display #0 (activities from top to bottom):\n  * Task{x #6 sz=0}\n    * Hist  #0: UnknownRecord{u0 org.example.app/.Main t6}",
+            "Display #0 (activities from top to bottom):\n  * Task{x #6 sz=1}\n    * Hist  #0: ActivityRecord{x u0 org.example.app/.Main t7}",
+            "Display #0 (activities from top to bottom):\n  * Task{x #6 sz=0}\n    Hist #0: ActivityRecord{x u0 org.example.app/.Main t6}",
+            "Display #0 (activities from top to bottom):\n  * Task{x #6 sz=2}\n    * Task{oneKnownChild #7 sz=0}",
+            "Display #0 (activities from top to bottom):\n  * Task{x #6}",
+            "Display #0 (activities from top to bottom):\nDisplay #9 (unknown tree):\n  * Task{x #6 sz=0}",
+            "Display #0 (activities from top to bottom):\n  * Task{x #6 sz=1}\n    * Hist  #0: ActivityRecord{x u10 org.example.app/.Main t6}"
+        ]
+        for tree in rejectedTrees {
+            do { _ = try AndroidTaskSnapshot.parseChecked(tree, requiredDisplay: 0); fatalError("Unknown or incomplete tree accepted as safe") } catch {}
+        }
+        do { _ = try AndroidTaskSnapshot.parseChecked(checkedHistory, requiredDisplay: 99); fatalError("Unrecognized target accepted as empty") } catch {}
+        print("PASS authoritative task parser and fail-closed checked production path, trusted empty displays/split children, real Hist spacing and unknown/partial/absent target rejection")
     }
 }

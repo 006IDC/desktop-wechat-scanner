@@ -2,7 +2,7 @@
 
 在 Mac 上操作真实 Android 手机，把手机应用拖出为独立窗口，并把窗口后方的电脑二维码送给真实微信扫一扫。
 
-**当前开发候选：v0.4.0-preview.1（App 0.4.0 / build 12）。已内置开源 ADB，无需额外安装。桌面相机仍有回传延迟，尚未达到参考视频或 iPhone 镜像的流畅度。**
+**当前预览版：v0.4.0-preview.2（App 0.4.0 / build 13）。已内置开源 ADB，无需额外安装。桌面相机仍有回传延迟，尚未达到参考视频或 iPhone 镜像的流畅度。**
 
 [公开发行](https://github.com/006IDC/desktop-wechat-scanner/releases) · [安装说明](docs/INSTALL.md) · [版本记录](CHANGELOG.md)
 
@@ -28,7 +28,7 @@
 
 ## 验证与限制
 
-- 已在小米 Android 16 分别通过 USB 与 Wi-Fi 实测：读取应用目录、设置独立显示、微信独立显示与 H.264 回传、任务恢复与资源清理。无线测试明确使用网络端点，不回退到 USB。
+- 已在小米 Android 16 分别通过 USB 与 Wi-Fi 实测：读取应用目录、设置独立显示、微信独立显示与 H.264 回传、任务恢复与资源清理。无线测试明确使用网络端点，不回退到 USB；主屏与预热微信显示同时镜像、微信新帧返回及恢复清理也已验证。
 - App 内配对界面、窗口拖放手感和整套扫码过渡尚未完成验收。真机镜像解码和合成测试不等于流畅体验已通过。
 - 拖出入口是本 App 的“手机应用”列表；尚不支持直接抓取手机桌面镜像里的任意图标拖出。
 - 最多四个普通应用窗口，加一个微信窗口；同一包复用一个窗口。应用可能拒绝虚拟显示或保留手机显示，依机型和应用而异。
@@ -46,7 +46,7 @@ python3 scripts/build_app.py
 python3 scripts/package_release.py
 ```
 
-构建前提交源码；App 记录准确 commit。ADB 从固定开源源码构建，工具和源码归档校验 SHA-256，缓存放 `.local/`；scrcpy server 固定官方 5.0.1。发行物位于 `build/release/0.4.0-preview.1/`，不覆盖旧版。构建默认不替换已安装 App。
+构建前提交源码；App 记录准确 commit。ADB 从固定开源源码构建，工具和源码归档校验 SHA-256，缓存放 `.local/`；scrcpy server 固定官方 5.0.1。发行物位于 `build/release/0.4.0-preview.2/`，不覆盖旧版。构建默认不替换已安装 App。
 
 原创代码采用 [Apache-2.0](LICENSE)；ADB/依赖的对应源码、许可证与构建配方随 App 分发，见 [第三方说明](THIRD_PARTY.md)、[开发与测试](docs/DEVELOPMENT.md)、[隐私](docs/PRIVACY.md)。维护者：[006IDC](https://github.com/006IDC)。
 

@@ -434,15 +434,17 @@ actor PhoneSession {
             throw ScanError("请先解锁手机，再打开应用窗口。")
         }
     }
-    private func tasks() throws -> [AndroidTaskSnapshot] {
+    private func tasks(requiredDisplay: Int? = nil) throws -> [AndroidTaskSnapshot] {
         let dump = try shell("dumpsys activity activities")
-        guard dump.contains("Display #") else { throw ScanError("无法核实手机任务的显示归属，已保留恢复记录。") }
-        return AndroidTaskSnapshot.parse(dump)
+        return try AndroidTaskSnapshot.parseChecked(dump, requiredDisplay: requiredDisplay)
     }
     private func moveTask(_ id: Int, to display: Int, expectedRoot: Int? = nil) throws {
         let snapshot = try tasks()
         guard let task = snapshot.first(where: { $0.id == id }) else { return }
         guard expectedRoot == nil || task.rootID == expectedRoot else { throw ScanError("应用任务容器已变化，已保留恢复记录。") }
+        // Android may already have returned the task while a window is closing.
+        // Moving a root to its current display throws instead of being a no-op.
+        if task.display == display { return }
         let result = try shell("am display move-stack \(task.rootID) \(display)")
         guard !result.lowercased().contains("error"), !result.lowercased().contains("exception") else { throw ScanError("手机拒绝移动应用任务。") }
         if let moved = try tasks().first(where: { $0.id == id }), moved.display != display {
@@ -493,7 +495,7 @@ actor PhoneSession {
         throw ScanError("应用未出现在指定屏幕；已保留恢复记录。")
     }
     private func restoreTasks(on target: Int) throws {
-        let snapshot = try tasks()
+        let snapshot = try tasks(requiredDisplay: target)
         let recorded = recovery?.appTasks ?? []
         let groups = Dictionary(grouping: snapshot.filter { $0.display == target }, by: \.rootID)
         var destinations: [Int: Int] = [:]
@@ -519,7 +521,7 @@ actor PhoneSession {
             }
             try moveTask(representative.id, to: destination, expectedRoot: root)
         }
-        let restored = try tasks()
+        let restored = try tasks(requiredDisplay: target)
         guard !restored.contains(where: { $0.display == target }), groups.allSatisfy({ root, group in
             group.allSatisfy { original in
                 restored.first(where: { $0.id == original.id }).map { $0.display == destinations[root] } ?? true
