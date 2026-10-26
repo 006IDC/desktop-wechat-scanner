@@ -241,9 +241,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         adbSettingsItem?.isEnabled = !connected && !busy && !stopping
         control.update(status:currentStatus,detail:currentDetail,connected:connected,busy:busy,paused:paused)
         control.setCameraActive(cameraActive && !paused)
-        // Composite only the camera aperture locally. Real WeChat controls and
-        // result frames remain in the decoded video, with the same input mapping.
-        control.setLocalScanPreview(cameraActive && !paused && !busy && mode == .wechat)
+        // Keep the complete native WeChat image. The desktop is supplied to
+        // Android's virtual camera; no local aperture or replacement controls.
+        control.setLocalScanPreview(false)
         if wechatWindow != nil {
             mainControl.update(status:primaryLocked ? "手机主屏已锁定" : (connected ? "手机镜像 · \(model)" : currentStatus),detail:primaryLocked ? "独立应用仍可使用；正常解锁手机后恢复主屏镜像。" : "通过应用列表拖出应用，分别在 Mac 窗口里使用。",connected:connected,busy:stopping,paused:true)
         }
@@ -254,7 +254,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         try? FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
         let ticks=cameraTickGaps.sorted()
         let tickP95=ticks.isEmpty ? 0:ticks[min(ticks.count-1,Int(Double(ticks.count)*0.95))]
-        var value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":screenAccessGranted,"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"localCameraPreview":cameraActive && !paused && !busy && mode == .wechat,"independentApplicationsWhenLocked":independentApplicationsWhenLocked,"primaryLocked":primaryLocked,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"cameraTickP95Milliseconds":tickP95,"maximumCameraTickMilliseconds":maximumCameraTickMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
+        var value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":screenAccessGranted,"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"localCameraPreview":false,"independentApplicationsWhenLocked":independentApplicationsWhenLocked,"primaryLocked":primaryLocked,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"cameraTickP95Milliseconds":tickP95,"maximumCameraTickMilliseconds":maximumCameraTickMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
         let mirrorStats=scannerMirror.session.timingSnapshot
         value["mirrorRelativeBacklogP95Milliseconds"]=mirrorStats.relativeBacklogP95Milliseconds
         value["mirrorRelativeBacklogMaxMilliseconds"]=mirrorStats.relativeBacklogMaxMilliseconds
@@ -488,12 +488,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.onTouch={ [weak self] action,x,y in
             guard let self,self.connected,!self.stopping else{return}
             self.lastUserInput=Date();self.scannerMirror.session.touch(action:action,x:x,y:y)
-            // Finish the real gesture before restoring the full phone view.
-            // Menus/gallery can remain in ScannerUI, so activity polling alone
-            // cannot know that the transparent aperture would hide them.
-            if action==1,self.cameraActive,ScanPreviewAperture.isControl(at:CGPoint(x:x,y:y)) {
-                self.togglePause()
-            }
+
         }
         window.onTap={ [weak self] x,y in self?.tap(x,y) }
         window.onSwipe={ [weak self] x1,y1,x2,y2 in
