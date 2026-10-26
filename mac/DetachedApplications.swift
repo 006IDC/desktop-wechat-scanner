@@ -24,6 +24,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
         guard !stopping, app.isValid else { return false }
         if let existing = entries[app.packageName] {
             guard !existing.closing, let window = existing.ui.window else { return false }
+            NSApp.activate(ignoringOtherApps: true)
             existing.ui.showWindow(nil); AppWindowMotion.reveal(window, from: point); return true
         }
         guard entries.count < 4 else {
@@ -41,6 +42,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
         entry.ui.onSwipe = { [weak entry] x1,y1,x2,y2 in guard let entry, !entry.closing else { return }; entry.mirror.swipe(x1:x1,y1:y1,x2:x2,y2:y2) }
         entry.ui.onBack = { [weak entry] in entry?.mirror.key(4) }
         entry.ui.update(status: "正在打开 \(app.name)", detail: "应用仍在手机运行，画面即将在这里出现。", connected: false, busy: true, paused: true)
+        NSApp.activate(ignoringOtherApps: true)
         entry.ui.showWindow(nil)
         AppWindowMotion.reveal(window, from: point)
         entry.task = Task { [weak self, entry] in

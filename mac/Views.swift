@@ -441,6 +441,8 @@ final class ControlWindowController: NSWindowController {
     private var permissionHelp = false
     private var detailsExpanded = false
     private var cameraActive = false
+    private var desktopOverlayAllowed = false
+    private var desktopOverlayRestore: (NSWindow.Level, NSWindow.CollectionBehavior)?
 
     var desktopCaptureRect: CGRect {
         guard let window, holder.phone.window === window else { return .zero }
@@ -473,6 +475,7 @@ final class ControlWindowController: NSWindowController {
         window.minSize = NSSize(width: 320, height: 530)
         window.center()
         super.init(window: window)
+        desktopOverlayAllowed = scanner
         buildContent(in: window)
         if standalone {
             connectButton.isHidden = true; homeButton.isHidden = true; wechatButton.isHidden = true; appsButton.isHidden = true
@@ -642,6 +645,18 @@ final class ControlWindowController: NSWindowController {
     /// Show the real desktop through the phone area without a capture/USB round trip.
     /// Keep the real mirror image and aspect for instant restoration and correct sizing.
     func setLocalScanPreview(_ enabled: Bool) {
+        if desktopOverlayAllowed, let window {
+            if enabled, desktopOverlayRestore == nil {
+                desktopOverlayRestore = (window.level, window.collectionBehavior)
+                // Stay above the webpage when Stage Manager switches groups.
+                window.collectionBehavior = [.canJoinAllApplications]
+                window.level = .floating
+            } else if !enabled, let previous = desktopOverlayRestore {
+                window.level = previous.0
+                window.collectionBehavior = previous.1
+                desktopOverlayRestore = nil
+            }
+        }
         guard holder.phone.localScanPreview != enabled else { return }
         holder.phone.localScanPreview = enabled
         background.localScanPreview = enabled
