@@ -54,6 +54,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var maximumCameraTickMilliseconds=0.0
     private var performanceCheck: ScanPerformanceCheck?
     private var performanceTask: Task<Void,Never>?
+    private var launchDiagnosticTask: Task<Void,Never>?
+    private var launchDiagnosticGeneration=0
+    private var scanNavigation:[[String:Any]]=[]
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         buildMenu();control.window?.delegate=self
@@ -85,16 +88,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps:true)
         refreshScreenAccess()
         if CommandLine.arguments.contains("--run-scan-diagnostic") {
-            Task { await runLaunchDiagnostic() }
+            launchDiagnosticGeneration+=1
+            let generation=launchDiagnosticGeneration
+            launchDiagnosticTask=Task { await runLaunchDiagnostic(generation:generation) }
         }
     }
 
     /// Explicit native integration-test entry. Reuses only a previously chosen
     /// paired device and permission; never requests access, accepts a dialog or
     /// synthesizes OS input. The ordinary launch path is unchanged.
-    private func runLaunchDiagnostic() async {
+    private func runLaunchDiagnostic(generation:Int) async {
+        func check() throws {
+            try Task.checkCancellation()
+            guard generation==launchDiagnosticGeneration,!stopping else{throw CancellationError()}
+        }
         do {
-            await permissionCheck?.value
+            await permissionCheck?.value;try check()
             guard screenAccessGranted else{throw ScanError("诊断需要既有录屏授权，不会自动申请。")}
             let others=NSWorkspace.shared.runningApplications.filter {
                 $0.bundleIdentifier==Bundle.main.bundleIdentifier && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
@@ -103,26 +112,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let remembered=WirelessReconnectStore().load() else{throw ScanError("没有已选择的无线手机，诊断不自动配对新设备。")}
             guard let resources=Bundle.main.resourceURL else{throw ScanError("随包资源不可用。")}
             let adb=try await ADBConfiguration.validateAsync(resources.appendingPathComponent("adb/bin/adb"))
+            try check()
             let owned=try await ADBManagedServer.start(adbURL:adb)
+            do {try check()} catch {await owned.stop();throw error}
             wirelessServer=owned;adbServerSocket=owned.socket;wirelessEndpoint=remembered.endpoint;adbURL=adb
             let manager=ADBConnectionManager(adbURL:adb,serverSocket:owned.socket)
-            try await manager.connect(endpoint:remembered.endpoint)
-            let devices=try await manager.devices()
+            try await manager.connect(endpoint:remembered.endpoint);try check()
+            let devices=try await manager.devices();try check()
             guard let device=devices.first(where:{$0.authorization == .authorized && $0.serial==remembered.endpoint}) else{throw ScanError("此前配对的手机当前不可连接。")}
-            connectDevice(device,adb:adb,allowLockedApplications:UserDefaults.standard.bool(forKey:"allowsLockedApplications.v1"))
-            await connectionTask?.value
-            // connectDevice owns any failure cleanup; do not race a second
-            // termination cleanup against that still-running recovery task.
-            while stopping {try await Task.sleep(nanoseconds:100_000_000)}
+            connectDevice(device,adb:adb,allowLockedApplications:UserDefaults.standard.bool(forKey:"allowsLockedApplications.v1"),diagnostic:true)
+            await connectionTask?.value;try check()
             guard connected,!busy,!stopping else{throw ScanError("手机诊断连接未就绪。")}
             runPerformanceCheck()
-            await performanceTask?.value
-        } catch {
+            await performanceTask?.value;try check()
+        } catch is CancellationError {return} catch {
             let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
             let report:[String:Any]=["qrRecognized":false,"failure":error.localizedDescription,"updatedAt":ISO8601DateFormatter().string(from:Date())]
             if let data=try? JSONSerialization.data(withJSONObject:report,options:.sortedKeys){try? data.write(to:folder.appendingPathComponent("performance-last.json"),options:.atomic)}
         }
-        NSApp.terminate(nil)
+        guard generation==launchDiagnosticGeneration,!stopping,!Task.isCancelled else{return}
+        launchDiagnosticTask=nil
+        // NSApp.terminate enters a nested AppKit run loop. Call it outside a
+        // Swift MainActor task so the asynchronous cleanup can still execute.
+        DispatchQueue.main.async {NSApp.terminate(nil)}
     }
     private func buildMenu(){
         let menu=NSMenu(),appItem=NSMenuItem(),appMenu=NSMenu()
@@ -290,7 +302,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } catch is CancellationError {} catch {busy=false;status("连接未完成",error.localizedDescription)}
         }
     }
-    private func connectDevice(_ device:ADBDevice,adb selected:URL,allowLockedApplications:Bool){
+    private func connectDevice(_ device:ADBDevice,adb selected:URL,allowLockedApplications:Bool,diagnostic:Bool=false){
         guard !connected,!stopping else{return}
         busy=true;status("正在连接",allowLockedApplications ? "正在确认手机的独立应用锁屏支持…" : "请保持手机解锁。")
         connectionTask=Task { [self] in
@@ -321,7 +333,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             } catch {
                 guard !stopping else{return}
-                status("连接未完成",error.localizedDescription);disconnect(preserveError:true)
+                status("连接未完成",error.localizedDescription)
+                if diagnostic {busy=false;connected=false} else {disconnect(preserveError:true)}
             }
         }
     }
@@ -620,6 +633,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } catch { report["failure"]=error.localizedDescription }
             if let check=performanceCheck {report.merge(check.finish()){_,new in new}}
             performanceCheck=nil
+            report["navigation"]=scanNavigation
             report["captureMilliseconds"]=captureMilliseconds
             report["transferMilliseconds"]=transferMilliseconds
             report["cameraFPS"]=cameraFPS
@@ -812,6 +826,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Bounded navigation only: recognise the WeChat home/menu labels. Never
     /// click a scan result, authorization button, link, payment or chat item.
     private func openScanner() async throws -> Bool {
+        scanNavigation=[]
         if let foreground=try await phone.foreground(onVirtualDisplay:true),
            foreground.hasPrefix("com.tencent.mm/"),foreground.lowercased().contains("scanner") {return true}
         let deadline=ProcessInfo.processInfo.systemUptime+4
@@ -821,8 +836,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             try await Task.sleep(nanoseconds:120_000_000)
             guard let image=latestPhoneFrame,previewsReceived != recognisedFrame else{continue}
             recognisedFrame=previewsReceived
+            let ocrStarted=ProcessInfo.processInfo.systemUptime
             let words=try await Task.detached(priority:.userInitiated) {try Self.textIn(image)}.value
             try Task.checkCancellation()
+            // Persist only the fixed navigation-label allowlist, never chat text.
+            let labels:Set<String>=["微信","通讯录","发现","我","扫一扫","发起群聊","添加朋友"]
+            let allowed=words.filter{labels.contains($0.value.replacingOccurrences(of:" ",with:""))}
+            if scanNavigation.count<32 {scanNavigation.append(["ocrMilliseconds":(ProcessInfo.processInfo.systemUptime-ocrStarted)*1000,
+                "labels":allowed.map{["label":$0.value.replacingOccurrences(of:" ",with:""),"x":Int($0.rect.midX),"y":Int($0.rect.midY)]},
+                "menuTapped":openedMenu,"scannerTapped":tappedScanner,"frame":previewsReceived])}
             let scan=words.first{$0.value.replacingOccurrences(of:" ",with:"").contains("扫一扫")}
             if let scan,scan.rect.midY>950 {return true}
             if !tappedScanner,let scan,scan.rect.midY<950 && words.contains(where:{$0.value.contains("发起群聊") || $0.value.contains("添加朋友")}) {
@@ -901,6 +923,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func disconnect(preserveError:Bool=false){
         guard !stopping else{return}
+        launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
         stopping=true;busy=true;paused=true;cameraActive=false;scanGeneration+=1;mirrorGeneration+=1;physicalMirror.frames.stop();scannerMirror.frames.stop()
         let chooser=connectionWindow;chooser?.close();connectionWindow=nil
@@ -943,6 +966,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool)->Bool {showMainWindow();return true}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
+        launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
         stopping=true;let chooser=connectionWindow;chooser?.close();connectionWindow=nil
         connectionTask?.cancel();catalogTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;cameraLoop?.cancel()
