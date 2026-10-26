@@ -42,6 +42,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var independentApplicationsWhenLocked=false, primaryLocked=false
     private var cameraActive=false, cameraSuppressed=false, mode=Mode.phone
     private var cameraPump:CameraPumpMailbox?,cameraFramesBase=0
+    private var cameraActivity:NSObjectProtocol?
     private var nextCameraDiagnostic=0.0
     private var connectionTask:Task<Void,Never>?, operationTask:Task<Void,Never>?, loop:Task<Void,Never>?, cameraLoop:Task<Void,Never>?
     private var currentStatus="未连接", currentDetail="点击连接，选择 USB 手机或设置无线连接。"
@@ -270,6 +271,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let tickP95=ticks.isEmpty ? 0:ticks[min(ticks.count-1,Int(Double(ticks.count)*0.95))]
         var value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":screenAccessGranted,"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"localCameraPreview":false,"independentApplicationsWhenLocked":independentApplicationsWhenLocked,"primaryLocked":primaryLocked,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"cameraTickP95Milliseconds":tickP95,"maximumCameraTickMilliseconds":maximumCameraTickMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
         let mirrorStats=scannerMirror.session.timingSnapshot
+        value["cameraActivityActive"]=cameraActivity != nil
         value["desktopMode"]=desktopMode
         value["applicationPickerVisible"]=applicationPickerVisible
         value["mirrorRelativeBacklogP95Milliseconds"]=mirrorStats.relativeBacklogP95Milliseconds
@@ -490,7 +492,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         physicalMirror.startup=nil;scannerMirror.startup=nil
         physicalMirror.failure=nil;scannerMirror.failure=nil
     }
+    private func endCameraActivity() {
+        guard let activity=cameraActivity else{return}
+        cameraActivity=nil;ProcessInfo.processInfo.endActivity(activity)
+    }
     private func clearCamera() async {
+        endCameraActivity()
         let previousCamera=cameraLoop;cameraLoop=nil
         paused=true;cameraActive=false;scanGeneration+=1;cameraPump?.stop();cameraPump=nil;previousCamera?.cancel();cameraFPS=0;refresh()
         await capture.stop()
@@ -1039,6 +1046,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func startCameraLoop(){
         cameraLoop?.cancel();cameraPump?.stop()
+        // A live, user-requested scanner must keep receiving presentation ticks
+        // when the user focuses the QR in another app. Scope the activity to the
+        // active camera, and still allow ordinary idle system/display sleep.
+        if cameraActivity == nil {
+            cameraActivity=ProcessInfo.processInfo.beginActivity(options:.userInitiatedAllowingIdleSystemSleep,
+                reason:"实时手机桌面相机")
+        }
         cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0
         let pump=CameraPumpMailbox(),generation=scanGeneration
         let diagnosticQRStart=performanceCheck == nil ? Double.infinity:ProcessInfo.processInfo.systemUptime+6.2
@@ -1248,6 +1262,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func disconnect(preserveError:Bool=false){
         guard !stopping else{return}
+        endCameraActivity()
         launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
         stopping=true;busy=true;paused=true;cameraActive=false;scanGeneration+=1;mirrorGeneration+=1;physicalMirror.frames.stop();scannerMirror.frames.stop()
@@ -1300,6 +1315,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
         if terminationReady {return .terminateNow}
         guard !terminating else{return .terminateCancel}
+        endCameraActivity()
         terminating=true
         launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
