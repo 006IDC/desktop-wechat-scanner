@@ -357,12 +357,13 @@ actor DesktopCapture {
         guard !ownApps.isEmpty else {throw ScanError("无法排除本 App，请重新打开 App。")}
         let filter: SCContentFilter
         if let diagnosticBoardID {
-            guard content.windows.contains(where:{$0.windowID==diagnosticBoardID &&
+            guard let board=content.windows.first(where:{$0.windowID==diagnosticBoardID &&
                 $0.owningApplication?.processID==ProcessInfo.processInfo.processIdentifier}) else {
                 throw ScanError("合成测试窗口尚未就绪。")
             }
-            let excluded=content.windows.filter{$0.owningApplication?.processID==ProcessInfo.processInfo.processIdentifier && $0.windowID != diagnosticBoardID}
-            filter=SCContentFilter(display:display,excludingWindows:excluded)
+            // A diagnostic source contains only our synthetic board. No user
+            // desktop pixels can enter the diagnostic image or QR checks.
+            filter=SCContentFilter(display:display,including:[board])
         } else {
             filter=SCContentFilter(display:display,excludingApplications:ownApps,exceptingWindows:[])
         }
@@ -371,6 +372,7 @@ actor DesktopCapture {
         config.sourceRect=CGRect(origin:.zero,size:screen.size)
         config.width=Int(pixels.width);config.height=Int(pixels.height)
         config.pixelFormat=kCVPixelFormatType_32BGRA
+        if diagnosticBoardID != nil {config.backgroundColor=CGColor(gray:1,alpha:1)}
         config.minimumFrameInterval=CMTime(value:1,timescale:30)
         config.queueDepth=3;config.showsCursor=false;config.capturesAudio=false
         config.preservesAspectRatio=true;config.ignoreShadowsSingleWindow=true

@@ -98,3 +98,5 @@ swiftc -swift-version 5 -warnings-as-errors -target arm64-apple-macos14.4 -modul
 仅开发者显式追加 `--diagnostic-toolbar` 时，诊断会在确认微信主页后保存顶部 11% 工具栏图片 `diagnostic-toolbar.png`（本机支持目录），用于检查点击定位；不含聊天列表、桌面或扫码结果。正常启动与普通自检不输出图片。
 
 自检分别报告运动阶段送帧最大间隔、发送 JPEG 中的合成码可见性、手机画面中的合成码可见性，以及手机显示测试明文结果的确认。二维码视觉检查只在六秒运动基线结束后启用，不读取或保存其他二维码内容；它不触发登录或支付。
+
+扫码导航在首帧确认主页后，仅识别右上菜单或底部扫码标签，保留准确中文识别与受限回退。`ScannerNavigationOCRTests` 用合成文本验证 Vision ROI 局部坐标正确还原到整图坐标。自检板在普通窗口之上、扫码窗口之下，并只采集该合成板；显式 `--diagnostic-pattern` 可保存这一路纯合成裁切图，正常运行不保存。

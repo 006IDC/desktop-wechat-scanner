@@ -58,6 +58,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var launchDiagnosticTask: Task<Void,Never>?
     private var launchDiagnosticGeneration=0
     private var scanNavigation:[[String:Any]]=[]
+    private var scannerNavigationMilliseconds=0.0
     private var savedDiagnosticToolbar=false
 
     func applicationDidFinishLaunching(_ notification:Notification) {
@@ -644,6 +645,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if let check=performanceCheck {report.merge(check.finish()){_,new in new}}
             performanceCheck=nil
             report["navigation"]=scanNavigation
+            report["scannerNavigationMilliseconds"]=scannerNavigationMilliseconds
             report["captureMilliseconds"]=captureMilliseconds
             report["transferMilliseconds"]=transferMilliseconds
             report["cameraFPS"]=cameraFPS
@@ -774,13 +776,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0
         let pump=CameraPumpMailbox(),generation=scanGeneration
         let diagnosticQRStart=performanceCheck == nil ? Double.infinity:ProcessInfo.processInfo.systemUptime+6.2
+        let saveSyntheticPattern=performanceCheck != nil && CommandLine.arguments.contains("--diagnostic-pattern")
         cameraPump=pump;cameraFramesBase=framesSent
         updateCameraTick()
         cameraLoop=Task.detached(priority:.userInitiated) { [capture,phone] in
             var stats=CameraPumpMailbox.Statistics()
             var measuredAt=ProcessInfo.processInfo.systemUptime,measuredFrames=0
             var transientFailureSince:TimeInterval?,lastSentAt:TimeInterval?
-            var lastQRCheck=0.0
+            var lastQRCheck=0.0,savedPattern=false
             while !Task.isCancelled,let target=pump.latest() {
                 let began=ProcessInfo.processInfo.systemUptime
                 do {
@@ -804,6 +807,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                     if !stats.syntheticQRVisible,sentAt>=diagnosticQRStart,sentAt-lastQRCheck>=1 {
                         lastQRCheck=sentAt
+                        if saveSyntheticPattern,!savedPattern {
+                            savedPattern=true
+                            let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
+                            try? image.write(to:folder.appendingPathComponent("diagnostic-board-crop.jpg"),options:.atomic)
+                        }
                         let barcode=VNDetectBarcodesRequest();barcode.symbologies=[.qr]
                         try? VNImageRequestHandler(data:image).perform([barcode])
                         stats.syntheticQRVisible=barcode.results?.contains{$0.payloadStringValue==ScanPerformanceCheck.payload} ?? false
@@ -830,21 +838,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
     }
-    private struct OCRText {let value:String;let rect:CGRect}
-    private nonisolated static func textIn(_ pixels:CVPixelBuffer) throws -> [OCRText] {
-        let request=VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate;request.recognitionLanguages=["zh-Hans","en-US"]
-        try VNImageRequestHandler(cvPixelBuffer:pixels).perform([request])
-        return (request.results ?? []).compactMap { item in
-            guard let text=item.topCandidates(1).first?.string else{return nil}
-            let b=item.boundingBox
-            return OCRText(value:text,rect:CGRect(x:b.minX*720,y:(1-b.maxY)*1280,width:b.width*720,height:b.height*1280))
-        }
+    private nonisolated static func textIn(_ pixels:CVPixelBuffer,region:ScannerNavigationOCR.Region = .full) throws -> [ScannerNavigationOCR.Text] {
+        try ScannerNavigationOCR.recognize(pixels,region:region)
     }
     /// Bounded navigation only: recognise the WeChat home/menu labels. Never
     /// click a scan result, authorization button, link, payment or chat item.
     private func openScanner() async throws -> Bool {
         scanNavigation=[]
+        let navigationStarted=ProcessInfo.processInfo.systemUptime
+        defer {scannerNavigationMilliseconds=(ProcessInfo.processInfo.systemUptime-navigationStarted)*1000}
         if let foreground=try await phone.foreground(onVirtualDisplay:true),
            foreground.hasPrefix("com.tencent.mm/"),foreground.lowercased().contains("scanner") {return true}
         let deadline=ProcessInfo.processInfo.systemUptime+4
@@ -858,14 +860,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard previewsReceived != recognisedFrame || retryDue else{continue}
             recognisedFrame=previewsReceived
             let ocrStarted=ProcessInfo.processInfo.systemUptime
-            let words=try await Task.detached(priority:.userInitiated) {try Self.textIn(image)}.value
+            let region:ScannerNavigationOCR.Region=tappedScanner ? .scanner : (openedMenu && !retryDue ? .menu:.full)
+            let words=try await Task.detached(priority:.userInitiated) {try Self.textIn(image,region:region)}.value
             try Task.checkCancellation()
             // Persist only the fixed navigation-label allowlist, never chat text.
             let labels:Set<String>=["微信","通讯录","发现","我","扫一扫","发起群聊","添加朋友"]
             let allowed=words.filter{labels.contains($0.value.replacingOccurrences(of:" ",with:""))}
             if scanNavigation.count<32 {scanNavigation.append(["ocrMilliseconds":(ProcessInfo.processInfo.systemUptime-ocrStarted)*1000,
                 "labels":allowed.map{["label":$0.value.replacingOccurrences(of:" ",with:""),"x":Int($0.rect.midX),"y":Int($0.rect.midY)]},
-                "menuTapped":openedMenu,"menuAttempts":menuAttempts,"scannerTapped":tappedScanner,"frame":previewsReceived])}
+                "region":region.rawValue,"menuTapped":openedMenu,"menuAttempts":menuAttempts,"scannerTapped":tappedScanner,"frame":previewsReceived])}
             let scan=words.first{$0.value.replacingOccurrences(of:" ",with:"").contains("扫一扫")}
             if let scan,scan.rect.midY>950 {return true}
             if !tappedScanner,let scan,scan.rect.midY<950 && words.contains(where:{$0.value.contains("发起群聊") || $0.value.contains("添加朋友")}) {

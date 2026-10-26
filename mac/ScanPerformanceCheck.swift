@@ -42,7 +42,9 @@ import CoreImage.CIFilterBuiltins
         board.title = "扫码流畅度自检 · 合成图案"
         board.contentView = pattern
         board.collectionBehavior = [.canJoinAllApplications]
-        board.level = .normal
+        // Keep the synthetic board behind the floating scanner even if
+        // Stage Manager moves ordinary application windows into thumbnails.
+        board.level = NSWindow.Level(rawValue:NSWindow.Level.floating.rawValue-1)
         board.orderFront(nil)
         let capture = scanner.desktopCaptureRect
         captureOffsetX=capture.minX-window.frame.minX
