@@ -659,6 +659,14 @@ final class ControlWindowController: NSWindowController {
             (displayedMode == "桌面相机" && statusLabel.stringValue.contains("桌面相机"))
     }
 
+    func setLocalScanReview(_ reviewing:Bool) {
+        guard reviewing else{return}
+        pauseButton.title="重新框选"
+        pauseButton.image=NSImage(systemSymbolName:"viewfinder",accessibilityDescription:"重新框选")
+        pauseButton.setAccessibilityLabel("重新框选桌面二维码")
+        pauseButton.toolTip="重新打开透明扫码框"
+    }
+
     func setPhoneDesktopMode(_ enabled: Bool) {
         phoneDesktopMode = enabled
         holder.phone.emptyMessage = enabled ? "连接后显示手机桌面" : "连接手机后显示真实手机画面"
@@ -808,6 +816,7 @@ private final class ScanCornersView: NSView {
 }
 
 private final class DragBar: NSView {
+    var onDragBegan:(()->Void)?
     override func hitTest(_ point: NSPoint) -> NSView? {
         let target = super.hitTest(point)
         // Route text and non-control stack space through the same drag path;
@@ -817,8 +826,17 @@ private final class DragBar: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        onDragBegan?()
         window?.performDrag(with: event)
     }
+}
+
+private final class ScanFramePanel:NSPanel {
+    var onCancel:(()->Bool)?
+    override var canBecomeKey:Bool {true}
+    override func cancelOperation(_ sender:Any?){_ = onCancel?()}
+    override func performClose(_ sender:Any?){if onCancel?() != true {super.performClose(sender)}}
+    override func close(){if onCancel?() != true {super.close()}}
 }
 
 final class ScanFrameController: NSWindowController, NSWindowDelegate {
@@ -829,7 +847,8 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
 
     private let pauseButton = button("暂停", tooltip: "暂停或继续扫码画面")
     private let rescanButton = button("再扫", tooltip: "重新扫描当前框内的二维码")
-    private let closeButton = button("关闭", tooltip: "关闭扫码框")
+    private let closeButton = button("返回", tooltip: "返回真实手机应用")
+    private let titleLabel = text("停稳后自动识别", size: 13, weight: .semibold, color: .white)
     private var paused = false
 
     var captureRect: CGRect {
@@ -839,10 +858,13 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
     }
 
     init() {
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 352, height: 404),
+        let panel = ScanFramePanel(contentRect: NSRect(x: 0, y: 0, width: 352, height: 404),
                             styleMask: [.borderless, .nonactivatingPanel],
                             backing: .buffered, defer: false)
         panel.isFloatingPanel = true
+        panel.isReleasedWhenClosed = false
+        panel.title = "桌面扫码框"
+        panel.collectionBehavior = [.canJoinAllApplications]
         panel.level = .floating
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -852,6 +874,10 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
         panel.center()
         super.init(window: panel)
         panel.delegate = self
+        panel.onCancel = { [weak self] in
+            guard let action=self?.onClose else{return false}
+            action();return true
+        }
         buildContent(in: panel)
     }
 
@@ -870,9 +896,12 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
         bar.setAccessibilityLabel("拖动扫码框")
         bar.toolTip = "拖动这里，把透明框放在电脑二维码上"
         frame.addSubview(bar)
+        bar.onDragBegan={ [weak self] in
+            guard let self else{return};self.onMoved?(self.captureRect)
+        }
 
-        let title = text("拖到二维码上", size: 13, weight: .semibold, color: .white)
-        title.setAccessibilityLabel("拖到二维码上")
+        let title = titleLabel
+        title.setAccessibilityLabel("停稳后自动识别")
         for control in [pauseButton, rescanButton, closeButton] {
             control.isBordered = false
             control.contentTintColor = .white
@@ -903,6 +932,11 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
         pauseButton.title = value ? "继续" : "暂停"
         pauseButton.setAccessibilityLabel(value ? "继续扫码画面" : "暂停扫码画面")
         pauseButton.toolTip = value ? "继续扫码画面" : "暂停扫码画面"
+        setMessage(value ? "扫码已暂停":"停稳后自动识别")
+    }
+
+    func setMessage(_ message:String) {
+        titleLabel.stringValue=message;titleLabel.setAccessibilityLabel(message)
     }
 
     func show() {
@@ -910,7 +944,27 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
         onMoved?(captureRect)
     }
 
+    func show(near rect:CGRect) {
+        guard let window else{return}
+        let destination=AppWindowMotion.destination(for:window.frame,
+            at:NSPoint(x:rect.midX,y:rect.midY),screens:NSScreen.screens.map(\.visibleFrame),
+            fallback:NSScreen.main?.visibleFrame ?? window.frame)
+        window.setFrame(destination,display:false)
+        show()
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else{return}
+        window.alphaValue=0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration=0.16
+            window.animator().alphaValue=1
+        }
+    }
+
     func windowDidMove(_ notification: Notification) { onMoved?(captureRect) }
+    func windowWillMove(_ notification: Notification) {onMoved?(captureRect)}
+    func windowShouldClose(_ sender:NSWindow)->Bool {
+        guard let onClose else{return true}
+        onClose();return false
+    }
 
     @objc private func pausePressed() { onPause?() }
     @objc private func rescanPressed() { onRescan?() }

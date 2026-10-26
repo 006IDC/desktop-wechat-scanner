@@ -318,7 +318,8 @@ actor PhoneSession {
     }
     /// Android processing only, when supported; ACK round-trip remains a separate measurement.
     @discardableResult
-    func frame(_ data: Data, epoch: Int, selectedAt:TimeInterval?=nil) throws -> CameraFrameReceipt {
+    func frame(_ data: Data, epoch: Int, selectedAt:TimeInterval?=nil,
+               isCurrent:(@Sendable ()->Bool)?=nil) throws -> CameraFrameReceipt {
         try Task.checkCancellation()
         if let selectedAt,ProcessInfo.processInfo.systemUptime-selectedAt>0.5 {
             throw CameraFrameExpiredError()
@@ -329,6 +330,7 @@ actor PhoneSession {
         body.append(data)
         let started=ProcessInfo.processInfo.systemUptime
         let response:CameraSocket.MeasuredResponse
+        if let isCurrent,!isCurrent() {throw CameraFrameExpiredError()}
         do {response=try channel.requestMeasured(1,body)}
         catch let error as ScanError where error.message=="Desktop camera has no verified scanner owner" || error.message=="Desktop camera state changed while decoding frame" {
             // A normal scanner exit can invalidate an in-flight frame before
@@ -350,9 +352,18 @@ actor PhoneSession {
         guard nanos <= UInt64(Int64.max) else { throw ScanError("手机返回了无效的图像处理耗时。") }
         return Double(nanos) / 1_000_000
     }
-    func clear(epoch: Int) throws {
-        guard let channel else {return}
+    func clear(epoch: Int, requireConnection:Bool=false) throws {
+        guard let channel else {
+            if requireConnection {throw ScanError("手机未确认清除相机画面。")}
+            return
+        }
         _ = try channel.request(3,epochBytes(epoch))
+    }
+    /// Discard a moved/retried image within the same capture generation. Unlike
+    /// advancing clear(), it cannot invalidate a newer generation's pixels.
+    func discardFrame(epoch:Int) throws {
+        guard let channel else{throw ScanError("手机未确认丢弃过期画面。")}
+        _ = try channel.request(23,epochBytes(epoch))
     }
     func heartbeat() throws { guard let channel else {throw ScanError("手机未连接。")};_ = try channel.request(4) }
     func cameraState() throws -> PhoneCameraState {

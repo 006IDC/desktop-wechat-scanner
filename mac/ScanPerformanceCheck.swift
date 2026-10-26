@@ -9,10 +9,10 @@ import CoreImage.CIFilterBuiltins
     nonisolated static let payload = "006IDC20261026PERF"
     let board: NSWindow
     private let pattern = ScanPerformancePattern()
-    private let originalOrigin: NSPoint
-    private let scanner: NSWindow
-    private let center: NSPoint
-    private let captureOffsetX: CGFloat
+    private var originalOrigin: NSPoint
+    private var scanner: NSWindow
+    private var center: NSPoint
+    private var captureOffsetX: CGFloat
     private var started: TimeInterval?
     private var previousTick: TimeInterval?
     private var tickGaps: [Double] = []
@@ -62,6 +62,17 @@ import CoreImage.CIFilterBuiltins
     }
 
     func start(at time: TimeInterval) { started=time; previousTick=nil }
+
+    /// Move the actual local framing window in the new product path. The
+    /// synthetic board alone remains the capture source throughout the test.
+    func bindLocalFrame(_ controller:ScanFrameController) {
+        guard let window=controller.window else{return}
+        scanner=window;originalOrigin=window.frame.origin
+        captureOffsetX=controller.captureRect.minX-window.frame.minX
+        center=NSPoint(x:board.frame.midX-window.frame.width/2,
+                       y:board.frame.midY-176)
+        window.setFrameOrigin(center)
+    }
 
     /// Called by the same common-mode presentation tick as the product camera.
     func tick(at now: TimeInterval) {

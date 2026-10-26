@@ -43,6 +43,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var cameraActive=false, cameraSuppressed=false, mode=Mode.phone
     private var cameraPump:CameraPumpMailbox?,cameraFramesBase=0
     private var cameraActivity:NSObjectProtocol?
+    private var localScanFrame:ScanFrameController?
+    private var localScanRect:CGRect?
+    private var localCameraMode=false
     private var nextCameraDiagnostic=0.0
     private var connectionTask:Task<Void,Never>?, operationTask:Task<Void,Never>?, loop:Task<Void,Never>?, cameraLoop:Task<Void,Never>?
     private var currentStatus="未连接", currentDetail="点击连接，选择 USB 手机或设置无线连接。"
@@ -128,11 +131,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             try check()
             let owned=try await ADBManagedServer.start(adbURL:adb)
             do {try check()} catch {await owned.stop();throw error}
-            wirelessServer=owned;adbServerSocket=owned.socket;wirelessEndpoint=remembered.endpoint;adbURL=adb
+            let services=(try? await BonjourADBDiscovery().discover(seconds:3)) ?? []
+            let endpoint=remembered.preferredEndpoint(in:services)
+            wirelessServer=owned;adbServerSocket=owned.socket;wirelessEndpoint=endpoint;adbURL=adb
             let manager=ADBConnectionManager(adbURL:adb,serverSocket:owned.socket)
-            try await manager.connect(endpoint:remembered.endpoint);try check()
+            try await manager.connect(endpoint:endpoint);try check()
             let devices=try await manager.devices();try check()
-            guard let device=devices.first(where:{$0.authorization == .authorized && $0.serial==remembered.endpoint}) else{throw ScanError("此前配对的手机当前不可连接。")}
+            guard let device=devices.first(where:{$0.authorization == .authorized && $0.serial==endpoint}) else{throw ScanError("此前配对的手机当前不可连接。")}
             let desktopDiagnostic=CommandLine.arguments.contains("--run-desktop-diagnostic")
             connectDevice(device,adb:adb,allowLockedApplications:UserDefaults.standard.bool(forKey:"allowsLockedApplications.v1"),diagnostic:!desktopDiagnostic)
             await connectionTask?.value;try check()
@@ -261,6 +266,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Keep the complete native WeChat image. The desktop is supplied to
         // Android's virtual camera; no local aperture or replacement controls.
         control.setLocalScanPreview(false)
+        if localCameraMode,paused {cameraWindow?.setLocalScanReview(true)}
         if wechatWindow != nil {
             mainControl.update(status:primaryLocked ? "手机主屏已锁定" : (connected ? "手机镜像 · \(model)" : currentStatus),detail:primaryLocked ? "独立应用仍可使用；正常解锁手机后恢复主屏镜像。" : "通过应用列表拖出应用，分别在 Mac 窗口里使用。",connected:connected,busy:stopping,paused:true)
         }
@@ -272,6 +278,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":screenAccessGranted,"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"localCameraPreview":false,"independentApplicationsWhenLocked":independentApplicationsWhenLocked,"primaryLocked":primaryLocked,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"cameraTickP95Milliseconds":tickP95,"maximumCameraTickMilliseconds":maximumCameraTickMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
         let mirrorStats=scannerMirror.session.timingSnapshot
         value["cameraActivityActive"]=cameraActivity != nil
+        value["localScanFrameVisible"]=localScanFrame?.window?.isVisible == true
+        value["localCameraMode"]=localCameraMode
         value["desktopMode"]=desktopMode
         value["applicationPickerVisible"]=applicationPickerVisible
         value["mirrorRelativeBacklogP95Milliseconds"]=mirrorStats.relativeBacklogP95Milliseconds
@@ -496,14 +504,107 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let activity=cameraActivity else{return}
         cameraActivity=nil;ProcessInfo.processInfo.endActivity(activity)
     }
-    private func clearCamera() async {
+    private func showLocalScanFrame(for owner:ControlWindowController) {
+        let frame=ScanFrameController();localScanFrame=frame;localScanRect=nil
+        frame.onClose={ [weak self] in self?.returnLocalScanToApplication(retainImage:false) }
+        frame.onPause={ [weak self] in self?.toggleLocalScanPause() }
+        frame.onRescan={ [weak self] in
+            guard let self,!self.paused else{return}
+            self.localScanRect=nil
+            self.cameraPump?.delayCapture(until:ProcessInfo.processInfo.systemUptime+0.18)
+        }
+        frame.onMoved={ [weak self] _ in
+            guard let self else{return}
+            self.localScanRect=nil
+            self.cameraPump?.delayCapture(until:ProcessInfo.processInfo.systemUptime+0.18)
+        }
+        frame.show(near:owner.desktopCaptureRect)
+        owner.window?.orderOut(nil)
+    }
+    private func dismissLocalScanFrame(restoring:Bool) {
+        guard let frame=localScanFrame else{return}
+        localScanFrame=nil;localScanRect=nil
+        frame.onClose=nil;frame.onMoved=nil;frame.onPause=nil;frame.onRescan=nil
+        frame.window?.orderOut(nil);frame.close()
+        if restoring,let window=cameraWindow?.window {
+            window.alphaValue=1;window.makeKeyAndOrderFront(nil)
+        }
+    }
+    /// A QR presence check is only a handoff trigger. The native application
+    /// alone decides what it means; no result or authorization is clicked here.
+    private func returnLocalScanToApplication(retainImage:Bool) {
+        guard connected,!stopping,localScanFrame != nil else{return}
+        let previousOperation=operationTask;previousOperation?.cancel()
+        busy=true;paused=true;cameraSuppressed=true
+        let previous=cameraLoop;cameraLoop=nil;previous?.cancel()
+        cameraPump?.stop();cameraPump=nil;endCameraActivity()
+        if !retainImage {scanGeneration+=1}
+        let generation=scanGeneration
+        dismissLocalScanFrame(restoring:true);refresh()
+        operationTask=Task {
+            await previousOperation?.value
+            await previous?.value;await capture.stop()
+            guard connected,!stopping,!Task.isCancelled,scanGeneration==generation else{return}
+            if !retainImage {
+                do {try await phone.clear(epoch:generation,requireConnection:true)}
+                catch {localScanClearFailed();return}
+            }
+            guard connected,!stopping,!Task.isCancelled,scanGeneration==generation else{return}
+            busy=false;cameraFPS=0
+            status(retainImage ? "已送入手机识别":"已返回手机应用",
+                   retainImage ? "识别与后续操作由手机应用完成；换二维码可点“重新框选”。":"手机画面可直接操作；需要桌面扫码时点“重新框选”。")
+        }
+    }
+    private func localScanClearFailed() {
+        guard connected,!stopping,!Task.isCancelled else{return}
+        busy=false
+        status("扫码清理未确认","手机未确认清除上一张桌面图，正在安全结束临时连接。")
+        disconnect(preserveError:true)
+    }
+    private func toggleLocalScanPause() {
+        guard connected,!stopping,!busy,let frame=localScanFrame else{return}
+        busy=true
+        if paused {
+            let generation=scanGeneration
+            operationTask=Task {
+                do {
+                    try await capture.prepare();try Task.checkCancellation()
+                    guard connected,!stopping,localScanFrame === frame,scanGeneration==generation else{return}
+                    paused=false;busy=false;frame.setPaused(false);localScanRect=nil
+                    startCameraLoop();refresh();writeDiagnosticState()
+                } catch {
+                    guard connected,!stopping,!Task.isCancelled else{return}
+                    busy=false;frame.setMessage("采集未恢复，请返回应用");refresh()
+                }
+            }
+        } else {
+            paused=true;scanGeneration+=1
+            let generation=scanGeneration,previous=cameraLoop;cameraLoop=nil
+            cameraPump?.stop();cameraPump=nil;previous?.cancel();endCameraActivity()
+            frame.setPaused(true);refresh()
+            operationTask=Task {
+                await previous?.value;await capture.stop()
+                guard connected,!stopping,!Task.isCancelled,localScanFrame === frame,scanGeneration==generation else{return}
+                do {try await phone.clear(epoch:generation,requireConnection:true)}
+                catch {localScanClearFailed();return}
+                guard connected,!stopping,!Task.isCancelled,localScanFrame === frame,scanGeneration==generation else{return}
+                busy=false;refresh();writeDiagnosticState()
+            }
+        }
+    }
+    @discardableResult private func clearCamera() async -> Bool {
+        dismissLocalScanFrame(restoring:true)
+        localCameraMode=false
         endCameraActivity()
         let previousCamera=cameraLoop;cameraLoop=nil
         paused=true;cameraActive=false;scanGeneration+=1;cameraPump?.stop();cameraPump=nil;previousCamera?.cancel();cameraFPS=0;refresh()
         await capture.stop()
         await previousCamera?.value
-        try? await phone.clear(epoch:scanGeneration)
+        let confirmed:Bool
+        do {try await phone.clear(epoch:scanGeneration,requireConnection:true);confirmed=true}
+        catch {confirmed=false}
         cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil
+        return confirmed
     }
     private func showApplications(){
         guard connected,!stopping else{return}
@@ -623,7 +724,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         busy=true;operationTask?.cancel()
         operationTask=Task { [self] in
             do {
-                await clearCamera();let generation=scanGeneration
+                guard await clearCamera() else{localScanClearFailed();return}
+                let generation=scanGeneration
                 status("准备桌面相机","正在读取当前窗口后方的桌面画面…")
                 try await capture.prepare();try Task.checkCancellation()
                 screenAccessGranted=true
@@ -643,8 +745,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 targetWindow.onPermissionSettings={ [weak self] in self?.permissionSettings() }
                 targetWindow.onRelaunch={ [weak self] in self?.relaunch() }
                 cameraActive=true;paused=false;busy=false
+                localCameraMode=desktopMode
+                if localCameraMode {showLocalScanFrame(for:targetWindow)}
                 startCameraLoop()
-                status("拖动窗口扫码","当前应用正在读取窗口后方的桌面；拖动标题栏对准二维码，识别结果由你继续操作。")
+                status(localCameraMode ? "拖动扫码框":"拖动窗口扫码",localCameraMode ? "透明框直接显示桌面；停稳后送入手机，结果在原应用中显示。":"拖动窗口对准二维码，由真实手机应用识别。")
             } catch {
                 guard !stopping && connected else{return}
                 busy=false;cameraSuppressed=true
@@ -691,6 +795,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                     guard cameraActive,cameraWindow === mainControl else{throw ScanError("应用内扫一扫未自动启用桌面相机。")}
                     item["automaticCameraStarted"]=true
+                    item["localFrameVisible"]=localScanFrame?.window?.isVisible == true
+                    if localScanFrame != nil {
+                        toggleLocalScanPause();await operationTask?.value
+                        guard paused,localScanFrame?.window?.isVisible == true,cameraPump==nil else{throw ScanError("透明框暂停未完成。")}
+                        item["localPausePassed"]=true
+                        toggleLocalScanPause();await operationTask?.value
+                        guard !paused,cameraPump != nil else{throw ScanError("透明框恢复未完成。")}
+                        item["localResumePassed"]=true
+                        try await phone.discardFrame(epoch:scanGeneration)
+                        item["sameEpochDiscardAcknowledged"]=true
+                        returnLocalScanToApplication(retainImage:false);await operationTask?.value
+                        guard paused,localScanFrame==nil,mainControl.window?.isVisible == true else{throw ScanError("透明框返回未完成。")}
+                        item["localCancelPassed"]=true
+                        togglePause();await operationTask?.value
+                        guard localScanFrame?.window?.isVisible == true,!paused else{throw ScanError("重新框选未完成。")}
+                        item["localReopenPassed"]=true
+                    }
+                    if let frame=localScanFrame {check.bindLocalFrame(frame)}
                     let started=ProcessInfo.processInfo.systemUptime
                     check.start(at:started)
                     while ProcessInfo.processInfo.systemUptime-started<14 {
@@ -701,7 +823,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                     $0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)
                                 }
                             }.value
-                            if found {item["qrRecognized"]=true;break}
+                            if found {
+                                item["qrRecognized"]=true
+                                item["returnedToNativeWindow"]=mainControl.window?.isVisible == true && localScanFrame == nil
+                                break
+                            }
                         }
                     }
                 } catch {item["failure"]=error.localizedDescription}
@@ -867,6 +993,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     private func followCameraState(_ state:PhoneCameraState) async {
+        guard connected,!stopping,!busy else{return}
         let mainDisplay=await phone.scannerDisplay()?.id
         if let mainDisplay {try? await followDesktopHome(state,display:mainDisplay)}
         let windows=detachedApplications?.cameraWindows() ?? []
@@ -1004,7 +1131,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func updateCameraTick(){
         guard let pump=cameraPump,cameraActive,!paused else{return}
-        guard captureControl.window?.isVisible == true,captureControl.window?.isMiniaturized == false else {
+        let visible=localCameraMode ? localScanFrame?.window?.isVisible == true :
+            (captureControl.window?.isVisible == true && captureControl.window?.isMiniaturized == false)
+        guard visible else {
             suspendHiddenCamera();return
         }
         let tick=ProcessInfo.processInfo.systemUptime
@@ -1018,7 +1147,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if tick>=nextCameraGeometry {
             nextCameraGeometry=tick+1.0/30
             do {
-                let rect=captureControl.desktopCaptureRect
+                let rect=localScanFrame?.captureRect ?? captureControl.desktopCaptureRect
+                if localCameraMode,localScanRect != rect {
+                    localScanRect=rect;pump.delayCapture(until:tick+0.18)
+                }
                 performanceCheck?.recordCaptureRect(rect,at:tick)
                 pump.publish(try DesktopCaptureTarget.current(for:rect))
             }
@@ -1029,14 +1161,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         framesSent=cameraFramesBase+stats.sent;cameraFPS=stats.fps
         captureMilliseconds=stats.captureMilliseconds;transferMilliseconds=stats.transferMilliseconds
         droppedCameraFrames=stats.dropped;maximumCameraGapMilliseconds=stats.maximumGapMilliseconds
+        if localCameraMode,pump.canHandoff(at:tick) {
+            returnLocalScanToApplication(retainImage:true)
+            return
+        }
         if let error=snapshot.failure {
             let checking=performanceTask;checking?.cancel()
             pump.stop();cameraPump=nil;cameraSuppressed=true;cameraLoop?.cancel()
             cameraActive=false;paused=true;busy=true;refresh()
             operationTask=Task {
                 await checking?.value
-                await clearCamera()
+                let cleared=await clearCamera()
                 guard connected,!stopping else{return}
+                if !cleared {localScanClearFailed();return}
                 busy=false;status("桌面相机已暂停",error.localizedDescription)
                 if await capture.permissionBlocked {captureControl.showPermissionHelp(true)}
             }
@@ -1058,24 +1195,52 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let diagnosticQRStart=performanceCheck == nil ? Double.infinity:ProcessInfo.processInfo.systemUptime+6.2
         let saveSyntheticPattern=performanceCheck != nil && CommandLine.arguments.contains("--diagnostic-pattern")
         cameraPump=pump;cameraFramesBase=framesSent
+        let localFrameMode=localCameraMode
+        if localFrameMode {localScanRect=nil}
         updateCameraTick()
         cameraLoop=Task.detached(priority:.userInitiated) { [capture,phone] in
             var stats=CameraPumpMailbox.Statistics()
             var measuredAt=ProcessInfo.processInfo.systemUptime,measuredFrames=0
             var transientFailureSince:TimeInterval?,lastSentAt:TimeInterval?
             var lastQRCheck=0.0,savedPattern=false
-            while !Task.isCancelled,let target=pump.latest() {
+            while !Task.isCancelled,let selection=pump.selection() {
+                let target=selection.target
                 let began=ProcessInfo.processInfo.systemUptime
+                if localFrameMode,!pump.captureReady(at:began) {
+                    try? await Task.sleep(nanoseconds:25_000_000);continue
+                }
                 do {
                     let image=try await capture.capture(target,maximumDimension:1280)
                     stats.captureMilliseconds=(ProcessInfo.processInfo.systemUptime-began)*1000
                     try Task.checkCancellation()
                     guard pump.latest() != nil else{break}
+                    if localFrameMode,(!pump.captureReady(at:ProcessInfo.processInfo.systemUptime) || !pump.isCurrent(selection)) {continue}
+                    var localCodeVisible=false
+                    if localFrameMode {
+                        let request=VNDetectBarcodesRequest();request.symbologies=[.qr]
+                        try VNImageRequestHandler(data:image).perform([request])
+                        // Presence only: never read or follow a real QR payload.
+                        localCodeVisible = !(request.results?.isEmpty ?? true)
+                        if !pump.captureReady(at:ProcessInfo.processInfo.systemUptime) || !pump.isCurrent(selection) {continue}
+                        if !localCodeVisible {
+                            pump.update(stats)
+                            try await Task.sleep(nanoseconds:250_000_000)
+                            continue
+                        }
+                    }
                     let sending=ProcessInfo.processInfo.systemUptime
                     // Freshness is checked again when the phone actor actually owns
                     // the socket, after any queued control command has completed.
-                    let receipt=try await phone.frame(image,epoch:generation,selectedAt:target.selectedAt)
+                    let validator:(@Sendable ()->Bool)?
+                    if localFrameMode {
+                        validator={pump.isCurrent(selection) && pump.captureReady(at:ProcessInfo.processInfo.systemUptime)}
+                    } else {validator=nil}
+                    let receipt=try await phone.frame(image,epoch:generation,selectedAt:target.selectedAt,isCurrent:validator)
                     let sentAt=ProcessInfo.processInfo.systemUptime
+                    if localFrameMode,!pump.isCurrent(selection) {
+                        try await phone.discardFrame(epoch:generation)
+                        stats.dropped+=1;pump.update(stats);continue
+                    }
                     stats.sent+=1
                     if let previous=lastSentAt {stats.maximumGapMilliseconds=max(stats.maximumGapMilliseconds,(sentAt-previous)*1000)}
                     lastSentAt=sentAt;transientFailureSince=nil
@@ -1087,6 +1252,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     stats.sendMilliseconds=receipt.sendMilliseconds
                     stats.responseWaitMilliseconds=receipt.responseWaitMilliseconds
                     stats.responseBodyMilliseconds=receipt.responseBodyMilliseconds
+                    if localFrameMode,localCodeVisible {
+                        stats.localQRSubmitted=true;stats.localSubmission=selection
+                    }
                     let duration=sentAt-measuredAt
                     if duration>=2 {
                         stats.fps=Double(stats.sent-measuredFrames)/duration
@@ -1104,6 +1272,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         stats.syntheticQRVisible=barcode.results?.contains{$0.payloadStringValue==ScanPerformanceCheck.payload} ?? false
                     }
                     pump.update(stats)
+                    if stats.localQRSubmitted {
+                        // Wait for the main actor to accept this exact selection.
+                        // Movement/retry during or after ACK invalidates it, even
+                        // if the frame returns to the same screen coordinates.
+                        while !Task.isCancelled,pump.isCurrent(selection) {
+                            try await Task.sleep(nanoseconds:20_000_000)
+                        }
+                        guard !Task.isCancelled,pump.latest() != nil else{break}
+                        try await phone.discardFrame(epoch:generation)
+                        stats.localQRSubmitted=false;stats.localSubmission=nil
+                        stats.dropped+=1;pump.update(stats)
+                        continue
+                    }
                 } catch {
                     guard !Task.isCancelled,pump.latest() != nil else{break}
                     if error is DesktopCaptureTransientError || error is CameraFrameExpiredError {
@@ -1120,7 +1301,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     try? await phone.clear(epoch:generation)
                     break
                 }
-                let rest=max(0,1.0/30-(ProcessInfo.processInfo.systemUptime-began))
+                let rest=max(0,(localFrameMode ? 0.25:1.0/30)-(ProcessInfo.processInfo.systemUptime-began))
                 if rest>0 {try? await Task.sleep(nanoseconds:UInt64(rest*1_000_000_000))}
             }
         }
@@ -1207,6 +1388,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return false
     }
     private func togglePause(){
+        if localScanFrame != nil {toggleLocalScanPause();return}
         guard connected,!busy,cameraActive,let window=cameraWindow,let display=cameraDisplay else{return}
         if !paused {
             let checking=performanceTask;checking?.cancel()
@@ -1262,6 +1444,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func disconnect(preserveError:Bool=false){
         guard !stopping else{return}
+        dismissLocalScanFrame(restoring:true);localCameraMode=false
         endCameraActivity()
         launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
@@ -1315,6 +1498,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
         if terminationReady {return .terminateNow}
         guard !terminating else{return .terminateCancel}
+        dismissLocalScanFrame(restoring:false);localCameraMode=false
         endCameraActivity()
         terminating=true
         launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil

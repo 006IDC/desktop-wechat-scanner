@@ -1090,6 +1090,13 @@ public final class LiveCameraServer {
                     clearCameraFrame();
                 }
                 reply(output, true, new byte[0]);
+            } else if (command == 23) {
+                if (length != Long.BYTES) { error(output, "Discard request needs an 8-byte epoch"); continue; }
+                long epoch = new DataInputStream(new ByteArrayInputStream(body)).readLong();
+                if (epoch < 0) { error(output, "Epoch must be nonnegative"); continue; }
+                // An old discard must never erase a newer capture generation.
+                if (epoch == currentEpoch) clearCameraFrame();
+                reply(output, true, new byte[0]);
             } else if (command == 4) {
                 if (length != 0) { error(output, "Heartbeat must be empty"); continue; }
                 reply(output, true, new byte[0]);

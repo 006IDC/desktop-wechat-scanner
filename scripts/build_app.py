@@ -119,7 +119,7 @@ info={
     'CFBundleIdentifier':'com.idc006.DesktopWeChatScanner',
     'CFBundleName':'桌面微信扫码','CFBundleDisplayName':'桌面微信扫码',
     'CFBundleExecutable':'DesktopWeChatScanner','CFBundlePackageType':'APPL',
-    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'40',
+    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'41',
     'DesktopScannerRelease':'0.4.0-preview.5',
     'CFBundleIconFile':'AppIcon.icns',
     'LSMinimumSystemVersion':'14.4','NSHighResolutionCapable':True,

@@ -24,6 +24,32 @@ import Dispatch
         for index in 0..<10_000 {pump.publish(target(index))}
         require(marker(pump.latest())==9_999,"Fast producer left an old target")
         require(marker(pump.latest())==9_999,"Reading latest consumed the target")
+        pump.delayCapture(until:120)
+        require(!pump.captureReady(at:119.99),"Moving frame uploaded before settling")
+        require(pump.captureReady(at:120),"Settled frame never became eligible")
+        pump.delayCapture(until:121)
+        require(!pump.captureReady(at:120.5),"A second move failed to defer capture")
+        let region=target(71)
+        pump.publish(region)
+        let old=pump.selection()!
+        pump.publish(target(72));pump.publish(region)
+        require(!pump.isCurrent(old),"A to B to A revived a stale capture")
+        let beforeRetry=pump.selection()!
+        pump.delayCapture(until:125)
+        require(!pump.isCurrent(beforeRetry),"Retry did not invalidate an in-flight image")
+        let stable=pump.selection()!
+        pump.publish(target(971))
+        require(pump.isCurrent(stable),"A routine timestamp refresh invalidated unchanged geometry")
+        var ack=CameraPumpMailbox.Statistics()
+        ack.localQRSubmitted=true;ack.localSubmission=stable
+        pump.update(ack)
+        require(pump.canHandoff(at:126),"A current settled ACK could not hand off")
+        pump.delayCapture(until:127)
+        require(!pump.canHandoff(at:128),"Retry after ACK handed off the old submission")
+        let duringACK=pump.selection()!
+        pump.publish(target(72));pump.publish(target(971))
+        ack.localSubmission=duringACK;pump.update(ack)
+        require(!pump.canHandoff(at:129),"A to B to A during ACK handed off the old frame")
 
         var stats=CameraPumpMailbox.Statistics()
         require(stats.sendMilliseconds==0 && stats.responseWaitMilliseconds==0 &&
@@ -33,6 +59,7 @@ import Dispatch
         stats.sendMilliseconds=1.25;stats.responseWaitMilliseconds=2.5
         stats.responseBodyMilliseconds=0.75
         stats.maximumGapMilliseconds=110
+        stats.localQRSubmitted=true
         pump.update(stats)
         let read=pump.snapshot()
         require(read.statistics.sent==47 && read.statistics.dropped==3 &&
@@ -41,7 +68,7 @@ import Dispatch
                 read.statistics.sendMilliseconds==1.25 &&
                 read.statistics.responseWaitMilliseconds==2.5 &&
                 read.statistics.responseBodyMilliseconds==0.75 &&
-                read.statistics.maximumGapMilliseconds==110 && read.failure==nil,
+                read.statistics.maximumGapMilliseconds==110 && read.statistics.localQRSubmitted && read.failure==nil,
                 "Statistics snapshot lost pump metrics")
 
         // The worker may finish one capture while UI publishes many new positions.
