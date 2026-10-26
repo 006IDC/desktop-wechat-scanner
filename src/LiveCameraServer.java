@@ -39,6 +39,7 @@ import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -127,6 +128,9 @@ public final class LiveCameraServer {
     private long ownerGeneration;
     // A bounded reason for fail-closed camera ownership detection in CMD 5.
     private String ownerStatus = "uninitialized";
+    private String ownerErrorClass, ownerErrorDetail;
+    private int ownerVisibleCameraCount, ownerBackCameraCount;
+    private int ownerDeviceKeyListedCount, ownerDeviceIdPresentCount, ownerDeviceIdMatchCount;
     // Only the authenticated command reader changes this value. A clear advances
     // the epoch so a frame captured before pause cannot revive the camera.
     private long currentEpoch;
@@ -554,6 +558,19 @@ public final class LiveCameraServer {
         boolean probeFailed = false;
         CameraCharacteristics.Key<Integer> owningDeviceKey =
                 new CameraCharacteristics.Key<>("android.info.deviceId", int.class);
+        Method characteristicsWithoutRotation;
+        try {
+            // Android 16's public one-argument overload first reads desktop
+            // rotation flags through a system-context Settings resolver, which
+            // is unrelated to camera identity and fails in this shell process.
+            // The framework's @TestApi overload skips that path while querying
+            // the same CameraService with this virtual Context's attribution.
+            characteristicsWithoutRotation = CameraManager.class.getMethod(
+                    "getCameraCharacteristics", String.class, boolean.class);
+        } catch (NoSuchMethodException unavailable) {
+            ownerStatus = "characteristic_api_unavailable";
+            return;
+        }
         probe: for (int attempt = 0; attempt < 3 && mapped == null; attempt++) {
             ownerStatus = "ids";
             String[] ids;
@@ -562,14 +579,31 @@ public final class LiveCameraServer {
                 ownerStatus = "ids_error";
                 probeFailed = true; break;
             }
+            ownerVisibleCameraCount = ids.length;
+            ownerBackCameraCount = 0;
+            ownerDeviceKeyListedCount = 0;
+            ownerDeviceIdPresentCount = 0;
+            ownerDeviceIdMatchCount = 0;
             Map<String, Integer> facing = new HashMap<>();
             Map<String, Integer> owningDevices = new HashMap<>();
             ownerStatus = "characteristic";
             for (String id : ids) {
                 CameraCharacteristics properties;
-                try { properties = manager.getCameraCharacteristics(id); }
+                try { properties = (CameraCharacteristics) characteristicsWithoutRotation.invoke(manager, id, false); }
                 catch (Exception unavailable) {
                     ownerStatus = "characteristic_lookup_error";
+                    Throwable failure = unavailable instanceof InvocationTargetException
+                            && unavailable.getCause() != null ? unavailable.getCause() : unavailable;
+                    ownerErrorClass = failure.getClass().getSimpleName().replaceAll("[^A-Za-z0-9_]", "");
+                    String detail = failure.getMessage();
+                    if (detail != null) {
+                        detail = detail.replaceAll("[\\p{Cntrl}]", " ")
+                                .replaceAll("(?i)\\b[0-9a-f]{12,}\\b", "[redacted]")
+                                .replaceAll("[A-Za-z0-9_-]{24,}", "[redacted]")
+                                .replaceAll("https?://\\S+|/(?:[^\\s/]+/)+[^\\s/]+", "[redacted]")
+                                .replaceAll("\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b", "[redacted]");
+                        ownerErrorDetail = detail.substring(0, Math.min(120, detail.length()));
+                    }
                     probeFailed = true; break probe;
                 }
                 List<CameraCharacteristics.Key<?>> keys;
@@ -588,16 +622,23 @@ public final class LiveCameraServer {
                     probeFailed = true; break probe;
                 }
                 facing.put(id, direction);
-                // INFO_DEVICE_ID is optional on physical cameras. Do not call
-                // get() for a tag this ROM does not advertise.
-                if (!keys.contains(owningDeviceKey)) continue;
+                if (Integer.valueOf(CameraMetadata.LENS_FACING_BACK).equals(direction)) ownerBackCameraCount++;
+                // getKeys() is filtered through availableCharacteristicsKeys;
+                // a framework-injected hidden tag can be readable even when
+                // absent from that advertised list. Read it directly, while
+                // keeping null/invalid values fail-closed.
+                if (keys.contains(owningDeviceKey)) ownerDeviceKeyListedCount++;
                 Integer owningDevice;
                 try { owningDevice = properties.get(owningDeviceKey); }
                 catch (Exception unavailable) {
                     ownerStatus = "device_id_read_error";
                     probeFailed = true; break probe;
                 }
-                owningDevices.put(id, owningDevice);
+                if (owningDevice != null) {
+                    ownerDeviceIdPresentCount++;
+                    owningDevices.put(id, owningDevice);
+                    if (owningDevice == deviceId) ownerDeviceIdMatchCount++;
+                }
             }
             mapped = verifiedMappedBackCameraId(deviceId, true, ids, facing, owningDevices);
             if (mapped == null && attempt < 2) {
@@ -953,7 +994,14 @@ public final class LiveCameraServer {
             state.put("generation", streamGeneration).put("activeStreams", streams.size());
             state.put("cameraOwner", cameraOwner == null ? JSONObject.NULL : cameraOwner);
             state.put("ownerKnown", cameraOwnerKnown).put("ownerGeneration", ownerGeneration);
-            state.put("ownerStatus", ownerStatus);
+            state.put("ownerStatus", ownerStatus)
+                    .put("ownerErrorClass", ownerErrorClass == null ? JSONObject.NULL : ownerErrorClass)
+                    .put("ownerErrorDetail", ownerErrorDetail == null ? JSONObject.NULL : ownerErrorDetail)
+                    .put("ownerVisibleCameraCount", ownerVisibleCameraCount)
+                    .put("ownerBackCameraCount", ownerBackCameraCount)
+                    .put("ownerDeviceKeyListedCount", ownerDeviceKeyListedCount)
+                    .put("ownerDeviceIdPresentCount", ownerDeviceIdPresentCount)
+                    .put("ownerDeviceIdMatchCount", ownerDeviceIdMatchCount);
             for (Map.Entry<Integer, String> entry : topActivities.entrySet()) {
                 int id = entry.getKey();
                 String component = entry.getValue();

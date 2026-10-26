@@ -125,7 +125,7 @@ info={
     'LSMinimumSystemVersion':'14.4','NSHighResolutionCapable':True,
     'NSLocalNetworkUsageDescription':'连接同一局域网内已由你配对授权的 Android 手机，以显示镜像并发送点击。',
     'NSBonjourServices':['_adb-tls-connect._tcp'],
-    'NSScreenCaptureUsageDescription':'将手机镜像窗口后方的桌面画面送给你的手机微信扫一扫。',
+    'NSScreenCaptureUsageDescription':'将手机应用窗口后方的桌面画面作为已连接手机的扫码相机输入。',
     'NSPrincipalClass':'NSApplication',
 }
 with (contents/'Info.plist').open('wb') as stream:plistlib.dump(info,stream)
