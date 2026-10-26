@@ -25,16 +25,27 @@ import Darwin
             precondition(String(bytes:exact(client,32),encoding:.ascii)==token)
             precondition(exact(client,5)==[1,0,0,0,3]);precondition(exact(client,3)==[1,2,3])
             // Deliberately fragmented response exercises exact-read framing.
+            usleep(10_000)
             for byte:UInt8 in [0,0,0,0,2,8,9] {var b=byte;_=Darwin.send(client,&b,1,0)}
             precondition(exact(client,5)==[2,0,0,0,0])
+            var ordinary:[UInt8]=[0,0,0,0,1,7]
+            _=Darwin.send(client,&ordinary,ordinary.count,0)
+            precondition(exact(client,5)==[3,0,0,0,0])
             var invalid:[UInt8]=[0,0x7f,0xff,0xff,0xff]
             _=Darwin.send(client,&invalid,invalid.count,0)
         }
         let client=try CameraSocket(port:UInt16(bigEndian:address.sin_port),token:token)
-        let response=try client.request(1,Data([1,2,3]));precondition(response==Data([8,9]))
-        do {_=try client.request(2);fatalError("oversized response accepted")}
+        let measured=try client.requestMeasured(1,Data([1,2,3]))
+        precondition(measured.data==Data([8,9]))
+        for value in [measured.sendMilliseconds,measured.responseWaitMilliseconds,measured.responseBodyMilliseconds] {
+            precondition(value.isFinite && value>=0,"invalid transport timing")
+        }
+        precondition(measured.responseWaitMilliseconds>=5,"delayed ACK was not measured")
+        let ordinaryResponse=try client.request(2)
+        precondition(ordinaryResponse==Data([7]),"ordinary request changed")
+        do {_=try client.request(3);fatalError("oversized response accepted")}
         catch {precondition(error.localizedDescription.contains("长度"))}
         client.close();precondition(done.wait(timeout:.now()+2) == .success)
-        print("PASS: token, big-endian framing, fragmented reads, oversized response rejection, socket close")
+        print("PASS: token, framing, transport phase timings, ordinary request, oversized response rejection, socket close")
     }
 }

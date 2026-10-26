@@ -23,6 +23,8 @@ import CoreImage.CIFilterBuiltins
     private var movementDuration=0.0
     private var captureCosts:[Double]=[],transferCosts:[Double]=[]
     private var processingCosts:[Double]=[],requestCosts:[Double]=[],actorWaitCosts:[Double]=[],imageSizes:[Double]=[]
+    private var sendCosts:[Double]=[],responseWaitCosts:[Double]=[],responseBodyCosts:[Double]=[]
+    private var presentationCosts:[String:[Double]]=[:]
     private(set) var qrVisible = false
     private(set) var movedPoints: CGFloat = 0
     private let reduceMotion: Bool
@@ -88,6 +90,14 @@ import CoreImage.CIFilterBuiltins
         }
     }
 
+    /// Numeric-only opt-in timing of the UI work surrounding a presentation.
+    /// Bounded to the six-second movement phase; no screen content is retained.
+    func recordPresentation(_ stage:String,since began:TimeInterval) {
+        let now=ProcessInfo.processInfo.systemUptime
+        guard let started,now-started<=6,(presentationCosts[stage]?.count ?? 0)<600 else{return}
+        presentationCosts[stage,default:[]].append(max(0,now-began)*1000)
+    }
+
     func recordPump(_ stats:CameraPumpMailbox.Statistics,at now:TimeInterval) {
         syntheticQRVisible = syntheticQRVisible || stats.syntheticQRVisible
         guard let started,now-started<=6 else{return}
@@ -98,6 +108,8 @@ import CoreImage.CIFilterBuiltins
             captureCosts.append(stats.captureMilliseconds);transferCosts.append(stats.transferMilliseconds)
             if let processing=stats.phoneProcessingMilliseconds {processingCosts.append(processing)}
             requestCosts.append(stats.requestMilliseconds);actorWaitCosts.append(stats.actorWaitMilliseconds)
+            sendCosts.append(stats.sendMilliseconds);responseWaitCosts.append(stats.responseWaitMilliseconds)
+            responseBodyCosts.append(stats.responseBodyMilliseconds)
             imageSizes.append(Double(stats.imageBytes))
         }
     }
@@ -109,7 +121,11 @@ import CoreImage.CIFilterBuiltins
             let sorted=values.sorted()
             return sorted.isEmpty ? 0 : sorted[min(sorted.count-1,Int(Double(sorted.count)*0.95))]
         }
+        let presentation=presentationCosts.mapValues { values in
+            ["p95Milliseconds":percentile(values),"maxMilliseconds":values.max() ?? 0,"samples":Double(values.count)]
+        }
         return ["test":"native-window-motion-and-synthetic-qr", "tickSamples":tickGaps.count,
+                "presentationStages":presentation,
                 "tickP95Milliseconds":percentile(tickGaps), "tickMaxMilliseconds":tickGaps.max() ?? 0,
                 "roiPositionErrorP95Points":percentile(positionErrors),
                 "movementSentFrames":movementSent,
@@ -122,6 +138,9 @@ import CoreImage.CIFilterBuiltins
                 "movementPhoneProcessingP95Milliseconds":percentile(processingCosts),
                 "movementRequestP95Milliseconds":percentile(requestCosts),
                 "movementActorWaitP95Milliseconds":percentile(actorWaitCosts),
+                "movementSendP95Milliseconds":percentile(sendCosts),
+                "movementResponseWaitP95Milliseconds":percentile(responseWaitCosts),
+                "movementResponseBodyP95Milliseconds":percentile(responseBodyCosts),
                 "movementImageBytesP95":percentile(imageSizes),
                 "movementAmplitudePoints":movedPoints, "reducedMotion":reduceMotion,
                 "physicalMouseDragMeasured":false]

@@ -26,14 +26,21 @@ import Dispatch
         require(marker(pump.latest())==9_999,"Reading latest consumed the target")
 
         var stats=CameraPumpMailbox.Statistics()
+        require(stats.sendMilliseconds==0 && stats.responseWaitMilliseconds==0 &&
+                stats.responseBodyMilliseconds==0,"New transport timings were not zero")
         stats.sent=47;stats.dropped=3;stats.fps=28.5
         stats.captureMilliseconds=7.25;stats.transferMilliseconds=4.5
+        stats.sendMilliseconds=1.25;stats.responseWaitMilliseconds=2.5
+        stats.responseBodyMilliseconds=0.75
         stats.maximumGapMilliseconds=110
         pump.update(stats)
         let read=pump.snapshot()
         require(read.statistics.sent==47 && read.statistics.dropped==3 &&
                 read.statistics.fps==28.5 && read.statistics.captureMilliseconds==7.25 &&
                 read.statistics.transferMilliseconds==4.5 &&
+                read.statistics.sendMilliseconds==1.25 &&
+                read.statistics.responseWaitMilliseconds==2.5 &&
+                read.statistics.responseBodyMilliseconds==0.75 &&
                 read.statistics.maximumGapMilliseconds==110 && read.failure==nil,
                 "Statistics snapshot lost pump metrics")
 

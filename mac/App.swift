@@ -375,8 +375,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if previewsReceived%60==1 {writeDiagnosticState()}
     }
     @objc private func presentMirrorFrame(){
-        performanceCheck?.tick(at:ProcessInfo.processInfo.systemUptime)
-        updateCameraTick();detachedApplications?.present()
+        let check=performanceCheck
+        var stage=ProcessInfo.processInfo.systemUptime
+        check?.tick(at:stage)
+        check?.recordPresentation("windowMotion",since:stage)
+        stage=ProcessInfo.processInfo.systemUptime
+        updateCameraTick()
+        check?.recordPresentation("captureGeometry",since:stage)
+        stage=ProcessInfo.processInfo.systemUptime
+        detachedApplications?.present()
+        check?.recordPresentation("detachedPresentation",since:stage)
+        stage=ProcessInfo.processInfo.systemUptime
+        defer {check?.recordPresentation("mirrorPresentation",since:stage)}
         if primaryLocked {_=physicalMirror.frames.takeLatest()}
         else if wechatWindow != nil,let frame=physicalMirror.frames.takeLatest(),frame.generation==physicalMirror.incarnation {
             physicalFrame=frame.pixelBuffer;mainControl.setPhonePixelBuffer(frame.pixelBuffer)
@@ -667,7 +677,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let check=try ScanPerformanceCheck(scanner:mainControl);performanceCheck=check
                     await capture.setDiagnosticBoard(CGWindowID(check.board.windowNumber))
                     cameraSuppressed=false
-                    try await navigateDiagnosticScanner(package:package)
+                    try await navigateDiagnosticScanner(package:package,evidence:&item)
                     let deadline=ProcessInfo.processInfo.systemUptime+8
                     while !cameraActive && ProcessInfo.processInfo.systemUptime<deadline {
                         try Task.checkCancellation();try await Task.sleep(nanoseconds:100_000_000)
@@ -712,23 +722,35 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             try? data.write(to:folder.appendingPathComponent("desktop-performance-last.json"),options:.atomic)
         }
     }
-    private func navigateDiagnosticScanner(package:String) async throws {
+    private func navigateDiagnosticScanner(package:String,evidence:inout [String:Any]) async throws {
         var plusTapped=false,scanTapped=false,returnedFromResult=false
         var observedHomeLabels=Set<String>()
+        var stateSamples=0,targetActivitySamples=0,frameSamples=0
+        defer {
+            evidence["navigationStateSamples"]=stateSamples
+            evidence["navigationTargetActivitySamples"]=targetActivitySamples
+            evidence["navigationFrameSamples"]=frameSamples
+            evidence["navigationPlusTapped"]=plusTapped
+            evidence["navigationScanTapped"]=scanTapped
+            evidence["navigationKnownLabels"]=observedHomeLabels.sorted()
+        }
         let deadline=ProcessInfo.processInfo.systemUptime+10
         try await Task.sleep(nanoseconds:500_000_000)
         while ProcessInfo.processInfo.systemUptime<deadline {
             try Task.checkCancellation()
             let state=try await phone.cameraState()
+            stateSamples+=1
             if let scanner=state.scannerActivity(),scanner.component.hasPrefix(package+"/") {return}
             guard let display=await phone.scannerDisplay()?.id,
                   state.activities.contains(where:{$0.displayId==display && $0.component.hasPrefix(package+"/")}) else {
                 try await Task.sleep(nanoseconds:120_000_000);continue
             }
+            targetActivitySamples+=1
             if let pixels=latestPhoneFrame,!scanTapped {
+                frameSamples+=1
                 let point=try await Task.detached { () -> (CGPoint?,Bool,Bool,[String]) in
                     let words=try ScannerNavigationOCR.recognize(pixels)
-                    let known=["首页","消息","生活","理财","我的","支付宝","收付款","收付钱","扫一扫"]
+                    let known=["首页","消息","生活","理财","我的","支付宝","收付款","收付钱","扫一扫","微信","通讯录","发现","我"]
                     let labels=words.filter{known.contains($0.value)}.map(\.value)
                     let ownResult=words.contains{$0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)}
                     if ownResult {return (nil,false,true,labels)}
@@ -756,6 +778,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             }
             try await Task.sleep(nanoseconds:120_000_000)
+        }
+        if let foreground=try? await phone.foreground(onVirtualDisplay:true) {
+            evidence["navigationForegroundMatchesPackage"]=foreground.hasPrefix(package+"/")
         }
         throw ScanError("未确认真实应用的扫一扫入口，测试未点击其他内容。已见固定标签："+observedHomeLabels.sorted().joined(separator:","))
     }
@@ -1031,6 +1056,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     stats.phoneProcessingMilliseconds=receipt.processingMilliseconds
                     stats.requestMilliseconds=receipt.requestMilliseconds
                     stats.actorWaitMilliseconds=max(0,stats.transferMilliseconds-receipt.requestMilliseconds)
+                    stats.sendMilliseconds=receipt.sendMilliseconds
+                    stats.responseWaitMilliseconds=receipt.responseWaitMilliseconds
+                    stats.responseBodyMilliseconds=receipt.responseBodyMilliseconds
                     let duration=sentAt-measuredAt
                     if duration>=2 {
                         stats.fps=Double(stats.sent-measuredFrames)/duration

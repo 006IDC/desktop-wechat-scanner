@@ -9,6 +9,7 @@ final class CameraPumpMailbox: @unchecked Sendable {
         var imageBytes=0
         var phoneProcessingMilliseconds:Double?
         var requestMilliseconds=0.0,actorWaitMilliseconds=0.0
+        var sendMilliseconds=0.0,responseWaitMilliseconds=0.0,responseBodyMilliseconds=0.0
         var fps=0.0,captureMilliseconds=0.0,transferMilliseconds=0.0,maximumGapMilliseconds=0.0
     }
     struct Snapshot {

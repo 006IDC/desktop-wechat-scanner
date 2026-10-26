@@ -41,6 +41,12 @@ enum ShellCommand {
 
 /// Blocking framed transport. Only PhoneSession's actor accesses this socket.
 final class CameraSocket {
+    struct MeasuredResponse {
+        let data: Data
+        let sendMilliseconds: Double
+        let responseWaitMilliseconds: Double
+        let responseBodyMilliseconds: Double
+    }
     private var descriptor: Int32 = -1
     init(port: UInt16, token: String) throws {
         descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
@@ -89,16 +95,27 @@ final class CameraSocket {
         return data
     }
     func request(_ command: UInt8, _ body: Data = Data()) throws -> Data {
+        try requestMeasured(command, body).data
+    }
+    func requestMeasured(_ command: UInt8, _ body: Data = Data()) throws -> MeasuredResponse {
         guard body.count <= 4*1024*1024+8 else { throw ScanError("图像过大。") }
         var request = Data([command]); var length = UInt32(body.count).bigEndian
         withUnsafeBytes(of: &length) { request.append(contentsOf: $0) }
-        request.append(body); try send(request)
+        request.append(body)
+        let sendStart=ProcessInfo.processInfo.systemUptime
+        try send(request)
+        let sentAt=ProcessInfo.processInfo.systemUptime
         let header = try read(5)
+        let headerAt=ProcessInfo.processInfo.systemUptime
         let size = header.dropFirst().reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
         guard size <= 4*1024*1024 else { throw ScanError("手机返回了无效图像长度。") }
         let result = try read(Int(size))
+        let bodyAt=ProcessInfo.processInfo.systemUptime
         guard header[0] == 0 else { throw ScanError(String(data: result, encoding: .utf8) ?? "手机处理图像失败。") }
-        return result
+        return MeasuredResponse(data:result,
+                                sendMilliseconds:max(0,(sentAt-sendStart)*1000),
+                                responseWaitMilliseconds:max(0,(headerAt-sentAt)*1000),
+                                responseBodyMilliseconds:max(0,(bodyAt-headerAt)*1000))
     }
 }
 
@@ -182,6 +199,18 @@ struct CameraFrameExpiredError: LocalizedError {
 struct CameraFrameReceipt {
     let processingMilliseconds: Double?
     let requestMilliseconds: Double
+    let sendMilliseconds: Double
+    let responseWaitMilliseconds: Double
+    let responseBodyMilliseconds: Double
+    init(processingMilliseconds: Double?, requestMilliseconds: Double,
+         sendMilliseconds: Double=0, responseWaitMilliseconds: Double=0,
+         responseBodyMilliseconds: Double=0) {
+        self.processingMilliseconds=processingMilliseconds
+        self.requestMilliseconds=requestMilliseconds
+        self.sendMilliseconds=sendMilliseconds
+        self.responseWaitMilliseconds=responseWaitMilliseconds
+        self.responseBodyMilliseconds=responseBodyMilliseconds
+    }
 }
 
 actor PhoneSession {
@@ -299,15 +328,19 @@ actor PhoneSession {
         var body = try epochBytes(epoch)
         body.append(data)
         let started=ProcessInfo.processInfo.systemUptime
-        let reply:Data
-        do {reply=try channel.request(1,body)}
+        let response:CameraSocket.MeasuredResponse
+        do {response=try channel.requestMeasured(1,body)}
         catch let error as ScanError where error.message=="Desktop camera has no verified scanner owner" || error.message=="Desktop camera state changed while decoding frame" {
             // A normal scanner exit can invalidate an in-flight frame before
             // the next status poll. Drop it without displaying a transport error.
             throw CameraFrameExpiredError()
         }
-        let processing=try Self.frameProcessingMilliseconds(in:reply)
-        return CameraFrameReceipt(processingMilliseconds:processing,requestMilliseconds:(ProcessInfo.processInfo.systemUptime-started)*1000)
+        let processing=try Self.frameProcessingMilliseconds(in:response.data)
+        return CameraFrameReceipt(processingMilliseconds:processing,
+                                  requestMilliseconds:(ProcessInfo.processInfo.systemUptime-started)*1000,
+                                  sendMilliseconds:response.sendMilliseconds,
+                                  responseWaitMilliseconds:response.responseWaitMilliseconds,
+                                  responseBodyMilliseconds:response.responseBodyMilliseconds)
     }
     static func frameProcessingMilliseconds(in reply: Data) throws -> Double? {
         // Empty is compatible with older servers and deliberately ignored epochs.
