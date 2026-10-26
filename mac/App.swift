@@ -734,8 +734,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if ownResult {return (nil,false,true,labels)}
                     // Alipay business pages may also contain this text. Require
                     // its home navigation and payment toolbar before any tap.
+                    let alipayTabs=Set(words.filter{$0.rect.midY>1000 && ["消息","理财","生活"].contains($0.value)}.map(\.value))
                     let alipayHome=package != "com.eg.android.AlipayGphone" || (
-                        words.contains{$0.value=="首页" && $0.rect.midY>1000} &&
+                        (words.contains{$0.value=="首页" && $0.rect.midY>1000} || alipayTabs.count>=2) &&
                         words.contains{$0.value=="我的" && $0.rect.midY>1000} &&
                         words.contains{["收付款","收付钱"].contains($0.value) && $0.rect.midY<400})
                     if alipayHome,let scan=words.first(where:{$0.value.replacingOccurrences(of:" ",with:"")=="扫一扫" && $0.rect.midY<(package=="com.eg.android.AlipayGphone" ? 400:800)}) {
@@ -1280,6 +1281,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let alert=NSAlert();alert.messageText="连接已停止，手机清理待恢复";alert.informativeText=problem
                 alert.addButton(withTitle:"退出，下次连接时清理");alert.runModal()
             }
+            connected=false;busy=false
+            status(problem.isEmpty ? "已退出":"已退出，清理待恢复",problem)
             await diagnosticWriter.flush()
             if relaunchAfterExit {scheduleRelaunch()}
             terminationReady=true
