@@ -1,6 +1,5 @@
 import android.content.Context;
 import android.content.ContextWrapper;
-import android.content.AttributionSource;
 import android.graphics.*;
 import android.hardware.camera2.*;
 import android.hardware.display.*;
@@ -40,9 +39,6 @@ public final class CameraProbe {
         @Override public String getPackageName() { return "com.android.shell"; }
         @Override public String getOpPackageName() { return "com.android.shell"; }
         @Override public Context getApplicationContext() { return this; }
-        @Override public AttributionSource getAttributionSource() {
-            return new AttributionSource.Builder(android.os.Process.myUid()).setPackageName("com.android.shell").build();
-        }
         @Override public Context createDeviceContext(int id) {
             return new ShellContext(getBaseContext().createDeviceContext(id));
         }
@@ -63,7 +59,26 @@ public final class CameraProbe {
         Class<?> at = Class.forName("android.app.ActivityThread");
         Object thread = at.getMethod("systemMain").invoke(null);
         Context system = (Context) at.getMethod("getSystemContext").invoke(thread);
-        return new ShellContext(system.createPackageContext("com.android.shell", 0));
+        Context packageContext = system.createPackageContext("com.android.shell", 0);
+        // createPackageContext keeps the system ContextImpl as its container. On
+        // Android 16 that copies the container's op package ("android") into
+        // the new ContextImpl and its ContentResolver, despite loading shell's
+        // resources. A wrapper cannot change that internal attribution. Build
+        // an app ContextImpl with the same shell LoadedApk but no system
+        // container, so every framework service sees the shell UID/package.
+        Class<?> impl = Class.forName("android.app.ContextImpl");
+        java.lang.reflect.Field loadedApkField = impl.getDeclaredField("mPackageInfo");
+        loadedApkField.setAccessible(true);
+        Object loadedApk = loadedApkField.get(packageContext);
+        java.lang.reflect.Method createAppContext = impl.getDeclaredMethod(
+                "createAppContext", at, loadedApkField.getType());
+        createAppContext.setAccessible(true);
+        Context shell = (Context) createAppContext.invoke(null, thread, loadedApk);
+        if (!"com.android.shell".equals(shell.getOpPackageName())
+                || !"com.android.shell".equals(shell.getAttributionSource().getPackageName())) {
+            throw new IllegalStateException("Shell context attribution mismatch");
+        }
+        return new ShellContext(shell);
     }
 
     static Object manager() throws Exception {

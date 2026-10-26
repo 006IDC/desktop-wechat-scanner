@@ -137,11 +137,10 @@ final class DirectDisplayStream implements AutoCloseable {
                     ByteBuffer buffer = codec.getOutputBuffer(index);
                     if (buffer == null) throw new IOException("Encoder output unavailable");
                     buffer.position(info.offset); buffer.limit(info.offset + info.size);
-                    byte[] bytes = new byte[info.size]; buffer.get(bytes);
                     long flags = info.presentationTimeUs & ((1L << 61) - 1);
                     if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) flags |= 1L << 62;
                     if ((info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) flags |= 1L << 61;
-                    output.writeLong(flags); output.writeInt(bytes.length); output.write(bytes); output.flush();
+                    DirectVideoPacket.write(output, buffer, flags, info.size);
                     if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) throw new IOException("Encoder ended");
                 } finally { codec.releaseOutputBuffer(index, false); }
             }

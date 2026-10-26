@@ -105,6 +105,7 @@ final class CameraSocket {
 final class ServerLog {
     private let condition = NSCondition()
     private var buffer = "", fields: [String:String] = [:]
+    private var ended = false
     func append(_ data: Data) {
         condition.lock(); defer { condition.unlock() }
         buffer += String(data: data, encoding: .utf8) ?? ""
@@ -116,6 +117,7 @@ final class ServerLog {
         }
         condition.broadcast()
     }
+    func finish() { condition.lock(); ended=true; condition.broadcast(); condition.unlock() }
     func dpi() -> Int { condition.lock(); defer { condition.unlock() }; return Int(fields["display_dpi"] ?? "") ?? 320 }
     func independentLockReady() -> Bool {
         condition.lock();defer {condition.unlock()}
@@ -128,7 +130,7 @@ final class ServerLog {
     func waitReady() throws -> (Int,Int,Int) {
         condition.lock(); defer { condition.unlock() }
         let end = Date().addingTimeInterval(25)
-        while fields["ready"] != "1" && fields["error"] == nil && Date() < end && !Task.isCancelled {
+        while fields["ready"] != "1" && fields["error"] == nil && !ended && Date() < end && !Task.isCancelled {
             condition.wait(until:min(end,Date().addingTimeInterval(0.2)))
         }
         if Task.isCancelled {throw CancellationError()}
@@ -136,7 +138,7 @@ final class ServerLog {
         guard fields["ready"] == "1", let device = Int(fields["device_id"] ?? ""),
               let display = Int(fields["display_id"] ?? ""), let pid = Int(fields["pid"] ?? ""),
               device > 0, display > 0, pid > 0 else {
-            throw ScanError("手机虚拟摄像头未能启动。请保持手机解锁后重试。")
+            throw ScanError(ended ? "手机连接服务在准备完成前退出，请重新连接。" : "手机连接服务准备超时，已停止本次连接。")
         }
         return (device,display,pid)
     }
@@ -209,7 +211,7 @@ actor PhoneSession {
         try JSONEncoder().encode(state).write(to: recoveryURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:recoveryURL.path)
     }
-    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
+    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, desktopHome: Bool = false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
         guard server == nil else { throw ScanError("手机已经连接。") }
         do {
             progress("正在检查手机连接…")
@@ -234,8 +236,10 @@ actor PhoneSession {
             }
             let api = Int(try adb(["shell","getprop ro.build.version.sdk"],serial:serial)) ?? 0
             guard api >= 36 else { throw ScanError("此版本需要 Android 16 或更新系统。") }
-            let wechat = try adb(["shell","cmd package list packages com.tencent.mm"],serial:serial)
-            guard wechat.split(separator:"\n").contains("package:com.tencent.mm") else { throw ScanError("手机主用户中没有找到微信，请先安装并登录微信。") }
+            if openWechatOnConnect {
+                let wechat = try adb(["shell","cmd package list packages com.tencent.mm"],serial:serial)
+                guard wechat.split(separator:"\n").contains("package:com.tencent.mm") else { throw ScanError("手机主用户中没有找到微信。") }
+            }
             let suffix = String(UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased().prefix(8))
             let token = UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
             let hex = Array(suffix.uppercased())
@@ -253,10 +257,10 @@ actor PhoneSession {
             try Task.checkCancellation()
             let process=Process(), pipe=Pipe(), log=ServerLog()
             process.executableURL=adbURL
-            let lockArgument=allowLockedApplications ? " independent-lock":""
+            let lockArgument=(allowLockedApplications ? " independent-lock":"") + (desktopHome ? " desktop-home":"")
             process.arguments=(serverSocket.map { ["-L", $0] } ?? []) + ["-s",r.serial,"shell","CLASSPATH=\(r.path)/server.jar app_process / LiveCameraServer \(association) \(r.socketName) \(r.token)\(lockArgument)"]
             process.standardOutput=pipe;process.standardError=pipe
-            pipe.fileHandleForReading.readabilityHandler = { handle in let data=handle.availableData; if !data.isEmpty {log.append(data)} }
+            pipe.fileHandleForReading.readabilityHandler = { handle in let data=handle.availableData; if !data.isEmpty {log.append(data)} else {log.finish()} }
             server=process;serverPipe=pipe;try process.run()
             let (device,display,pid)=try log.waitReady()
             (displayWidth,displayHeight)=log.dimensions(); displayDpi=log.dpi()
@@ -295,7 +299,14 @@ actor PhoneSession {
         var body = try epochBytes(epoch)
         body.append(data)
         let started=ProcessInfo.processInfo.systemUptime
-        let processing=try Self.frameProcessingMilliseconds(in:channel.request(1,body))
+        let reply:Data
+        do {reply=try channel.request(1,body)}
+        catch let error as ScanError where error.message=="Desktop camera has no verified scanner owner" || error.message=="Desktop camera state changed while decoding frame" {
+            // A normal scanner exit can invalidate an in-flight frame before
+            // the next status poll. Drop it without displaying a transport error.
+            throw CameraFrameExpiredError()
+        }
+        let processing=try Self.frameProcessingMilliseconds(in:reply)
         return CameraFrameReceipt(processingMilliseconds:processing,requestMilliseconds:(ProcessInfo.processInfo.systemUptime-started)*1000)
     }
     static func frameProcessingMilliseconds(in reply: Data) throws -> Double? {
@@ -311,6 +322,15 @@ actor PhoneSession {
         _ = try channel.request(3,epochBytes(epoch))
     }
     func heartbeat() throws { guard let channel else {throw ScanError("手机未连接。")};_ = try channel.request(4) }
+    func cameraState() throws -> PhoneCameraState {
+        try PhoneCameraState.decode(cameraStatusSnapshot())
+    }
+    /// Authenticated bounded technical status; callers must not persist app activity history.
+    func cameraStatusSnapshot() throws -> Data {
+        try Task.checkCancellation()
+        guard let channel else {throw ScanError("手机未连接。")}
+        return try channel.request(5)
+    }
     func screenshot() throws -> Data { guard let channel else {throw ScanError("手机未连接。")};return try channel.request(2) }
     func tap(x: Int,y: Int) throws {
         guard let displayID else {return}
@@ -555,12 +575,13 @@ actor PhoneSession {
         let result = try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")
         guard !result.lowercased().contains("error:"), !result.lowercased().contains("exception") else { throw ScanError("手机应用启动失败。") }
         for _ in 0..<8 {
-            let after = try tasks()
+            let activityDump = try shell("dumpsys activity activities")
+            let after = try AndroidTaskSnapshot.parseChecked(activityDump)
             for task in after where task.packageName == app.packageName && task.display == target && !(recovery?.appTasks?.contains(where: { $0.id == task.id }) ?? false) {
                 appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: 0, packageName: app.packageName, ownedDisplay: target))
                 try save()
             }
-            if Self.foregroundComponent(in: try shell("dumpsys activity activities"), display: target)?.hasPrefix(app.packageName + "/") == true { return }
+            if Self.foregroundComponent(in: activityDump, display: target)?.hasPrefix(app.packageName + "/") == true { return }
             Thread.sleep(forTimeInterval: 0.2)
         }
         throw ScanError("应用未出现在指定屏幕；已保留恢复记录。")
@@ -568,7 +589,9 @@ actor PhoneSession {
     private func restoreTasks(on target: Int) throws {
         let snapshot = try tasks(requiredDisplay: target)
         let recorded = recovery?.appTasks ?? []
-        let groups = Dictionary(grouping: snapshot.filter { $0.display == target }, by: \.rootID)
+        // Native secondary HOME belongs to the owned display itself. Android
+        // destroys it with that display; never move it onto the physical phone.
+        let groups = Dictionary(grouping: snapshot.filter { $0.display == target && !$0.isHome }, by: \.rootID)
         var destinations: [Int: Int] = [:]
         // A root cannot be split by move-stack. Refuse conflicting destinations
         // before moving anything, including children associated with another window.
@@ -593,7 +616,7 @@ actor PhoneSession {
             try moveTask(representative.id, to: destination, expectedRoot: root)
         }
         let restored = try tasks(requiredDisplay: target)
-        guard !restored.contains(where: { $0.display == target }), groups.allSatisfy({ root, group in
+        guard !restored.contains(where: { $0.display == target && !$0.isHome }), groups.allSatisfy({ root, group in
             group.allSatisfy { original in
                 restored.first(where: { $0.id == original.id }).map { $0.display == destinations[root] } ?? true
             }

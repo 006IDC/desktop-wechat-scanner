@@ -61,6 +61,14 @@ struct AndroidTaskSnapshot: Equatable {
     let display: Int
     let packageName: String
     let rootID: Int
+    let isHome: Bool
+    init(id: Int, display: Int, packageName: String, rootID: Int, isHome: Bool = false) {
+        self.id = id
+        self.display = display
+        self.packageName = packageName
+        self.rootID = rootID
+        self.isHome = isHome
+    }
     /// Convenience for historical fixtures; production must use parseChecked.
     static func parse(_ dump: String) -> [Self] { (try? scan(dump, strict: false, requiredDisplay: nil)) ?? [] }
     static func parseChecked(_ dump: String, requiredDisplay: Int? = nil) throws -> [Self] {
@@ -70,6 +78,7 @@ struct AndroidTaskSnapshot: Equatable {
         let indent: Int
         let id: Int
         let size: Int?
+        let isHome: Bool
         var childTasks = 0
         var histories = 0
     }
@@ -105,9 +114,14 @@ struct AndroidTaskSnapshot: Equatable {
             while let last = roots.last, nodes[last].indent >= indent { roots.removeLast() }
             if let match = taskPattern.firstMatch(in: line, range: range), let id = Int(ns.substring(with: match.range(at: 1))), id > 0 {
                 let size = sizePattern.firstMatch(in: line, range: range).flatMap { Int(ns.substring(with: $0.range(at: 1))) }
+                // Only the authoritative Task header after its numeric ID may
+                // declare home. A task name or activity package is not evidence.
+                let tail = ns.substring(from: NSMaxRange(match.range(at: 1)))
+                    .split(separator: "}", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
+                let isHome = tail.range(of: "(?:^|\\s)type=home(?:\\s|$)", options: .regularExpression) != nil
                 if strict && line.contains("sz=") && size == nil { throw invalid }
                 if let parent = roots.last { nodes[parent].childTasks += 1 }
-                nodes.append(TaskNode(indent: indent, id: id, size: size)); roots.append(nodes.count - 1); continue
+                nodes.append(TaskNode(indent: indent, id: id, size: size, isHome: isHome)); roots.append(nodes.count - 1); continue
             }
             if strict && line.hasPrefix("*") && line.dropFirst().trimmingCharacters(in: .whitespaces).hasPrefix("Task") { throw invalid }
             guard historyStart.firstMatch(in: line, range: range) != nil else { continue }
@@ -122,8 +136,9 @@ struct AndroidTaskSnapshot: Equatable {
                 if strict { throw invalid }
                 continue
             }
-            let entry = Self(id: id, display: currentDisplay, packageName: ns.substring(with: match.range(at: 2)), rootID: nodes[root].id)
-            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID { throw invalid }
+            let entry = Self(id: id, display: currentDisplay, packageName: ns.substring(with: match.range(at: 2)),
+                             rootID: nodes[root].id, isHome: nodes[root].isHome)
+            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID || old.isHome != entry.isHome { throw invalid }
             tasks[id] = entry
         }
         if strict {

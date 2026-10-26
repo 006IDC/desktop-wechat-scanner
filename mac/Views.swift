@@ -99,6 +99,7 @@ private final class PhonePreviewView: NSView {
     private var mirrorFrame: CGImage?
     private var hasFrame: Bool { mirrorPixels != nil || mirrorFrame != nil }
     private var mirrorSize: NSSize = .zero
+    var emptyMessage = "连接手机后显示真实手机画面" { didSet { if !hasFrame { needsDisplay = true } } }
     var aperture = ScanPreviewAperture.standard {
         didSet { updateLayerMasks(); needsDisplay = true }
     }
@@ -300,7 +301,7 @@ private final class PhonePreviewView: NSView {
                                   width: 60, height: 60)
             icon?.draw(in: iconRect, from: .zero, operation: .sourceOver,
                        fraction: 0.8, respectFlipped: true, hints: nil)
-            let message = "连接手机后显示真实手机画面"
+            let message = emptyMessage
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.white
             ]
@@ -361,6 +362,16 @@ private final class PhonePreviewView: NSView {
 
 private final class PhoneAspectHolder: NSView {
     let phone = PhonePreviewView()
+    var applicationPicker: PhoneApplicationPicker? {
+        didSet {
+            oldValue?.removeFromSuperview()
+            if let applicationPicker {
+                applicationPicker.isHidden = true
+                addSubview(applicationPicker)
+            }
+            needsLayout = true
+        }
+    }
     var onLayout: (() -> Void)?
     var aspectRatio = ViewStyle.phoneRatio { didSet { needsLayout = true } }
     override init(frame frameRect: NSRect) {
@@ -377,6 +388,7 @@ private final class PhoneAspectHolder: NSView {
         phone.frame = NSRect(x: (bounds.width - width) / 2,
                              y: (bounds.height - height) / 2,
                              width: width, height: height)
+        applicationPicker?.frame = phone.frame
         onLayout?()
     }
 }
@@ -391,6 +403,7 @@ private func toolbarButton(_ title: String, symbol: String, tooltip: String) -> 
     control.bezelStyle = .recessed
     control.showsBorderOnlyWhileMouseInside = true
     control.heightAnchor.constraint(equalToConstant:34).isActive = true
+    control.widthAnchor.constraint(equalToConstant:44).isActive = true
     return control
 }
 
@@ -419,19 +432,16 @@ final class ControlWindowController: NSWindowController {
                                             tooltip: "返回手机上一页")
     private let homeButton = toolbarButton("主屏幕", symbol: "house",
                                             tooltip: "回到手机主屏幕")
-    private let wechatButton = toolbarButton("微信", symbol: "message",
-                                              tooltip: "打开手机微信")
-    private let scanButton = toolbarButton("桌面扫码", symbol: "qrcode.viewfinder",
-                                            tooltip: "将此窗口拖到电脑二维码上扫码")
-    private let appsButton = toolbarButton("手机应用", symbol: "square.grid.2x2", tooltip: "拖出手机应用，打开独立窗口")
+    private let appsButton = toolbarButton("应用列表", symbol: "square.grid.2x2", tooltip: "浏览手机应用并拖出独立窗口")
     private let pauseButton = NSButton(title: "暂停", target: nil, action: nil)
     private let statusLabel = text("未连接", size: 12, weight: .semibold)
-    private let modeLabel = text("手机镜像", size: 10, weight: .medium,
+    private let modeLabel = text("手机桌面", size: 10, weight: .medium,
                                  color: .secondaryLabelColor)
     private let detailLabel = text("请连接已开启 USB 调试的手机。", size: 11,
                                    color: .secondaryLabelColor)
     private let detailButton = NSButton(title: "详情", target: nil, action: nil)
     private let holder = PhoneAspectHolder()
+    private let applicationPicker = PhoneApplicationPicker()
     private let background = PhoneWindowBackgroundView()
     private let permissionRow = NSStackView()
     private var connected = false
@@ -439,11 +449,14 @@ final class ControlWindowController: NSWindowController {
     private var permissionHelp = false
     private var detailsExpanded = false
     private var cameraActive = false
-    private var desktopOverlayAllowed = false
+    private var phoneDesktopMode = false
+    private var desktopOverlayAllowed = true
+    private var isStandalone = false
     private var desktopOverlayRestore: (NSWindow.Level, NSWindow.CollectionBehavior)?
 
     var desktopCaptureRect: CGRect {
-        guard let window, holder.phone.window === window else { return .zero }
+        guard let window, holder.phone.window === window,
+              applicationPicker.isHidden else { return .zero }
         let phone = holder.phone
         // WeChat center-crops its portrait camera across the full display.
         // Capture the full phone rectangle; Android letterboxes into the sensor
@@ -454,30 +467,32 @@ final class ControlWindowController: NSWindowController {
         return WindowCaptureGeometry.correctedCaptureRect(for: window, cachedRect: cached)
     }
 
-    init(title: String = "桌面微信扫码", standalone: Bool = false, scanner: Bool = false) {
+    init(title: String = "手机镜像", standalone: Bool = false, scanner: Bool = false) {
         let visibleHeight = NSScreen.main?.visibleFrame.height ?? 740
         let initialHeight = min(690, max(500, visibleHeight - 30))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360,
                                                    height: initialHeight),
-                              styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
         window.title = title
-        // Our opaque surface must also extend behind the native title/traffic lights.
-        // Only the phone aperture is transparent; content is laid out below this chrome.
-        window.titlebarAppearsTransparent = true
-        window.isOpaque = false
-        window.backgroundColor = .clear
+        // Keep the native title bar and traffic lights in AppKit's own surface.
+        window.titlebarAppearsTransparent = false
+        window.isOpaque = true
+        window.backgroundColor = .windowBackgroundColor
         window.ignoresMouseEvents = false
         background.frame = window.contentView?.bounds ?? .zero
         window.contentView = background
         window.minSize = NSSize(width: 320, height: 530)
         window.center()
         super.init(window: window)
-        desktopOverlayAllowed = scanner
+        isStandalone = standalone
+        desktopOverlayAllowed = true
+        setPhoneDesktopMode(!standalone)
         buildContent(in: window)
         if standalone {
-            connectButton.isHidden = true; homeButton.isHidden = true; wechatButton.isHidden = true; appsButton.isHidden = true
-            scanButton.isHidden = !scanner
+            connectButton.isHidden = true
+            homeButton.isHidden = true
+            appsButton.isHidden = true
         }
         update(status: "未连接", detail: "请连接已开启 USB 调试的手机。",
                connected: false, busy: false, paused: true)
@@ -487,18 +502,15 @@ final class ControlWindowController: NSWindowController {
 
     private func buildContent(in window: NSWindow) {
         guard let content = window.contentView else { return }
-        let toolbar = NSStackView(views: [connectButton, backButton, homeButton,
-                                          wechatButton, appsButton, scanButton])
+        let toolbar = NSStackView(views: [connectButton, backButton, homeButton, appsButton])
         toolbar.orientation = .horizontal
-        toolbar.distribution = .fillEqually
-        toolbar.spacing = 5
+        toolbar.distribution = .fill
+        toolbar.spacing = 6
 
         connectButton.target = self; connectButton.action = #selector(connectPressed)
         backButton.target = self; backButton.action = #selector(backPressed)
         homeButton.target = self; homeButton.action = #selector(homePressed)
-        wechatButton.target = self; wechatButton.action = #selector(wechatPressed)
         appsButton.target = self; appsButton.action = #selector(applicationsPressed)
-        scanButton.target = self; scanButton.action = #selector(scanPressed)
         pauseButton.target = self; pauseButton.action = #selector(pausePressed)
         pauseButton.font = .systemFont(ofSize: 11, weight: .medium)
         pauseButton.bezelStyle = .rounded
@@ -508,6 +520,7 @@ final class ControlWindowController: NSWindowController {
         pauseButton.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
         let phone = holder.phone
+        holder.applicationPicker = applicationPicker
         background.preview = phone
         holder.onLayout = { [weak self] in self?.background.needsDisplay = true }
         phone.wantsLayer = true
@@ -601,10 +614,9 @@ final class ControlWindowController: NSWindowController {
         connectButton.setAccessibilityLabel(connected ? "断开手机" : (busy ? "取消连接" : "连接手机"))
         connectButton.toolTip = connected ? "断开手机" : (busy ? "取消连接" : "通过 USB 或无线连接手机")
         connectButton.isEnabled = true
-        for control in [backButton, homeButton, wechatButton, appsButton] {
+        for control in [backButton, homeButton, appsButton] {
             control.isEnabled = connected && !busy
         }
-        scanButton.isEnabled = connected && !busy && !permissionHelp
         pauseButton.isEnabled = connected && !busy && cameraActive && !permissionHelp
         pauseButton.isHidden = !cameraActive
         pauseButton.title = paused ? "继续" : "暂停"
@@ -619,29 +631,65 @@ final class ControlWindowController: NSWindowController {
             detailsExpanded = true
             detailLabel.isHidden = false
             detailButton.title = "收起"
-            scanButton.isEnabled = false
             pauseButton.isEnabled = false
         }
     }
 
-    func setCameraActive(_ active: Bool) {
-        setScannerFloating(active)
+    func setCameraActive(_ active: Bool, paused: Bool = false) {
+        setScannerFloating(active && !paused)
         cameraActive = active
-        setMode(active ? "桌面相机" : "手机镜像")
-        scanButton.contentTintColor = active ? ViewStyle.green : .labelColor
-        scanButton.toolTip = active ? "桌面扫码进行中；重新点击可再扫" : "将此窗口拖到电脑二维码上扫码"
+        setMode(active ? "桌面相机" : (phoneDesktopMode ? "手机桌面" : "手机镜像"))
         pauseButton.isHidden = !active
         pauseButton.isEnabled = active && connected && !busy && !permissionHelp
+        pauseButton.title = paused ? "继续" : "暂停"
+        pauseButton.image = NSImage(systemSymbolName: paused ? "play" : "pause",
+                                   accessibilityDescription: pauseButton.title)
+        let action = paused ? "继续桌面相机" : "暂停桌面相机"
+        pauseButton.setAccessibilityLabel(action)
+        pauseButton.toolTip = action
     }
 
     func setMode(_ mode: String) {
-        guard ["手机镜像", "微信", "桌面相机"].contains(mode) else { return }
-        modeLabel.stringValue = mode
-        modeLabel.isHidden = statusLabel.stringValue == mode ||
-            (mode == "桌面相机" && statusLabel.stringValue.contains("桌面相机"))
+        guard ["手机镜像", "手机桌面", "手机应用", "微信", "桌面相机"].contains(mode) else { return }
+        let displayingPicker = applicationPicker.superview != nil && !applicationPicker.isHidden
+        let displayedMode = displayingPicker ? "手机应用" :
+            (phoneDesktopMode && mode == "手机镜像" ? "手机桌面" : mode)
+        modeLabel.stringValue = displayedMode
+        modeLabel.isHidden = statusLabel.stringValue == displayedMode ||
+            (displayedMode == "桌面相机" && statusLabel.stringValue.contains("桌面相机"))
     }
 
-    /// A real WeChat video window can float without cutting holes in its image.
+    func setPhoneDesktopMode(_ enabled: Bool) {
+        phoneDesktopMode = enabled
+        holder.phone.emptyMessage = enabled ? "连接后显示手机桌面" : "连接手机后显示真实手机画面"
+        if applicationPicker.superview == nil || applicationPicker.isHidden {
+            setMode(cameraActive ? "桌面相机" : "手机镜像")
+        }
+    }
+
+    func showApplicationPicker(_ apps: [AndroidApplication],
+                               onOpen: @escaping (AndroidApplication) -> Void,
+                               onDetach: @escaping (AndroidApplication, NSPoint) -> Void) {
+        guard !isStandalone else { return }
+        applicationPicker.setApplications(apps)
+        applicationPicker.onOpenApplication = onOpen
+        applicationPicker.onDetachApplication = onDetach
+        holder.phone.isHidden = true
+        applicationPicker.isHidden = false
+        holder.needsLayout = true
+        setMode("手机应用")
+    }
+
+    func hideApplicationPicker() {
+        guard !applicationPicker.isHidden else { return }
+        applicationPicker.isHidden = true
+        holder.phone.isHidden = false
+        applicationPicker.onOpenApplication = nil
+        applicationPicker.onDetachApplication = nil
+        setMode(cameraActive ? "桌面相机" : (phoneDesktopMode ? "手机桌面" : "手机镜像"))
+    }
+
+    /// Any phone window can float while its own app uses the desktop camera.
     private func setScannerFloating(_ enabled: Bool) {
         if desktopOverlayAllowed, let window {
             if enabled, desktopOverlayRestore == nil {
@@ -657,24 +705,15 @@ final class ControlWindowController: NSWindowController {
         }
     }
 
-    /// Show the real desktop through the phone area without a capture/USB round trip.
-    /// Keep the real mirror image and aspect for instant restoration and correct sizing.
+    /// Retained for older callers. The product always displays the complete
+    /// Android frame; desktop imagery reaches the app through its camera feed.
     func setLocalScanPreview(_ enabled: Bool) {
-        guard holder.phone.localScanPreview != enabled else { return }
-        holder.phone.localScanPreview = enabled
-        background.localScanPreview = enabled
-        holder.phone.setAccessibilityLabel(enabled
-            ? "真实微信扫码画面；拖动窗口标题栏对准二维码，手机按钮仍可操作"
-            : "真实手机画面；点击或拖动可操作手机")
-        holder.phone.toolTip = enabled
-            ? "拖动窗口标题栏，让二维码位于相机区域；微信按钮可直接点击"
-            : "真实手机画面；点击、拖动或滚动可操作手机"
-        window?.contentView?.layoutSubtreeIfNeeded()
-        background.needsDisplay = true
-        window?.invalidateShadow()
+        guard !enabled else { return }
+        holder.phone.localScanPreview = false
+        background.localScanPreview = false
     }
 
-    /// Calibrate against a real scan screen without changing phone tap coordinates.
+    /// Retained for older callers; the local aperture is no longer shown.
     func setLocalScanAperture(_ normalizedRect: CGRect) {
         guard ScanPreviewAperture.valid(normalizedRect) else { return }
         holder.phone.aperture = normalizedRect
@@ -714,7 +753,10 @@ final class ControlWindowController: NSWindowController {
         let usable = screen.visibleFrame
         let chrome = window.frame.height - window.contentLayoutRect.height
         let phoneWidth = window.contentView!.bounds.width - ViewStyle.inset * 2
-        let desired = phoneWidth / ratio + 124 + chrome
+        window.contentView?.layoutSubtreeIfNeeded()
+        let controlsHeight = holder.bounds.height > 0
+            ? window.contentView!.bounds.height - holder.bounds.height : 100
+        let desired = phoneWidth / ratio + controlsHeight + chrome
         let height = min(usable.height, max(window.minSize.height, desired))
         var frame = window.frame
         let top = frame.maxY
@@ -726,12 +768,10 @@ final class ControlWindowController: NSWindowController {
     @objc private func connectPressed() {
         if connected || busy { onDisconnect?() } else { onConnect?() }
     }
-    @objc private func scanPressed() { onScan?() }
     @objc private func pausePressed() { onPause?() }
     @objc private func backPressed() { onBack?() }
     @objc private func homePressed() { onHome?() }
     @objc private func applicationsPressed() { onApplications?() }
-    @objc private func wechatPressed() { onWechat?() }
     @objc private func permissionSettingsPressed() { onPermissionSettings?() }
     @objc private func relaunchPressed() { onRelaunch?() }
     @objc private func toggleDetails() {

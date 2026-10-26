@@ -47,6 +47,7 @@ import Foundation
         let tasks = AndroidTaskSnapshot.parse(dump)
         require(tasks.count == 3 && tasks[0].id == 12 && tasks[0].rootID == 10 && tasks[0].display == 0, "Nested root task parsing failed")
         require(tasks[1].rootID == 20 && tasks[2].display == 8 && tasks[2].rootID == 30, "Display task isolation failed")
+        require(tasks.allSatisfy { !$0.isHome }, "Ordinary task was mistaken for the home root")
         require(PhoneSession.foregroundComponent(in: dump, display: 8) == "org.example.window/.Main", "Foreground display selection")
         // Redacted shape of the real failure: an empty split root followed by
         // orientation/focus diagnostics must not invent a WeChat task under it.
@@ -67,6 +68,31 @@ import Foundation
         """
         let staleTasks = AndroidTaskSnapshot.parse(staleReferences)
         require(staleTasks.count == 1 && staleTasks[0].id == 700 && staleTasks[0].rootID == 7 && staleTasks[0].packageName == "org.example.launcher", "Non-authoritative or mismatched task records invented a WeChat task")
+        require(staleTasks[0].isHome, "Explicit type=home at the authoritative root was lost")
+        let homeTypes = """
+        Display #0 (activities from top to bottom):
+          * Task{type=home #10 type=standard sz=1}
+            * Task{contains_home_in_name #11 type=home sz=1}
+              * Hist  #0: ActivityRecord{homeLike u0 org.example.launcher/.Home t11}
+          * Task{actualRoot #20 type=home sz=1}
+            * Task{child #21 type=standard sz=1}
+              * Hist  #0: ActivityRecord{real u0 org.example.app/.Main t21}
+          * Task{unknownRoot #30 type=undefined sz=1}
+            * Hist  #0: ActivityRecord{unknown u0 org.example.other/.Main t30}
+        RootWindowContainer:
+          Display #0 (activities from top to bottom):
+            * Task{duplicate #30 type=home sz=1}
+              * Hist  #0: ActivityRecord{stale u0 org.example.other/.Main t30}
+        """
+        let typedTasks = try AndroidTaskSnapshot.parseChecked(homeTypes, requiredDisplay: 0)
+        require(typedTasks.count == 3 && typedTasks.first(where: { $0.id == 11 })?.isHome == false,
+                "A home-like name or child type promoted an ordinary root")
+        require(typedTasks.first(where: { $0.id == 21 })?.isHome == true,
+                "The explicit home root type did not propagate to its leaf")
+        require(typedTasks.first(where: { $0.id == 30 })?.isHome == false,
+                "Unknown type or a non-authoritative duplicate promoted a normal task")
+        require(!AndroidTaskSnapshot(id: 1, display: 0, packageName: "org.example.app", rootID: 1).isHome,
+                "Legacy snapshot construction must default to non-home")
         let authoritative = """
           Display #0 (activities from top to bottom):
             topResumedActivity=ActivityRecord{stale u0 com.tencent.mm/.ui.LauncherUI t5385}

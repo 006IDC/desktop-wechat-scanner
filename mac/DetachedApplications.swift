@@ -13,6 +13,13 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
             frames.reset(generation: 1)
         }
     }
+    var beforeClose: ((Int) async -> Void)?
+    func cameraWindows() -> [(display:Int,window:ControlWindowController)] {
+        entries.values.compactMap { entry in
+            guard !entry.closing,let display=entry.display else{return nil}
+            return (display,entry.ui)
+        }
+    }
     private let phone: PhoneSession, adb: URL, server: URL
     private let serverSocket: String?
     private var entries: [String: Entry] = [:], stopping = false
@@ -85,6 +92,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
         entry.closing = true; entry.task?.cancel()
         entry.ui.update(status: "正在返回手机", detail: "正在收起这个应用窗口…", connected: false, busy: true, paused: true)
         Task { [self, entry] in
+            if let id=entry.display {await beforeClose?(id)}
             await entry.mirror.stop(); await entry.task?.value
             do {
                 if let id = entry.display { try await phone.closeAppDisplay(id) }

@@ -15,6 +15,17 @@ import Foundation
         do {_ = try await waiter.value;fatalError("Expected readiness cancellation")}
         catch is CancellationError {}
         guard Date().timeIntervalSince(started)<1 else{fatalError("Readiness cancellation exceeded bound")}
+        let earlyExit=ServerLog(),exitStarted=Date()
+        let exitWaiter=Task.detached {try earlyExit.waitReady()}
+        earlyExit.finish()
+        do {_ = try await exitWaiter.value;fatalError("Exited server accepted readiness")}
+        catch {guard error.localizedDescription.contains("退出") else{throw error}}
+        guard Date().timeIntervalSince(exitStarted)<1 else{fatalError("Exited server waited for full startup timeout")}
+        let readyThenEOF=ServerLog()
+        readyThenEOF.append(Data("QR_LIVE device_id=7\nQR_LIVE display_id=9\nQR_LIVE pid=123\nQR_LIVE ready=1\n".utf8))
+        readyThenEOF.finish()
+        let ready=try readyThenEOF.waitReady()
+        guard ready.0==7 && ready.1==9 && ready.2==123 else{fatalError("Buffered ready reply lost at EOF")}
         let cleanup=Task.detached {() throws -> String in
             try await Task.sleep(nanoseconds:100_000_000)
             return "unexpected"
