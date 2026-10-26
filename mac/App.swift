@@ -794,7 +794,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // Android may add a window caption above WeChat's own toolbar.
             // The lower matching title is the app toolbar; tapping the caption
             // instead leaves the menu closed until the navigation timeout.
-            if !openedMenu,!tappedScanner,home,let title=words.filter({$0.value.hasPrefix("微信") && $0.rect.midY<250}).max(by:{$0.rect.minY<$1.rect.minY}) {
+            if !openedMenu,!tappedScanner,home,let title=words.filter({
+                $0.value.replacingOccurrences(of:" ",with:"")=="微信" &&
+                $0.rect.midY<170 && (300...420).contains($0.rect.midX)
+            }).max(by:{$0.rect.minY<$1.rect.minY}) {
                 mirror.tap(x:665.0/720,y:Double(title.rect.midY/1280))
                 openedMenu=true
             }
