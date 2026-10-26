@@ -593,6 +593,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     @discardableResult private func clearCamera() async -> Bool {
+        let clearingLocal=localCameraMode
         dismissLocalScanFrame(restoring:true)
         localCameraMode=false
         endCameraActivity()
@@ -604,6 +605,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         do {try await phone.clear(epoch:scanGeneration,requireConnection:true);confirmed=true}
         catch {confirmed=false}
         cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil
+        if clearingLocal,!confirmed {localScanClearFailed()}
         return confirmed
     }
     private func showApplications(){
@@ -999,12 +1001,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let windows=detachedApplications?.cameraWindows() ?? []
         guard let activity=state.scannerActivity(),
               let target=activity.displayId==mainDisplay ? mainControl : windows.first(where:{$0.display==activity.displayId})?.window else {
-            if cameraActive {await clearCamera();status("手机桌面","在应用里打开扫一扫，桌面相机会自动出现。")}
+            if cameraActive {
+                await clearCamera()
+                guard connected,!stopping,!Task.isCancelled else{return}
+                status("手机桌面","在应用里打开扫一扫，桌面相机会自动出现。")
+            }
             if state.activeStreams==0 || !state.activities.contains(where:{DesktopScannerRoute.isScanner($0.component)}) {cameraSuppressed=false}
             return
         }
         if cameraActive,cameraDisplay != activity.displayId {await clearCamera()}
-        guard !cameraActive,!cameraSuppressed,!busy,target.window?.isVisible==true,
+        guard connected,!stopping,!Task.isCancelled,!cameraActive,!cameraSuppressed,!busy,target.window?.isVisible==true,
               target.window?.isMiniaturized==false else{return}
         startCamera(in:target,display:activity.displayId)
     }
