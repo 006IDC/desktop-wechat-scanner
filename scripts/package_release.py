@@ -79,7 +79,7 @@ def main():
                 or any(c not in '0123456789ABCDEF' for c in expected_identity)):
             raise RuntimeError('Invalid persistent signing identity marker')
         cert_prefix = temp/'release-certificate-'
-        subprocess.run(['codesign', '-d', '--extract-certificates', str(cert_prefix), str(app)], check=True)
+        subprocess.run(['codesign', '-d', '--extract-certificates='+str(cert_prefix), str(app)], check=True)
         certificate = Path(str(cert_prefix)+'0').read_bytes()
         if hashlib.sha1(certificate).hexdigest().upper() != expected_identity:
             raise RuntimeError('Release certificate differs from persistent identity')
