@@ -1,6 +1,6 @@
 # 开发与测试
 
-App 使用 AppKit、ScreenCaptureKit、VideoToolbox 和 Vision；手机端 Java 服务使用 Android 16 虚拟设备/相机 API，通过 USB 或显式配对的无线 ADB 启动。镜像服务固定为官方 scrcpy 5.0.1。当前已安装开发候选 build 37 连接后请求原生副屏 HOME；在已确认返回白屏的小米上，主窗口改用手机实际应用目录选择器，选中后显示该应用的真实画面。应用可从列表拖出独立窗口；扫码结果仍由手机中的应用返回。2026-10-27 已有一次普通应用路径双扫码、主屏锁定及清理通过；重复进入未稳定，Mac 物理拖动与完整 GUI 仍未验收。
+App 使用 AppKit、ScreenCaptureKit、VideoToolbox 和 Vision；手机端 Java 服务使用 Android 16 虚拟设备/相机 API，通过 USB 或显式配对的无线 ADB 启动。镜像服务固定为官方 scrcpy 5.0.1。当前已安装开发候选 build 40（源码 `2cf0410`）连接后请求原生副屏 HOME；在已确认返回白屏的小米上，主窗口改用手机实际应用目录选择器，选中后显示该应用的真实画面。应用可从列表拖出独立窗口；扫码结果仍由手机中的应用返回。2026-10-27 三轮普通应用路径双扫码、主屏锁定及清理通过；偶发长间隔仍未定位，Mac 物理拖动与完整 GUI 仍未验收。
 
 `mac/` 为主应用，`src/` 为手机端临时服务，`scripts/` 为依赖准备/编译/打包，`third_party/` 为许可证。运行输出、缓存、测试证书及安装包均被 Git 忽略。
 
@@ -62,7 +62,9 @@ swiftc -swift-version 5 -O -target arm64-apple-macos14.4 -module-cache-path .loc
 
 副屏 HOME 能否绘制完整原生桌面由手机系统决定。当前小米真机的 `SecondaryDisplayLauncher` 在按 HOME 后仍为纯白，因此在这部手机上该路径只作为副屏能力检测；主窗口的“手机应用”选择器使用已连接手机返回的真实可启动应用目录，不伪装成 Android 桌面或补造应用图标。选择应用后原生镜像继续提供画面和输入，目录内可拖出独立窗口。锁屏独立应用继续受既有显式选项和首次解锁条件约束；物理主屏不会被绕过。
 
-相机状态通过已认证的手机通道返回，包含当前活动、虚拟相机所有者、所有者是否可判定及代数。Mac 仅在所有者明确、有活动流、恰好一个经真机验证的扫码 Activity、并且同包没有第二个前台窗口时开始桌面采集；未知应用、普通拍照和歧义状态保持关闭。当前经真机确认的精确 Activity 为微信 `com.tencent.mm/.plugin.scanner.ui.BaseScanUI`（亦接受同组件全名）及支付宝 `com.eg.android.AlipayGphone/com.alipay.mobile.scan.as.main.MainCaptureActivity`；支付宝其他扫码类名尚未验证，不因同包名自动放行。手机端相机所有者及相机 ID 只用于内存中的路由判断，不进入遥测。后端与 build 37 的双应用自动集成识别已有成功记录，重复进入和完整 GUI 仍未验收。相机查询使用不继承 system context 的 shell ContextImpl，使内部 ContentResolver 的包身份与 UID 相符；虚拟 context 的 AttributionSource 保留 deviceId，通过显式 `getCameraCharacteristics(String, false)` 避开无关的全局桌面旋转设置，并直接读取不一定列于 `getKeys()` 的 `INFO_DEVICE_ID` 验证映射别名，不能把设备感知的 camera ID 0 当作物理相机。
+相机状态通过已认证的手机通道返回，包含当前活动、虚拟相机所有者、所有者是否可判定及代数。Mac 仅在所有者明确、有活动流、恰好一个经真机验证的扫码 Activity、并且同包没有第二个前台窗口时开始桌面采集；未知应用、普通拍照和歧义状态保持关闭。当前经真机确认的精确 Activity 为微信 `com.tencent.mm/.plugin.scanner.ui.BaseScanUI`（亦接受同组件全名）及支付宝 `com.eg.android.AlipayGphone/com.alipay.mobile.scan.as.main.MainCaptureActivity`；支付宝其他扫码类名尚未验证，不因同包名自动放行。手机端相机所有者及相机 ID 只用于内存中的路由判断，不进入遥测。build 40 的三轮双应用自动集成识别与恢复清理通过，完整 GUI 与长时间稳定性仍未验收。相机查询使用不继承 system context 的 shell ContextImpl，使内部 ContentResolver 的包身份与 UID 相符；虚拟 context 的 AttributionSource 保留 deviceId，通过显式 `getCameraCharacteristics(String, false)` 避开无关的全局桌面旋转设置，并直接读取不一定列于 `getKeys()` 的 `INFO_DEVICE_ID` 验证映射别名，不能把设备感知的 camera ID 0 当作物理相机。
+
+任务树解析保留 Task `U` 与 Activity `u` 的用户 ID，核对父子结构、数量与根任务包含的用户。小米的无关分身任务可以出现在其他屏幕，不再使整个快照失败；实际打开、迁移、恢复仍仅允许主用户 0，拒绝混合用户根任务及自有副屏上的其他用户。空子任务的用户也计入根任务判定。`AndroidApplicationTests` 覆盖这些边界，不意味着支持控制分身应用。
 
 ## 锁屏独立应用
 
@@ -131,4 +133,20 @@ swiftc -swift-version 5 -warnings-as-errors -O -target arm64-apple-macos14.4 -pa
 
 诊断状态文件由后台串行 writer 合并写入最新快照，界面线程不再执行 JSON 编码或磁盘写入；退出异步等待最后一次写入。
 
-2026-10-27 build 37（源码 `391aabc`）集成报告一次 `passed=true`，两款应用均自动接入并识别测试码；微信/支付宝移动送帧约 10.0 / 11.5 fps，窗口更新间隔 p95 约 38.1 / 28.7 ms。这些是程序移动窗口的数值，不是鼠标到画面的端到端延迟。另一次主屏解锁复测未确认两款入口，失败记录保留，遗留恢复记录已按原有 `PhoneSession.disconnect` 核对所有者后清理。真实鼠标与全界面验收未完成，不能宣称已达到参考视频效果。
+build 38 起分段记录 socket 写入、回复头等待、回复体读取，以及窗口移动、采集几何、独立窗口呈现和主镜像呈现的 p95/最大值。记录仅在显式六秒诊断窗口内有界采样。`SocketTests` 验证拆包回复、延迟 ACK、普通请求兼容与尺寸拒绝；`CameraPumpMailboxTests` 验证数值随帧回执传递。
+
+普通应用选择和诊断共用可抛错的 `performMainApplicationOpen`；诊断必须先确认启动成功，失败时保留实际错误，不进入扫一扫导航。断开/退出检查取消及会话代数，迟到完成不能重新显示应用。显式自动诊断退出若恢复清理失败，将报告 `cleanupSucceeded=false`、`passed=false` 并以失败码退出，保留恢复记录；普通交互仍显示恢复错误。
+
+build 40 在实时相机 loop 启动时持有 `ProcessInfo` 的 `.userInitiatedAllowingIdleSystemSleep` 活动，clear/pause/disconnect/terminate 路径释放；不关闭系统休眠、不使用 latencyCritical。它声明这段实时工作仍有用户关注，不能据前后性能差异单独证明 App Nap 是全部卡顿的根因。`diagnostic-state.json` 的 `cameraActivityActive` 可核对生命周期。
+
+2026-10-27 本机无线、已保存的独立锁屏选项、同一签名下，build 40（源码 `2cf0410`）三轮两应用均 `automaticCameraStarted=true`、`qrRecognized=true`，整体 `passed=true`、`cleanupSucceeded=true`；主屏前后锁定，实际录屏权限 true。结果如下，每格顺序为微信 / 支付宝：
+
+| 运行 | 六秒移动送帧 fps | 窗口间隔 p95 ms | 窗口间隔最大 ms | 最大送帧间隔 ms |
+| --- | --- | --- | --- | --- |
+| 第一轮，无线程采样 | 27.21 / 30.17 | 17.44 / 17.41 | 17.66 / 43.42 | 235.89 / 49.53 |
+| 第二轮，无线程采样 | 29.52 / 29.38 | 17.46 / 17.32 | 29.02 / 492.39 | 50.01 / 231.74 |
+| 第三轮，附加进程采样 | 28.87 / 29.55 | 18.74 / 18.49 | 24.87 / 23.00 | 49.27 / 120.24 |
+
+此前 build 39 同类运行分别约 9.0 / 18.2 fps；以上是前后观察，非受控因果实验。第三轮只采样本 App，未复现半秒窗口间隔，因此采样未定位第二轮长尾的阻塞位置；不能删除该反例或宣称卡顿根治。这些测量由程序移动自己的窗口，不是鼠标到画面的端到端延迟。界面控制工具返回捕获错误，物理鼠标拖动、完整 GUI 与拖出动画未完成验收；App 本身实际录屏和测试码识别正常，不应因此重置录屏授权。
+
+三轮退出后恢复记录均已清除，连接、相机、用户活动均为关闭状态，录屏权限仍为 true。原始运行日志、采样和设备状态仅保留于忽略目录，不进入公开仓库。候选尚不能称达到参考视频效果。
