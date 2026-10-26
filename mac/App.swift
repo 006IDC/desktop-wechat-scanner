@@ -623,12 +623,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     try Task.checkCancellation()
                     try await Task.sleep(nanoseconds:200_000_000)
                     if check.qrVisible,let pixels=latestPhoneFrame {
-                        let component=try await phone.foreground(onVirtualDisplay:true)
-                        if component?.hasPrefix("com.tencent.mm/")==true,component?.lowercased().contains("scanner") != true {
-                            let words=try await Task.detached {try Self.textIn(pixels)}.value
-                            if words.contains(where:{$0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)}) {
-                                report["qrRecognized"]=true;break
-                            }
+                        let result=try await Task.detached {
+                            let words=try Self.textIn(pixels)
+                            let barcode=VNDetectBarcodesRequest();barcode.symbologies=[.qr]
+                            try VNImageRequestHandler(cvPixelBuffer:pixels).perform([barcode])
+                            let visible=barcode.results?.contains{$0.payloadStringValue==ScanPerformanceCheck.payload} ?? false
+                            return (words.contains{$0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)},visible)
+                        }.value
+                        report["phoneSyntheticQRVisible"]=(report["phoneSyntheticQRVisible"] as? Bool == true) || result.1
+                        // A plain-text result can stay in the scanner activity.
+                        // The exact payload is never printed on the Mac test board.
+                        if result.0 {
+                            report["qrRecognized"]=true
+                            report["qrRecognitionMilliseconds"]=(ProcessInfo.processInfo.systemUptime-started-6)*1000
+                            break
                         }
                     }
                 }
@@ -765,12 +773,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cameraLoop?.cancel();cameraPump?.stop()
         cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0
         let pump=CameraPumpMailbox(),generation=scanGeneration
+        let diagnosticQRStart=performanceCheck == nil ? Double.infinity:ProcessInfo.processInfo.systemUptime+6.2
         cameraPump=pump;cameraFramesBase=framesSent
         updateCameraTick()
         cameraLoop=Task.detached(priority:.userInitiated) { [capture,phone] in
             var stats=CameraPumpMailbox.Statistics()
             var measuredAt=ProcessInfo.processInfo.systemUptime,measuredFrames=0
             var transientFailureSince:TimeInterval?,lastSentAt:TimeInterval?
+            var lastQRCheck=0.0
             while !Task.isCancelled,let target=pump.latest() {
                 let began=ProcessInfo.processInfo.systemUptime
                 do {
@@ -791,6 +801,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if duration>=2 {
                         stats.fps=Double(stats.sent-measuredFrames)/duration
                         measuredFrames=stats.sent;measuredAt=sentAt
+                    }
+                    if !stats.syntheticQRVisible,sentAt>=diagnosticQRStart,sentAt-lastQRCheck>=1 {
+                        lastQRCheck=sentAt
+                        let barcode=VNDetectBarcodesRequest();barcode.symbologies=[.qr]
+                        try? VNImageRequestHandler(data:image).perform([barcode])
+                        stats.syntheticQRVisible=barcode.results?.contains{$0.payloadStringValue==ScanPerformanceCheck.payload} ?? false
                     }
                     pump.update(stats)
                 } catch {

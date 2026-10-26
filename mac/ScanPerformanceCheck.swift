@@ -6,7 +6,7 @@ import CoreImage.CIFilterBuiltins
 /// scanner. This exercises the production capture path, not synthesized input.
 /// It measures application scheduling, not physical mouse-to-photon latency.
 @MainActor final class ScanPerformanceCheck {
-    static let payload = "006IDC20261026PERF"
+    nonisolated static let payload = "006IDC20261026PERF"
     let board: NSWindow
     private let pattern = ScanPerformancePattern()
     private let originalOrigin: NSPoint
@@ -18,6 +18,7 @@ import CoreImage.CIFilterBuiltins
     private var tickGaps: [Double] = []
     private var positionErrors: [Double] = []
     private var lastSampledSent=0
+    private var syntheticQRVisible=false,movementMaximumGap=0.0
     private var movementSent=0
     private var movementDuration=0.0
     private var captureCosts:[Double]=[],transferCosts:[Double]=[]
@@ -35,6 +36,7 @@ import CoreImage.CIFilterBuiltins
         let size = NSSize(width: min(820, visible.width), height: min(800, visible.height))
         let frame = NSRect(x: visible.midX-size.width/2, y: visible.midY-size.height/2,
                            width: size.width, height: size.height)
+        pattern.prepareQR()
         board = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
         board.isReleasedWhenClosed = false
         board.title = "扫码流畅度自检 · 合成图案"
@@ -84,7 +86,9 @@ import CoreImage.CIFilterBuiltins
     }
 
     func recordPump(_ stats:CameraPumpMailbox.Statistics,at now:TimeInterval) {
+        syntheticQRVisible = syntheticQRVisible || stats.syntheticQRVisible
         guard let started,now-started<=6 else{return}
+        movementMaximumGap=stats.maximumGapMilliseconds
         movementSent=stats.sent;movementDuration=now-started
         if stats.sent>0,stats.sent != lastSampledSent,captureCosts.count<600 {
             lastSampledSent=stats.sent
@@ -103,6 +107,8 @@ import CoreImage.CIFilterBuiltins
                 "tickP95Milliseconds":percentile(tickGaps), "tickMaxMilliseconds":tickGaps.max() ?? 0,
                 "roiPositionErrorP95Points":percentile(positionErrors),
                 "movementSentFrames":movementSent,
+                "movementMaximumSendGapMilliseconds":movementMaximumGap,
+                "outgoingSyntheticQRVisible":syntheticQRVisible,
                 "movementSendFPS":movementDuration>0 ? Double(movementSent)/movementDuration : 0,
                 "movementCaptureP95Milliseconds":percentile(captureCosts),
                 "movementTransferP95Milliseconds":percentile(transferCosts),
@@ -120,6 +126,7 @@ private final class ScanPerformancePattern: NSView {
         guard let output=filter.outputImage else{return nil}
         return CIContext().createCGImage(output,from:output.extent)
     }()
+    func prepareQR() {_ = qr}
     override func draw(_ dirtyRect: NSRect) {
         NSColor.white.setFill(); bounds.fill()
         let cell: CGFloat=32
