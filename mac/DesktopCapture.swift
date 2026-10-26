@@ -372,7 +372,6 @@ actor DesktopCapture {
         config.sourceRect=CGRect(origin:.zero,size:screen.size)
         config.width=Int(pixels.width);config.height=Int(pixels.height)
         config.pixelFormat=kCVPixelFormatType_32BGRA
-        if diagnosticBoardID != nil {config.backgroundColor=CGColor(gray:1,alpha:1)}
         config.minimumFrameInterval=CMTime(value:1,timescale:30)
         config.queueDepth=3;config.showsCursor=false;config.capturesAudio=false
         config.preservesAspectRatio=true;config.ignoreShadowsSingleWindow=true
