@@ -58,6 +58,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var launchDiagnosticTask: Task<Void,Never>?
     private var launchDiagnosticGeneration=0
     private var scanNavigation:[[String:Any]]=[]
+    private var savedDiagnosticToolbar=false
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         buildMenu();control.window?.delegate=self
@@ -856,6 +857,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 tappedScanner=true;continue
             }
             let home=words.contains{$0.value.contains("通讯录") && $0.rect.midY>1000} && words.contains{$0.value.contains("发现") && $0.rect.midY>1000}
+            if home,!savedDiagnosticToolbar,CommandLine.arguments.contains("--diagnostic-toolbar"),CommandLine.arguments.contains("--run-scan-diagnostic") {
+                // Explicit local developer artifact: only the top 13% toolbar,
+                // never the chat list, desktop or a scan-result page.
+                savedDiagnosticToolbar=true
+                let source=CIImage(cvPixelBuffer:image)
+                let crop=CGRect(x:0,y:source.extent.height*0.87,width:source.extent.width,height:source.extent.height*0.13)
+                if let toolbar=CIContext().createCGImage(source,from:crop),let data=NSBitmapImageRep(cgImage:toolbar).representation(using:.png,properties:[:]) {
+                    let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
+                    try data.write(to:folder.appendingPathComponent("diagnostic-toolbar.png"),options:.atomic)
+                }
+            }
             // Android may add a window caption above WeChat's own toolbar.
             // The lower matching title is the app toolbar; tapping the caption
             // instead leaves the menu closed until the navigation timeout.

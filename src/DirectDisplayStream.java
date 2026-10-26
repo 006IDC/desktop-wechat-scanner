@@ -177,9 +177,17 @@ final class DirectDisplayStream implements AutoCloseable {
                     long now = SystemClock.uptimeMillis();
                     if (action == 0) { down = true; downTime = now; }
                     lastX = x; lastY = y;
-                    MotionEvent event = MotionEvent.obtain(downTime, now, action, lastX, lastY,
-                            pressure / 65535f, 1f, 0, 1f, 1f, 0, 0);
-                    event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+                    MotionEvent.PointerProperties properties = new MotionEvent.PointerProperties();
+                    properties.id = 0;
+                    properties.toolType = MotionEvent.TOOL_TYPE_FINGER;
+                    MotionEvent.PointerCoords coords = new MotionEvent.PointerCoords();
+                    coords.x = lastX;
+                    coords.y = lastY;
+                    coords.pressure = pressure / 65535f;
+                    coords.size = 1f;
+                    MotionEvent event = MotionEvent.obtain(downTime, now, action, 1,
+                            new MotionEvent.PointerProperties[]{properties}, new MotionEvent.PointerCoords[]{coords},
+                            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0);
                     try { inject(event); } finally { event.getClass().getMethod("recycle").invoke(event); }
                     if (action == 1) down = false;
                 } else if (type == 0) {
