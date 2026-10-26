@@ -95,4 +95,4 @@ swiftc -swift-version 5 -warnings-as-errors -target arm64-apple-macos14.4 -modul
 
 诊断启动任务在断开或退出时取消并隔离迟到结果；首次退出返回取消并完成异步清理，随后再立即退出，以免 AppKit 嵌套退出循环阻塞主队列。导航诊断仅包含固定的微信导航标签、位置和耗时，不保存聊天 OCR。
 
-仅开发者显式追加 `--diagnostic-toolbar` 时，诊断会在确认微信主页后保存顶部 13% 工具栏图片 `diagnostic-toolbar.png`（本机支持目录），用于检查点击定位；不含聊天列表、桌面或扫码结果。正常启动与普通自检不输出图片。
+仅开发者显式追加 `--diagnostic-toolbar` 时，诊断会在确认微信主页后保存顶部 11% 工具栏图片 `diagnostic-toolbar.png`（本机支持目录），用于检查点击定位；不含聊天列表、桌面或扫码结果。正常启动与普通自检不输出图片。

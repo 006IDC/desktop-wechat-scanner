@@ -858,23 +858,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             let home=words.contains{$0.value.contains("通讯录") && $0.rect.midY>1000} && words.contains{$0.value.contains("发现") && $0.rect.midY>1000}
             if home,!savedDiagnosticToolbar,CommandLine.arguments.contains("--diagnostic-toolbar"),CommandLine.arguments.contains("--run-scan-diagnostic") {
-                // Explicit local developer artifact: only the top 13% toolbar,
+                // Explicit local developer artifact: only the top 11% toolbar,
                 // never the chat list, desktop or a scan-result page.
                 savedDiagnosticToolbar=true
                 let source=CIImage(cvPixelBuffer:image)
-                let crop=CGRect(x:0,y:source.extent.height*0.87,width:source.extent.width,height:source.extent.height*0.13)
+                let crop=CGRect(x:0,y:source.extent.height*0.89,width:source.extent.width,height:source.extent.height*0.11)
                 if let toolbar=CIContext().createCGImage(source,from:crop),let data=NSBitmapImageRep(cgImage:toolbar).representation(using:.png,properties:[:]) {
                     let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
                     try data.write(to:folder.appendingPathComponent("diagnostic-toolbar.png"),options:.atomic)
                 }
             }
-            // Android may add a window caption above WeChat's own toolbar.
-            // The lower matching title is the app toolbar; tapping the caption
-            // instead leaves the menu closed until the navigation timeout.
+            // MIUI can render two identical WeChat toolbar rows. The top
+            // visible row is the active navigation bar; the repeated lower
+            // row did not respond to either the mirror or shell input path.
             if (!openedMenu || retryDue),!tappedScanner,home,let title=words.filter({
                 $0.value.replacingOccurrences(of:" ",with:"")=="微信" &&
                 $0.rect.midY<170 && (300...420).contains($0.rect.midX)
-            }).max(by:{$0.rect.minY<$1.rect.minY}) {
+            }).min(by:{$0.rect.minY<$1.rect.minY}) {
                 if menuAttempts==2 {
                     // A bounded compatibility fallback, only after the exact
                     // home screen survives two direct-channel attempts.
