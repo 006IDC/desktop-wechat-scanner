@@ -853,19 +853,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         scanNavigation=[]
         let navigationStarted=ProcessInfo.processInfo.systemUptime
         defer {scannerNavigationMilliseconds=(ProcessInfo.processInfo.systemUptime-navigationStarted)*1000}
-        // Repeated explicit diagnostics may resume their own plain-text result.
-        // Only the exact synthetic payload permits this one back action.
-        if CommandLine.arguments.contains("--run-scan-diagnostic"),let pixels=latestPhoneFrame {
-            let isOwnResult=try await Task.detached {
-                try Self.textIn(pixels).contains{$0.value.replacingOccurrences(of:" ",with:"")==ScanPerformanceCheck.payload}
-            }.value
-            try Task.checkCancellation()
-            if isOwnResult {mirror.key(4);try await Task.sleep(nanoseconds:350_000_000)}
-        }
         if let foreground=try await phone.foreground(onVirtualDisplay:true),
            foreground.hasPrefix("com.tencent.mm/"),foreground.lowercased().contains("scanner") {return true}
         let deadline=ProcessInfo.processInfo.systemUptime+4
         var openedMenu=false,tappedScanner=false,menuAttempts=0
+        var returnedFromOwnResult=false
         var lastMenuTap=0.0
         var recognisedFrame = -1
         while ProcessInfo.processInfo.systemUptime<deadline {
@@ -878,6 +870,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let region:ScannerNavigationOCR.Region=tappedScanner ? .scanner : (openedMenu && !retryDue ? .menu:.full)
             let words=try await Task.detached(priority:.userInitiated) {try Self.textIn(image,region:region)}.value
             try Task.checkCancellation()
+            // Wait for a fresh rendered frame before dismissing our own prior
+            // diagnostic result. A launch's first frame can still be blank.
+            if !returnedFromOwnResult,CommandLine.arguments.contains("--run-scan-diagnostic"),
+               words.contains(where:{$0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)}) {
+                returnedFromOwnResult=true;mirror.key(4)
+                try await Task.sleep(nanoseconds:350_000_000);continue
+            }
             // Persist only the fixed navigation-label allowlist, never chat text.
             let labels:Set<String>=["微信","通讯录","发现","我","扫一扫","发起群聊","添加朋友"]
             let allowed=words.filter{labels.contains($0.value.replacingOccurrences(of:" ",with:""))}
