@@ -12,15 +12,20 @@ import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
 APP=ROOT/'build/桌面微信扫码.app'
-ZIP=ROOT/'build/桌面微信扫码.zip'
+STABLE_ZIP=ROOT/'build/桌面微信扫码-本机签名.zip'
+AD_HOC_ZIP=ROOT/'build/桌面微信扫码-ad-hoc.zip'
 parser=argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--local-signing',action='store_true',
-                    help='sign with the persistent project-local identity and produce a separate ZIP')
+signing=parser.add_mutually_exclusive_group()
+signing.add_argument('--local-signing',action='store_true',
+                     help='use the persistent project-local identity (the default; kept for existing commands)')
+signing.add_argument('--ad-hoc',action='store_true',
+                     help='make a separate ad-hoc signed test ZIP; cannot be installed by this script')
 parser.add_argument('--install',type=Path,metavar='PATH',
-                    help='install the verified app at this explicit .app path')
+                    help='install the verified stable-signed app at this explicit .app path')
 args=parser.parse_args()
-if args.local_signing:
-    ZIP=ROOT/'build/桌面微信扫码-本机签名.zip'
+if args.ad_hoc and args.install:
+    parser.error('--ad-hoc is test-only and cannot be combined with --install')
+ZIP=AD_HOC_ZIP if args.ad_hoc else STABLE_ZIP
 revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
 if subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip():
     raise RuntimeError('Commit all source changes before building an app')
@@ -114,7 +119,7 @@ info={
     'CFBundleIdentifier':'com.idc006.DesktopWeChatScanner',
     'CFBundleName':'桌面微信扫码','CFBundleDisplayName':'桌面微信扫码',
     'CFBundleExecutable':'DesktopWeChatScanner','CFBundlePackageType':'APPL',
-    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'16',
+    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'17',
     'DesktopScannerRelease':'0.4.0-preview.5',
     'CFBundleIconFile':'AppIcon.icns',
     'LSMinimumSystemVersion':'14.4','NSHighResolutionCapable':True,
@@ -150,7 +155,7 @@ with tempfile.TemporaryDirectory(prefix='006idc-app-sign-') as temp:
     for name in ('com.apple.FinderInfo','com.apple.ResourceFork'):
         subprocess.run(['xattr','-dr',name,str(staged)],
                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    if args.local_signing:
+    if not args.ad_hoc:
         from local_signing import KEYCHAIN, fingerprint
         signing_identity=fingerprint()
         signing_args=['--keychain',str(KEYCHAIN),'--sign',signing_identity]

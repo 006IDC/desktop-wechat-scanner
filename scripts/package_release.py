@@ -12,7 +12,8 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-RELEASE = '0.4.0-preview.4'
+RELEASE = '0.4.0-preview.5'
+APP_BUILD = '17'
 APP_NAME = '桌面微信扫码.app'
 STEM = f'DesktopWeChatScanner-{RELEASE}-macOS-arm64'
 OUT = ROOT / 'build/release' / RELEASE
@@ -63,9 +64,27 @@ def main():
     with tempfile.TemporaryDirectory(prefix='wechat-release-') as temporary:
         temp = Path(temporary)
         stage = temp/'stage'; stage.mkdir()
-        extract_checked(ROOT/'build/桌面微信扫码.zip', stage)
+        extract_checked(ROOT/'build/桌面微信扫码-本机签名.zip', stage)
         app = stage/APP_NAME
         verify(app)
+        # Packaging never creates/opens a signing keychain. Verify the public
+        # certificate embedded in this ZIP against the existing identity marker.
+        from local_signing import MARKER as marker
+        marker_mode = marker.lstat().st_mode
+        if not stat.S_ISREG(marker_mode) or stat.S_IMODE(marker_mode) != 0o600:
+            raise RuntimeError('Signing identity marker must be a regular mode-600 file')
+        marker_contents = marker.read_text()
+        expected_identity = marker_contents.removesuffix('\n')
+        if (marker_contents != expected_identity + '\n' or len(expected_identity) != 40
+                or any(c not in '0123456789ABCDEF' for c in expected_identity)):
+            raise RuntimeError('Invalid persistent signing identity marker')
+        cert_prefix = temp/'release-certificate-'
+        subprocess.run(['codesign', '-d', '--extract-certificates', str(cert_prefix), str(app)], check=True)
+        certificate = Path(str(cert_prefix)+'0').read_bytes()
+        if hashlib.sha1(certificate).hexdigest().upper() != expected_identity:
+            raise RuntimeError('Release certificate differs from persistent identity')
+        requirement = 'identifier "com.idc006.DesktopWeChatScanner" and certificate root = H"'+expected_identity+'"'
+        subprocess.run(['codesign', '--verify', '--strict', '-R', requirement, str(app)], check=True)
         resources = app/'Contents/Resources'
         if not (resources/'adb/bin/adb').is_file():
             raise RuntimeError('Missing bundled ADB')
@@ -79,7 +98,7 @@ def main():
         if (resources/'SOURCE-REVISION.txt').read_text().strip() != revision:
             raise RuntimeError('App source revision does not match current commit')
         info = plistlib.loads((app/'Contents/Info.plist').read_bytes())
-        if (info['CFBundleShortVersionString'], info['CFBundleVersion'], info['DesktopScannerRelease']) != ('0.4.0', '15', RELEASE):
+        if (info['CFBundleShortVersionString'], info['CFBundleVersion'], info['DesktopScannerRelease']) != ('0.4.0', APP_BUILD, RELEASE):
             raise RuntimeError('Release/Info.plist mismatch')
         executable = app/'Contents/MacOS/DesktopWeChatScanner'
         if run('lipo', '-archs', str(executable)) != 'arm64' or not os.access(executable, os.X_OK):
@@ -108,12 +127,14 @@ def main():
         if set(bundle) != allowed:
             raise RuntimeError('Incomplete bundle')
         readme = stage/'安装说明.txt'
-        readme.write_text('桌面微信扫码 0.4.0-preview.4\n\n'
+        readme.write_text('桌面微信扫码 '+RELEASE+'\n\n'
                           '将桌面微信扫码.app拖到应用程序目录。仅支持Apple Silicon、macOS 14.4+。\n'
                           '预览版：Android 16目标环境；无线配对和应用独立窗口有设备兼容性限制。\n'
                           '已内置开源ADB，无需额外安装。无线连接需在手机允许配对，配对码只填入App。\n'
                           '配对会保留此Mac的调试信任，断开App不会撤销。请在手机无线调试的已配对设备中忘记此Mac以撤销。\n\n'
-                          '此包为ad-hoc签名、未公证。若macOS阻止打开，请核对来源和校验值，按Apple官方指引操作，勿关闭Gatekeeper。\n'
+                          '此包使用维护者持续保留的自签代码签名身份，未经过 Apple Developer ID 签名或公证。\n'
+                          '由旧 ad-hoc 版本迁移时仍需一次录屏授权；相同身份后续更新不再因二进制变化而改变代码身份。\n'
+                          '若macOS阻止打开，请核对来源和校验值，按Apple官方指引操作，勿关闭Gatekeeper。\n'
                           'https://support.apple.com/102445\n\n'
                           '完整安装、隐私及开源说明：\nhttps://github.com/006IDC/desktop-wechat-scanner\n')
         shutil.copyfile(ROOT/'LICENSE', stage/'LICENSE.txt')
@@ -151,11 +172,12 @@ def main():
                 raise RuntimeError('Release ZIP lost executable permission')
         manifest = {'release':'v'+RELEASE, 'source_repository':'https://github.com/006IDC/desktop-wechat-scanner',
                     'source_commit':revision, 'architecture':'arm64', 'minimum_macos':'14.4',
-                    'app_version':'0.4.0', 'app_build':'15', 'signature':'ad-hoc', 'notarized':False,
+                    'app_version':'0.4.0', 'app_build':APP_BUILD, 'signature':'persistent self-signed', 'notarized':False,
+                    'signing_certificate_sha256':hashlib.sha256(certificate).hexdigest(),
                     'bundled_adb':True, 'adb_source_version':'37.0.0-android-tools',
-                    'known_limitations':['desktop camera round-trip latency remains', 'app pairing UI not yet verified',
-                    'remembered endpoint reconnect verified; changed-port Bonjour resolution timed out on test network',
-                    'screen-recording permission can remain unavailable despite system toggle; ad-hoc updates may require reauthorization',
+                    'known_limitations':['WeChat recognition still requires a phone round trip; local camera aperture bypasses it only for desktop preview', 'app pairing UI not yet verified',
+                    'remembered wireless device reconnect verified in App; changed-port Bonjour recovery not yet verified',
+                    'migration from previous ad-hoc builds requires screen-recording consent; actual permission retention across updates is under verification',
                     'independent app display support varies by Android app and device',
                     'interactive drag and clean Mac installation not human-verified'],
                     'verification':['ZIP CRC and executable mode', 'codesign deep strict after extraction',

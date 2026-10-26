@@ -35,6 +35,8 @@ def fingerprint() -> str:
         raise RuntimeError('Untracked local signing keychain; refusing to import another identity')
     if KEYCHAIN.exists() and not PASSWORD.exists():
         raise RuntimeError('Local keychain password is missing; preserve identity for diagnosis')
+    if KEYCHAIN.exists() and stat.S_IMODE(KEYCHAIN.stat().st_mode) != 0o600:
+        raise RuntimeError('Local signing keychain file must be mode 600')
     if PASSWORD.exists() and stat.S_IMODE(PASSWORD.stat().st_mode) != 0o600:
         raise RuntimeError('Local keychain password file must be mode 600')
     expected_fingerprint = None

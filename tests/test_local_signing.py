@@ -67,6 +67,12 @@ def metadata_fixture():
 
 
 class LocalSigningTest(unittest.TestCase):
+    def test_existing_identity_rejects_exposed_keychain(self) -> None:
+        with metadata_fixture() as (_, _, keychain, _):
+            os.chmod(keychain, 0o644)
+            with self.assertRaisesRegex(RuntimeError, 'keychain file must be mode 600'):
+                fingerprint()
+
     def test_existing_identity_rejects_exposed_password(self) -> None:
         with metadata_fixture() as (password, _, _, _):
             os.chmod(password, 0o644)
@@ -91,7 +97,9 @@ class LocalSigningTest(unittest.TestCase):
                 check_output.assert_called_once_with(
                     [str(helper), 'open', str(keychain), str(password), '-'], text=True)
 
-    # Integration test: signs synthetic apps using the persistent local identity.
+    # Explicit integration test: uses the persistent identity only when opted in.
+    @unittest.skipUnless(os.environ.get('RUN_LOCAL_SIGNING_INTEGRATION') == '1',
+                         'set RUN_LOCAL_SIGNING_INTEGRATION=1 to use the persistent local identity')
     def test_stable_designated_requirement_and_other_certificate_rejected(self) -> None:
         identity = fingerprint()
         with tempfile.TemporaryDirectory(prefix='006idc-signing-test-') as temp:
