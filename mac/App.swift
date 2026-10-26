@@ -454,8 +454,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         physicalMirror.failure=nil;scannerMirror.failure=nil
     }
     private func clearCamera() async {
-        paused=true;cameraActive=false;scanGeneration+=1;cameraPump?.stop();cameraPump=nil;cameraLoop?.cancel();cameraFPS=0;refresh()
+        let previousCamera=cameraLoop;cameraLoop=nil
+        paused=true;cameraActive=false;scanGeneration+=1;cameraPump?.stop();cameraPump=nil;previousCamera?.cancel();cameraFPS=0;refresh()
         await capture.stop()
+        await previousCamera?.value
         try? await phone.clear(epoch:scanGeneration)
     }
     private func showApplications(){
@@ -887,6 +889,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let scan=words.first{$0.value.replacingOccurrences(of:" ",with:"").contains("扫一扫")}
             if let scan,scan.rect.midY>950 {return true}
             if !tappedScanner,let scan,scan.rect.midY<950 && words.contains(where:{$0.value.contains("发起群聊") || $0.value.contains("添加朋友")}) {
+                guard try await phone.foreground(onVirtualDisplay:true)=="com.tencent.mm/.ui.LauncherUI" else{return false}
+                try Task.checkCancellation()
+                guard connected,!stopping else{return false}
                 mirror.tap(x:Double(scan.rect.midX/720),y:Double(scan.rect.midY/1280))
                 tappedScanner=true;continue
             }
@@ -902,18 +907,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     try data.write(to:folder.appendingPathComponent("diagnostic-toolbar.png"),options:.atomic)
                 }
             }
-            // MIUI can render two identical WeChat toolbar rows. The top
-            // visible row is the active navigation bar; the repeated lower
-            // row did not respond to either the mirror or shell input path.
-            if (!openedMenu || retryDue),!tappedScanner,home,let title=words.filter({
-                $0.value.replacingOccurrences(of:" ",with:"")=="微信" &&
-                $0.rect.midY<170 && (300...420).contains($0.rect.midX)
-            }).min(by:{$0.rect.minY<$1.rect.minY}) {
+            // MIUI can show a repeated title without repeating its controls.
+            // Confirm the actual plus on the same frame as the home evidence.
+            if (!openedMenu || retryDue),!tappedScanner,home {
+                let currentImage=image
+                guard let plus=try await Task.detached(priority:.userInitiated,operation:{
+                    try ScannerNavigationOCR.plusButton(in:currentImage,homeWords:words)
+                }).value else{continue}
+                guard try await phone.foreground(onVirtualDisplay:true)=="com.tencent.mm/.ui.LauncherUI" else{return false}
+                try Task.checkCancellation()
+                guard connected,!stopping else{return false}
                 if menuAttempts==2 {
-                    // A bounded compatibility fallback, only after the exact
-                    // home screen survives two direct-channel attempts.
-                    try await phone.tap(x:665,y:Int(title.rect.midY))
-                } else {mirror.tap(x:665.0/720,y:Double(title.rect.midY/1280))}
+                    try await phone.tap(x:Int(plus.x),y:Int(plus.y))
+                } else {mirror.tap(x:Double(plus.x/720),y:Double(plus.y/1280))}
                 openedMenu=true;menuAttempts+=1;lastMenuTap=ProcessInfo.processInfo.systemUptime
             }
             // A launch transition may discard the first input. Retry only the
@@ -982,13 +988,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let checking=performanceTask;checking?.cancel()
         stopping=true;busy=true;paused=true;cameraActive=false;scanGeneration+=1;mirrorGeneration+=1;physicalMirror.frames.stop();scannerMirror.frames.stop()
         let chooser=connectionWindow;chooser?.close();connectionWindow=nil
-        connectionTask?.cancel();catalogTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;cameraLoop?.cancel()
+        let previousCamera=cameraLoop;cameraLoop=nil
+        connectionTask?.cancel();catalogTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;previousCamera?.cancel()
         refresh()
         if !preserveError {status("正在断开","正在结束手机镜像并清理临时连接…")}
         Task {
             await checking?.value
             let chooserClean=await chooser?.waitForCleanup() ?? true
-            await capture.stop();await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
+            await capture.stop();await previousCamera?.value
+            await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
             var problem=await phoneSession?.disconnect() ?? ""
             let networkProblem=await disconnectWireless()
             if !networkProblem.isEmpty {problem += " " + networkProblem}
@@ -1027,14 +1035,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
         stopping=true;let chooser=connectionWindow;chooser?.close();connectionWindow=nil
-        connectionTask?.cancel();catalogTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;cameraLoop?.cancel()
+        let previousCamera=cameraLoop;cameraLoop=nil
+        connectionTask?.cancel();catalogTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;previousCamera?.cancel()
         paused=true;cameraActive=false;scanGeneration+=1;mirrorGeneration+=1;busy=true
         physicalMirror.frames.stop();scannerMirror.frames.stop();previewTimer?.invalidate();previewTimer=nil
         status("正在退出","正在停止镜像并清理手机临时连接…")
         Task {
             await checking?.value
             let chooserClean=await chooser?.waitForCleanup() ?? true
-            await capture.stop();await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
+            await capture.stop();await previousCamera?.value
+            await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
             var problem=await phoneSession?.disconnect() ?? ""
             let networkProblem=await disconnectWireless()
             if !networkProblem.isEmpty {problem += " " + networkProblem}

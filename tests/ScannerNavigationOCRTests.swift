@@ -4,6 +4,7 @@ import CoreText
 import CoreVideo
 
 @main enum ScannerNavigationOCRTests {
+    private enum Icon { case plus, magnifier, ellipsis, blank }
     static func require(_ condition: Bool, _ message: String) {
         if !condition { fatalError(message) }
     }
@@ -53,7 +54,92 @@ import CoreVideo
                 abs(lhs.width - rhs.width) < tolerance && abs(lhs.height - rhs.height) < tolerance,
                 "ROI or input size remapped synthetic coordinates: \(lhs) versus \(rhs)")
     }
+    private static func toolbar(width: Int, height: Int, dark: Bool,
+                                top: Icon, bottom: Icon) -> CVPixelBuffer {
+        var result: CVPixelBuffer?
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+            [kCVPixelBufferCGImageCompatibilityKey: true,
+             kCVPixelBufferCGBitmapContextCompatibilityKey: true] as CFDictionary, &result)
+        require(status == kCVReturnSuccess && result != nil, "Cannot create synthetic toolbar")
+        let buffer = result!
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let context = CGContext(data: CVPixelBufferGetBaseAddress(buffer), width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue |
+                CGBitmapInfo.byteOrder32Little.rawValue)!
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: 1, y: -1)
+        context.setFillColor(CGColor(gray: dark ? 0.10 : 0.94, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setStrokeColor(CGColor(gray: dark ? 0.94 : 0.06, alpha: 1))
+        context.setFillColor(CGColor(gray: dark ? 0.94 : 0.06, alpha: 1))
+        let radius = CGFloat(width) * 0.0235
+        context.setLineWidth(max(2, radius * 0.10))
+        context.setLineCap(.round)
+        for (row, icon) in [(CGFloat(38), top), (CGFloat(108), bottom)] {
+            let x = CGFloat(width) * 665 / 720
+            let y = CGFloat(height) * row / 1280
+            switch icon {
+            case .plus, .magnifier:
+                context.strokeEllipse(in: CGRect(x: x - radius, y: y - radius,
+                                               width: radius * 2, height: radius * 2))
+                if icon == .plus {
+                    context.move(to: CGPoint(x: x - radius * 0.47, y: y))
+                    context.addLine(to: CGPoint(x: x + radius * 0.47, y: y))
+                    context.move(to: CGPoint(x: x, y: y - radius * 0.47))
+                    context.addLine(to: CGPoint(x: x, y: y + radius * 0.47))
+                    context.strokePath()
+                } else {
+                    context.move(to: CGPoint(x: x + radius * 0.65, y: y + radius * 0.65))
+                    context.addLine(to: CGPoint(x: x + radius * 1.35, y: y + radius * 1.35))
+                    context.strokePath()
+                }
+            case .ellipsis:
+                for offset in [-0.55, 0, 0.55] as [CGFloat] {
+                    context.fillEllipse(in: CGRect(x: x + offset * radius - radius * 0.10,
+                                                   y: y - radius * 0.10,
+                                                   width: radius * 0.20, height: radius * 0.20))
+                }
+            case .blank: break
+            }
+        }
+        return buffer
+    }
+    private static func homeWords() -> [ScannerNavigationOCR.Text] {
+        [38, 108].map { y in
+            ScannerNavigationOCR.Text(value: "微信", rect: CGRect(x: 338, y: y - 16, width: 52, height: 32))
+        }
+    }
+    private static func expectPlus(_ pixels: CVPixelBuffer, near y: CGFloat?) throws {
+        let found = try ScannerNavigationOCR.plusButton(in: pixels, homeWords: homeWords())
+        if let y {
+            require(found != nil && abs(found!.x - 665) <= 8 && abs(found!.y - y) <= 7,
+                    "Did not select the verified plus row")
+        } else {
+            require(found == nil, "Guessed a plus where none exists")
+        }
+    }
     static func main() throws {
+        for (width, height) in [(720, 1280), (1268, 2756), (1000, 1700)] {
+            try expectPlus(toolbar(width: width, height: height, dark: false,
+                                   top: .blank, bottom: .plus), near: 108)
+            try expectPlus(toolbar(width: width, height: height, dark: false,
+                                   top: .plus, bottom: .blank), near: 38)
+            try expectPlus(toolbar(width: width, height: height, dark: false,
+                                   top: .plus, bottom: .plus), near: 38)
+            try expectPlus(toolbar(width: width, height: height, dark: false,
+                                   top: .blank, bottom: .blank), near: nil)
+            try expectPlus(toolbar(width: width, height: height, dark: false,
+                                   top: .magnifier, bottom: .ellipsis), near: nil)
+            try expectPlus(toolbar(width: width, height: height, dark: false,
+                                   top: .magnifier, bottom: .plus), near: 108)
+            try expectPlus(toolbar(width: width, height: height, dark: true,
+                                   top: .blank, bottom: .plus), near: 108)
+        }
+        print("PASS synthetic plus pixels: upper/lower/both/absent/search/ellipsis/dark and source aspect ratios")
+        if CommandLine.arguments.contains("--plus-only") { return }
         let pixels = fixture()
         let full = try ScannerNavigationOCR.recognize(pixels)
         let menu = try ScannerNavigationOCR.recognize(pixels, region: .menu)
