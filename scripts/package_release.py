@@ -177,7 +177,7 @@ def main():
                     'bundled_adb':True, 'adb_source_version':'37.0.0-android-tools',
                     'known_limitations':['WeChat recognition still requires a phone round trip; local camera aperture bypasses it only for desktop preview', 'app pairing UI not yet verified',
                     'remembered wireless device reconnect verified in App; changed-port Bonjour recovery not yet verified',
-                    'migration from previous ad-hoc builds requires screen-recording consent; actual permission retention across updates is under verification',
+                    'migration from previous ad-hoc builds requires screen-recording consent; same-certificate permission retention verified locally across builds 16, 18 and 19; new Mac installation remains unverified',
                     'independent app display support varies by Android app and device',
                     'interactive drag and clean Mac installation not human-verified'],
                     'verification':['ZIP CRC and executable mode', 'codesign deep strict after extraction',

@@ -77,3 +77,10 @@ Android 16 的 scrcpy 二次 AUTO_MIRROR 输出属于默认显示组，真机上
 `python3 -m unittest discover -s tests -p test_local_signing.py` 默认只运行临时夹具的签名元数据单元测试。需要显式验证持久身份签署合成应用时，设置 `RUN_LOCAL_SIGNING_INTEGRATION=1` 再运行同一命令；该集成测试会访问项目本机签名身份并调用 `codesign`，不会安装应用。
 
 真实安装前必须完成签名校验；跨版本的指定要求相同只是身份连续性的前提，录屏授权仍需在实际安装路径和系统上验证。
+
+`ScanPreviewMaskTests.swift` 创建但不显示本程序窗口，用 AppKit 实际 `convertToLayer` 校验视频/静态层遮罩与两个手机比例，并检查暂停后的窗口层级恢复。没有录屏、手机或共享 UI 输入；旧的二次翻转遮罩在此夹具失败。运行：
+
+```sh
+swiftc -swift-version 5 -warnings-as-errors -target arm64-apple-macos14.4 -module-cache-path .local/swift-cache mac/Views.swift mac/WindowCaptureGeometry.swift tests/ScanPreviewMaskTests.swift -o .local/scan-mask-tests
+.local/scan-mask-tests
+```
