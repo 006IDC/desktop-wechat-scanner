@@ -172,7 +172,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     @objc private func applicationsAction(){showApplications()}
-    @objc private func showMainWindow(){mainControl.window?.deminiaturize(nil);mainControl.showWindow(nil);mainControl.window?.makeKeyAndOrderFront(nil)}
+    @objc private func showMainWindow(){NSApp.activate(ignoringOtherApps:true);mainControl.window?.deminiaturize(nil);mainControl.showWindow(nil);mainControl.window?.makeKeyAndOrderFront(nil)}
     @objc private func homeAction(){home()}
     @objc private func wechatAction(){enterWechat(scan:false)}
     @objc private func scanAction(){enterWechat(scan:true)}
@@ -416,6 +416,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     private func configureWechatWindow(at point:NSPoint?){
+        NSApp.activate(ignoringOtherApps:true)
         if let window=wechatWindow?.window {window.deminiaturize(nil);window.makeKeyAndOrderFront(nil);return}
         let window=ControlWindowController(title:"微信 · 手机应用",standalone:true,scanner:true)
         wechatWindow=window;window.window?.delegate=self

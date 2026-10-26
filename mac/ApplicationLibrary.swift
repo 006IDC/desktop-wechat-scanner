@@ -136,6 +136,9 @@ enum AppWindowMotion {
         return destination
     }
     @MainActor static func reveal(_ window: NSWindow, from point: NSPoint?) {
+        // Ordering a window alone does not restore an inactive Stage Manager
+        // group. This entry is invoked when the user opens an application.
+        NSApp.activate(ignoringOtherApps: true)
         let destination = destination(for: window.frame, at: point, screens: NSScreen.screens.map(\.visibleFrame),
                                       fallback: NSScreen.main?.visibleFrame ?? window.frame)
         window.deminiaturize(nil)
