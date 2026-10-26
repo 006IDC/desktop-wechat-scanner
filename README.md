@@ -2,7 +2,7 @@
 
 在 Mac 上操作真实 Android 手机，在独立窗口中使用手机应用，并把窗口后方的电脑二维码送给真实微信扫一扫。
 
-**当前源码候选：v0.4.0-preview.5（App 0.4.0 / build 27），正在真机验收；已公开版本为 preview.4。已内置开源 ADB，无需额外安装。桌面相机仍有回传延迟，尚未达到参考视频或 iPhone 镜像的流畅度。**
+**当前源码候选：v0.4.0-preview.5（App 0.4.0 / build 28），正在真机验收；已公开版本为 preview.4。已内置开源 ADB，无需额外安装。桌面相机仍有回传延迟，尚未达到参考视频或 iPhone 镜像的流畅度。**
 
 [公开发行](https://github.com/006IDC/desktop-wechat-scanner/releases) · [安装说明](docs/INSTALL.md) · [版本记录](CHANGELOG.md)
 

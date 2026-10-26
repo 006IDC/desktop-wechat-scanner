@@ -558,7 +558,8 @@ final class MirrorSession: @unchecked Sendable {
                 let payload=try video.read(length,timeout:10)
                 let receivedAt = ProcessInfo.processInfo.systemUptime
                 if isCurrent(epoch) {
-                    let ticket = timing.recordPacket(epoch: epoch, ptsMicroseconds: pts, config: config, receivedAt: receivedAt)
+                    let ticket = timing.recordPacket(epoch: epoch, ptsMicroseconds: pts, config: config,
+                                                     receivedAt: receivedAt, bytes: payload.count)
                     try decoder.feed(payload,config:config,pts:pts,ticket:ticket)
                 }
             }

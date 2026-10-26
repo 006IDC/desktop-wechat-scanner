@@ -6,6 +6,23 @@ import Foundation
         require(value.map { abs($0 - expected) < 0.001 } == true, message)
     }
     static func main() {
+        let bandwidth = MirrorTiming()
+        bandwidth.begin(epoch: 7); bandwidth.startStream(epoch: 7)
+        _ = bandwidth.recordPacket(epoch: 7, ptsMicroseconds: 0, config: true, receivedAt: 10, bytes: 100)
+        require(bandwidth.snapshot.receivedBytes == 100 && bandwidth.snapshot.receiveDurationSeconds == 0 &&
+                bandwidth.snapshot.receivedBytesPerSecond == 0, "Single packet divided by zero or lost config bytes")
+        _ = bandwidth.recordPacket(epoch: 7, ptsMicroseconds: 1_000_000, config: false, receivedAt: 11, bytes: 200)
+        close(bandwidth.snapshot.receiveDurationSeconds, 1, "Receive duration is incorrect")
+        close(bandwidth.snapshot.receivedBytesPerSecond, 300, "Payload byte rate is incorrect")
+        _ = bandwidth.recordPacket(epoch: 7, ptsMicroseconds: 1_500_000, config: false, receivedAt: 10.5, bytes: 50)
+        require(bandwidth.snapshot.receivedBytes == 350, "Received byte count missed a complete payload")
+        close(bandwidth.snapshot.receiveDurationSeconds, 1, "Regressed receive time shortened the interval")
+        _ = bandwidth.recordPacket(epoch: 8, ptsMicroseconds: 2_000_000, config: false, receivedAt: 12, bytes: 100)
+        require(bandwidth.snapshot.receivedBytes == 350, "Old epoch added bytes")
+        bandwidth.startStream(epoch: 7)
+        require(bandwidth.snapshot.receivedBytes == 0 && bandwidth.snapshot.receiveDurationSeconds == 0 &&
+                bandwidth.snapshot.receivedBytesPerSecond == 0, "New stream retained old bandwidth samples")
+
         let timing = MirrorTiming(sampleCapacity: 20)
         timing.begin(epoch: 1); timing.startStream(epoch: 1)
         require(timing.recordPacket(epoch: 1, ptsMicroseconds: UInt64.max, config: true, receivedAt: 10) == nil,
@@ -86,6 +103,6 @@ import Foundation
         }
         require(timing.snapshot.packetCount == 11_000 && timing.snapshot.decodedFrameCount == 11_000,
                 "Concurrent snapshots/recording lost counts")
-        print("PASS bounded mirror timing, relative backlog/drift, PTS resets, sample loss, incarnation/stop isolation and concurrent snapshots")
+        print("PASS bounded mirror timing, payload byte rate, relative backlog/drift, PTS resets, sample loss, incarnation/stop isolation and concurrent snapshots")
     }
 }

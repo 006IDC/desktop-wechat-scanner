@@ -653,6 +653,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let mirrorStats=scannerMirror.session.timingSnapshot
             report["mirrorRelativeBacklogP95Milliseconds"]=mirrorStats.relativeBacklogP95Milliseconds
             report["mirrorDecodeP95Milliseconds"]=mirrorStats.decodeP95Milliseconds
+            report["mirrorReceivedBytes"]=mirrorStats.receivedBytes
+            report["mirrorReceiveBytesPerSecond"]=mirrorStats.receivedBytesPerSecond
             cameraSuppressed=true
             if connected {await clearCamera()}
             await capture.setDiagnosticBoard(nil)
@@ -794,12 +796,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let sending=ProcessInfo.processInfo.systemUptime
                     // Freshness is checked again when the phone actor actually owns
                     // the socket, after any queued control command has completed.
-                    try await phone.frame(image,epoch:generation,selectedAt:target.selectedAt)
+                    let receipt=try await phone.frame(image,epoch:generation,selectedAt:target.selectedAt)
                     let sentAt=ProcessInfo.processInfo.systemUptime
                     stats.sent+=1
                     if let previous=lastSentAt {stats.maximumGapMilliseconds=max(stats.maximumGapMilliseconds,(sentAt-previous)*1000)}
                     lastSentAt=sentAt;transientFailureSince=nil
                     stats.transferMilliseconds=(sentAt-sending)*1000
+                    stats.imageBytes=image.count
+                    stats.phoneProcessingMilliseconds=receipt.processingMilliseconds
+                    stats.requestMilliseconds=receipt.requestMilliseconds
+                    stats.actorWaitMilliseconds=max(0,stats.transferMilliseconds-receipt.requestMilliseconds)
                     let duration=sentAt-measuredAt
                     if duration>=2 {
                         stats.fps=Double(stats.sent-measuredFrames)/duration
@@ -847,6 +853,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         scanNavigation=[]
         let navigationStarted=ProcessInfo.processInfo.systemUptime
         defer {scannerNavigationMilliseconds=(ProcessInfo.processInfo.systemUptime-navigationStarted)*1000}
+        // Repeated explicit diagnostics may resume their own plain-text result.
+        // Only the exact synthetic payload permits this one back action.
+        if CommandLine.arguments.contains("--run-scan-diagnostic"),let pixels=latestPhoneFrame {
+            let isOwnResult=try await Task.detached {
+                try Self.textIn(pixels).contains{$0.value.replacingOccurrences(of:" ",with:"")==ScanPerformanceCheck.payload}
+            }.value
+            try Task.checkCancellation()
+            if isOwnResult {mirror.key(4);try await Task.sleep(nanoseconds:350_000_000)}
+        }
         if let foreground=try await phone.foreground(onVirtualDisplay:true),
            foreground.hasPrefix("com.tencent.mm/"),foreground.lowercased().contains("scanner") {return true}
         let deadline=ProcessInfo.processInfo.systemUptime+4

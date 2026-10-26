@@ -546,8 +546,13 @@ public final class LiveCameraServer {
                 if (epoch < 0) { error(output, "Epoch must be nonnegative"); continue; }
                 if (epoch != currentEpoch) { reply(output, true, new byte[0]); continue; }
                 try {
-                    setCameraFrame(Arrays.copyOfRange(body, Long.BYTES, body.length));
-                    reply(output, true, new byte[0]);
+                    byte[] image = Arrays.copyOfRange(body, Long.BYTES, body.length);
+                    long frameStartedAt = System.nanoTime();
+                    setCameraFrame(image);
+                    long processingNanos = System.nanoTime() - frameStartedAt;
+                    // Optional numeric receipt: method processing/lock wait only,
+                    // excluding socket transfer, reply flush and later painting.
+                    reply(output, true, java.nio.ByteBuffer.allocate(Long.BYTES).putLong(processingNanos).array());
                 }
                 catch (Exception e) { error(output, e.getMessage() == null ? "Invalid camera frame" : e.getMessage()); }
             } else if (command == 2) {

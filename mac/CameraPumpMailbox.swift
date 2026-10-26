@@ -6,6 +6,9 @@ final class CameraPumpMailbox: @unchecked Sendable {
     struct Statistics: Sendable {
         var sent=0,dropped=0
         var syntheticQRVisible=false
+        var imageBytes=0
+        var phoneProcessingMilliseconds:Double?
+        var requestMilliseconds=0.0,actorWaitMilliseconds=0.0
         var fps=0.0,captureMilliseconds=0.0,transferMilliseconds=0.0,maximumGapMilliseconds=0.0
     }
     struct Snapshot {

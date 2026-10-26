@@ -16,6 +16,11 @@ final class MirrorTiming: @unchecked Sendable {
         let packetCount: UInt64
         let configPacketCount: UInt64
         let videoPacketCount: UInt64
+        /// Complete H.264 packet payloads received in this stream incarnation.
+        let receivedBytes: UInt64
+        /// Elapsed monotonic time between the first and latest complete packet.
+        let receiveDurationSeconds: Double
+        let receivedBytesPerSecond: Double
         let decodedFrameCount: UInt64
         let decodeFailureCount: UInt64
         /// Media packets without a usable decode duration, not transport loss.
@@ -53,6 +58,8 @@ final class MirrorTiming: @unchecked Sendable {
     private var epoch = 0, active = false
     private var incarnation: UInt64 = 0
     private var packets: UInt64 = 0, configs: UInt64 = 0, videos: UInt64 = 0
+    private var receivedBytes: UInt64 = 0
+    private var firstReceiveAt: Double?, latestReceiveAt: Double?
     private var decoded: UInt64 = 0, failures: UInt64 = 0, losses: UInt64 = 0
     private var ptsResets: UInt64 = 0, invalidTimestamps: UInt64 = 0
     private var previousPTS: UInt64?, previousReceive: Double?, minimumOffset: Double?
@@ -82,14 +89,20 @@ final class MirrorTiming: @unchecked Sendable {
     }
     private func clearStream() {
         packets = 0; configs = 0; videos = 0; decoded = 0; failures = 0; losses = 0
+        receivedBytes = 0; firstReceiveAt = nil; latestReceiveAt = nil
         ptsResets = 0; invalidTimestamps = 0
         previousPTS = nil; previousReceive = nil; minimumOffset = nil
         decodeSamples = Samples(capacity: capacity); receiveOffsets = Samples(capacity: capacity)
     }
-    func recordPacket(epoch: Int, ptsMicroseconds: UInt64, config: Bool, receivedAt: Double) -> Ticket? {
+    func recordPacket(epoch: Int, ptsMicroseconds: UInt64, config: Bool, receivedAt: Double, bytes: Int = 0) -> Ticket? {
         lock.withLock {
             guard active, self.epoch == epoch else { return nil }
             packets += 1
+            receivedBytes += UInt64(max(0, bytes))
+            if receivedAt.isFinite, receivedAt >= 0 {
+                if firstReceiveAt == nil { firstReceiveAt = receivedAt }
+                latestReceiveAt = max(latestReceiveAt ?? receivedAt, receivedAt)
+            }
             if config { configs += 1; return nil }
             videos += 1
             let ticket = Ticket(epoch: epoch, incarnation: incarnation)
@@ -137,8 +150,11 @@ final class MirrorTiming: @unchecked Sendable {
         lock.withLock {
             let decode = decodeSamples.summary()
             let backlog = receiveOffsets.summary(subtracting: minimumOffset ?? 0)
+            let duration = max(0, (latestReceiveAt ?? 0) - (firstReceiveAt ?? 0))
             return Snapshot(active: active, streamIncarnation: incarnation,
                 packetCount: packets, configPacketCount: configs, videoPacketCount: videos,
+                receivedBytes: receivedBytes, receiveDurationSeconds: duration,
+                receivedBytesPerSecond: duration > 0 ? Double(receivedBytes) / duration : 0,
                 decodedFrameCount: decoded, decodeFailureCount: failures, decodeSampleLossCount: losses,
                 ptsResetCount: ptsResets, invalidTimestampCount: invalidTimestamps,
                 decodeSampleCount: decodeSamples.values.count,

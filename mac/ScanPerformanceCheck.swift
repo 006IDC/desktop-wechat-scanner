@@ -22,6 +22,7 @@ import CoreImage.CIFilterBuiltins
     private var movementSent=0
     private var movementDuration=0.0
     private var captureCosts:[Double]=[],transferCosts:[Double]=[]
+    private var processingCosts:[Double]=[],requestCosts:[Double]=[],actorWaitCosts:[Double]=[],imageSizes:[Double]=[]
     private(set) var qrVisible = false
     private(set) var movedPoints: CGFloat = 0
     private let reduceMotion: Bool
@@ -95,6 +96,9 @@ import CoreImage.CIFilterBuiltins
         if stats.sent>0,stats.sent != lastSampledSent,captureCosts.count<600 {
             lastSampledSent=stats.sent
             captureCosts.append(stats.captureMilliseconds);transferCosts.append(stats.transferMilliseconds)
+            if let processing=stats.phoneProcessingMilliseconds {processingCosts.append(processing)}
+            requestCosts.append(stats.requestMilliseconds);actorWaitCosts.append(stats.actorWaitMilliseconds)
+            imageSizes.append(Double(stats.imageBytes))
         }
     }
 
@@ -114,6 +118,11 @@ import CoreImage.CIFilterBuiltins
                 "movementSendFPS":movementDuration>0 ? Double(movementSent)/movementDuration : 0,
                 "movementCaptureP95Milliseconds":percentile(captureCosts),
                 "movementTransferP95Milliseconds":percentile(transferCosts),
+                "movementPhoneProcessingSamples":processingCosts.count,
+                "movementPhoneProcessingP95Milliseconds":percentile(processingCosts),
+                "movementRequestP95Milliseconds":percentile(requestCosts),
+                "movementActorWaitP95Milliseconds":percentile(actorWaitCosts),
+                "movementImageBytesP95":percentile(imageSizes),
                 "movementAmplitudePoints":movedPoints, "reducedMotion":reduceMotion,
                 "physicalMouseDragMeasured":false]
     }

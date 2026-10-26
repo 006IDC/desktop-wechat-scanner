@@ -177,6 +177,11 @@ struct CameraFrameExpiredError: LocalizedError {
     var errorDescription:String? {"本次桌面坐标已过时。"}
 }
 
+struct CameraFrameReceipt {
+    let processingMilliseconds: Double?
+    let requestMilliseconds: Double
+}
+
 actor PhoneSession {
     private let adbURL: URL, jarURL: URL, recoveryURL: URL
     private let serverSocket: String?
@@ -278,7 +283,9 @@ actor PhoneSession {
         var value = UInt64(epoch).bigEndian
         return withUnsafeBytes(of: &value) { Data($0) }
     }
-    func frame(_ data: Data, epoch: Int, selectedAt:TimeInterval?=nil) throws {
+    /// Android processing only, when supported; ACK round-trip remains a separate measurement.
+    @discardableResult
+    func frame(_ data: Data, epoch: Int, selectedAt:TimeInterval?=nil) throws -> CameraFrameReceipt {
         try Task.checkCancellation()
         if let selectedAt,ProcessInfo.processInfo.systemUptime-selectedAt>0.5 {
             throw CameraFrameExpiredError()
@@ -287,7 +294,17 @@ actor PhoneSession {
         guard data.count <= 4*1024*1024 else {throw ScanError("图像过大。")}
         var body = try epochBytes(epoch)
         body.append(data)
-        _ = try channel.request(1,body)
+        let started=ProcessInfo.processInfo.systemUptime
+        let processing=try Self.frameProcessingMilliseconds(in:channel.request(1,body))
+        return CameraFrameReceipt(processingMilliseconds:processing,requestMilliseconds:(ProcessInfo.processInfo.systemUptime-started)*1000)
+    }
+    static func frameProcessingMilliseconds(in reply: Data) throws -> Double? {
+        // Empty is compatible with older servers and deliberately ignored epochs.
+        if reply.isEmpty { return nil }
+        guard reply.count == 8 else { throw ScanError("手机返回了无效的图像处理耗时长度。") }
+        let nanos = reply.reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        guard nanos <= UInt64(Int64.max) else { throw ScanError("手机返回了无效的图像处理耗时。") }
+        return Double(nanos) / 1_000_000
     }
     func clear(epoch: Int) throws {
         guard let channel else {return}
