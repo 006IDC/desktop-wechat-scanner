@@ -271,7 +271,14 @@ actor DesktopCapture {
     private var preparationInFlight=false
     private let sampleQueue=DispatchQueue(label:"com.idc006.desktop.stream",qos:.userInteractive)
     private let encoder=DesktopFrameEncoder()
+    private var diagnosticBoardID: CGWindowID?
     private(set) var permissionBlocked=false
+
+    /// The opt-in self-test shows a synthetic board owned by this app. Include
+    /// just that window while continuing to exclude every other app window.
+    func setDiagnosticBoard(_ id: CGWindowID?) async {
+        await stop(); content=nil; diagnosticBoardID=id
+    }
 
     func prepare() async throws {
         try checkPermission()
@@ -348,7 +355,17 @@ actor DesktopCapture {
               let display=content.displays.first(where:{$0.displayID==id}) else {throw ScanError("显示器已变化，请重新开始扫码。")}
         let ownApps=content.applications.filter{$0.processID==ProcessInfo.processInfo.processIdentifier}
         guard !ownApps.isEmpty else {throw ScanError("无法排除本 App，请重新打开 App。")}
-        let filter=SCContentFilter(display:display,excludingApplications:ownApps,exceptingWindows:[])
+        let filter: SCContentFilter
+        if let diagnosticBoardID {
+            guard content.windows.contains(where:{$0.windowID==diagnosticBoardID &&
+                $0.owningApplication?.processID==ProcessInfo.processInfo.processIdentifier}) else {
+                throw ScanError("合成测试窗口尚未就绪。")
+            }
+            let excluded=content.windows.filter{$0.owningApplication?.processID==ProcessInfo.processInfo.processIdentifier && $0.windowID != diagnosticBoardID}
+            filter=SCContentFilter(display:display,excludingWindows:excluded)
+        } else {
+            filter=SCContentFilter(display:display,excludingApplications:ownApps,exceptingWindows:[])
+        }
         let config=SCStreamConfiguration()
         // Capture a stable full-display surface. Moving/resizing the consumer only changes its crop.
         config.sourceRect=CGRect(origin:.zero,size:screen.size)

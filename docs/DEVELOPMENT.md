@@ -84,3 +84,9 @@ Android 16 的 scrcpy 二次 AUTO_MIRROR 输出属于默认显示组，真机上
 swiftc -swift-version 5 -warnings-as-errors -target arm64-apple-macos14.4 -module-cache-path .local/swift-cache mac/Views.swift mac/WindowCaptureGeometry.swift tests/ScanPreviewMaskTests.swift -o .local/scan-mask-tests
 .local/scan-mask-tests
 ```
+
+## 扫码性能诊断
+
+“手机 → 运行扫码流畅度检查”需要已经连接的手机与既有录屏授权。测试自动移动本 App 的扫码窗口 6 秒，然后显示纯文本合成二维码，最多等待 8 秒；只保存数值和识别确认布尔值至 App 支持目录的 `performance-last.json`，不保存画面、二维码外的 OCR 文本或消息。测试结束恢复窗口位置、关闭测试板、撤销测试板采集例外并暂停相机。暂停、返回、最小化、断开或退出会取消测试。系统开启减少动态效果时不进行往返移动，报告会标注。
+
+这是原生窗口位置更新与真实扫码链路的诊断，不等于物理鼠标拖动或屏幕实际显示延迟验收。视频相对积压用同一流的 PTS 与 Mac 到包时间差的最小值作基线，含时钟漂移影响；不能当作绝对无线延迟。`MirrorTimingTests.swift` 使用合成时钟，验证重连/PTS 跳变、计数、有界采样和并发，真实硬件数据需另验。

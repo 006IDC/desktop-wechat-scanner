@@ -218,8 +218,12 @@ private final class H264Decoder: @unchecked Sendable {
     private var sps: Data?, pps: Data?, format: CMVideoFormatDescription?, decoder: VTDecompressionSession?
     private let output:Output
     private let context:CIContext?
-    init(output:Output) {
+    private let timing: MirrorTiming
+    private let timingLock = NSLock()
+    private var pendingTiming: (MirrorTiming.Ticket, Double)?
+    init(output:Output, timing:MirrorTiming) {
         self.output=output
+        self.timing=timing
         if case .image = output {context=CIContext(options:[.useSoftwareRenderer:false])}
         else {context=nil}
     }
@@ -248,8 +252,11 @@ private final class H264Decoder: @unchecked Sendable {
         }
         guard status == noErr, let format else { throw ScanError("手机镜像 H.264 参数无效。") }
         let callback:VTDecompressionOutputCallback = { ref, _, status, _, image, _, _ in
-            guard status == noErr, let image, let ref else { return }
+            let completedAt = ProcessInfo.processInfo.systemUptime
+            guard let ref else { return }
             let owner = Unmanaged<H264Decoder>.fromOpaque(ref).takeUnretainedValue()
+            owner.completeTiming(at: completedAt, succeeded: status == noErr && image != nil)
+            guard status == noErr, let image else { return }
             switch owner.output {
             case let .pixelBuffer(onFrame):
                 onFrame(image)
@@ -270,7 +277,20 @@ private final class H264Decoder: @unchecked Sendable {
         // Public optional property; unsupported decoders retain their defaults.
         if let decoder { _ = VTSessionSetProperty(decoder, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue) }
     }
-    func feed(_ payload:Data, config:Bool) throws {
+    private func completeTiming(at completedAt: Double, succeeded: Bool) {
+        let pending = timingLock.withLock { () -> (MirrorTiming.Ticket, Double)? in
+            defer { pendingTiming = nil }
+            return pendingTiming
+        }
+        if let (ticket, startedAt) = pending {
+            timing.recordDecode(ticket, startedAt: startedAt, completedAt: completedAt, succeeded: succeeded)
+        }
+    }
+    func feed(_ payload:Data, config:Bool, pts:UInt64, ticket:MirrorTiming.Ticket?) throws {
+        var submitted = false
+        defer {
+            if !submitted, let ticket { timing.recordMissingDecode(ticket) }
+        }
         let units = try MirrorProtocol.nalUnits(payload)
         var changed = false
         for unit in units {
@@ -304,19 +324,35 @@ private final class H264Decoder: @unchecked Sendable {
         }
         guard copy == noErr else {throw ScanError("H.264 帧拷贝失败。")}
         var sample:CMSampleBuffer?, size=avcc.count
+        var sampleTiming = CMSampleTimingInfo(duration: .invalid,
+            presentationTimeStamp: CMTime(value: Int64(pts), timescale: 1_000_000), decodeTimeStamp: .invalid)
         let sampleStatus=CMSampleBufferCreateReady(allocator:kCFAllocatorDefault,dataBuffer:block,
-            formatDescription:format,sampleCount:1,sampleTimingEntryCount:0,
-            sampleTimingArray:nil,sampleSizeEntryCount:1,sampleSizeArray:&size,sampleBufferOut:&sample)
+            formatDescription:format,sampleCount:1,sampleTimingEntryCount:1,
+            sampleTimingArray:&sampleTiming,sampleSizeEntryCount:1,sampleSizeArray:&size,sampleBufferOut:&sample)
         guard sampleStatus == noErr, let sample else {throw ScanError("H.264 样本无效。")}
         var flags:VTDecodeInfoFlags=[]
+        // With both decode flags clear, Apple's API guarantees the callback
+        // completes before DecodeFrame returns. One protected slot is sufficient;
+        // it owns only numeric timing data, never a frame or retained refcon.
+        if let ticket {
+            timingLock.withLock { pendingTiming = (ticket, ProcessInfo.processInfo.systemUptime) }
+        }
+        submitted = true
         let status=VTDecompressionSessionDecodeFrame(decoder,sampleBuffer:sample,
                                 flags:[],frameRefcon:nil,infoFlagsOut:&flags)
+        let missing = timingLock.withLock { () -> MirrorTiming.Ticket? in
+            defer { pendingTiming = nil }
+            return pendingTiming?.0
+        }
+        if let missing { timing.recordMissingDecode(missing, failed: status != noErr) }
         guard status == noErr else {throw ScanError("H.264 硬件解码失败（\(status)）。")}
     }
 }
 
 final class MirrorSession: @unchecked Sendable {
     private let lock=NSLock()
+    private let timing = MirrorTiming()
+    var timingSnapshot: MirrorTiming.Snapshot { timing.snapshot }
     private let inputScheduler = MirrorInputScheduler()
     private let inputQueue=DispatchQueue(label:"com.idc006.mirror.input",qos:.userInitiated)
     private var generation=0, video:MirrorSocket?, control:MirrorSocket?, server:Process?
@@ -332,6 +368,7 @@ final class MirrorSession: @unchecked Sendable {
         lock.lock();defer {lock.unlock()}
         guard !started && !stopping else {throw ScanError("手机镜像已经运行或正在关闭。")}
         started=true;generation += 1
+        timing.begin(epoch: generation)
         inputScheduler.reset(epoch: generation, enabled: true)
         self.adbURL=adbURL;self.serial=serial;self.serverSocket=serverSocket
         failureCallback=onFailure
@@ -402,7 +439,7 @@ final class MirrorSession: @unchecked Sendable {
                     onFrame(pixelBuffer)
                 }
             }
-            let decoder=H264Decoder(output:deliver)
+            let decoder=H264Decoder(output:deliver,timing:timing)
             DispatchQueue.global(qos:.userInitiated).async { [weak self] in
                 guard let self else {return}
                 do {try self.receive(epoch:epoch,decoder:decoder)}
@@ -511,11 +548,19 @@ final class MirrorSession: @unchecked Sendable {
             let header=try MirrorProtocol.header(video.read(12))
             switch header {
             case let .session(width,height,_):
-                lock.lock();self.width=width;self.height=height;lock.unlock()
+                lock.withLock {
+                    guard started && generation == epoch else { return }
+                    self.width=width;self.height=height
+                    timing.startStream(epoch: epoch)
+                }
                 decoder.reset()
-            case let .packet(length,config,_,_):
+            case let .packet(length,config,_,pts):
                 let payload=try video.read(length,timeout:10)
-                if isCurrent(epoch) {try decoder.feed(payload,config:config)}
+                let receivedAt = ProcessInfo.processInfo.systemUptime
+                if isCurrent(epoch) {
+                    let ticket = timing.recordPacket(epoch: epoch, ptsMicroseconds: pts, config: config, receivedAt: receivedAt)
+                    try decoder.feed(payload,config:config,pts:pts,ticket:ticket)
+                }
             }
         }
     }
@@ -624,6 +669,7 @@ final class MirrorSession: @unchecked Sendable {
                     stopWaiters.append(continuation)
                     return nil
                 }
+                timing.invalidate(epoch: generation)
                 stopping=true;generation += 1;started=false
                 inputScheduler.reset(epoch: generation, enabled: false)
                 return (video,control,preparing)

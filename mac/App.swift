@@ -52,6 +52,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var permissionCheck:Task<Void,Never>?
     private var cameraTickAt:TimeInterval?,cameraTickGaps:[Double]=[]
     private var maximumCameraTickMilliseconds=0.0
+    private var performanceCheck: ScanPerformanceCheck?
+    private var performanceTask: Task<Void,Never>?
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         buildMenu();control.window?.delegate=self
@@ -100,6 +102,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         actions.addItem(.separator())
         actions.addItem(withTitle:"关闭窗口",action:#selector(NSWindow.performClose(_:)),keyEquivalent:"w")
         actions.addItem(withTitle:"手机应用…",action:#selector(applicationsAction),keyEquivalent:"l").target=self
+        actions.addItem(withTitle:"运行扫码流畅度检查",action:#selector(runPerformanceCheck),keyEquivalent:"").target=self
         item.submenu=actions;menu.addItem(item)
         let windowItem=NSMenuItem(),windows=NSMenu(title:"窗口")
         windows.addItem(withTitle:"最小化",action:#selector(NSWindow.performMiniaturize(_:)),keyEquivalent:"m")
@@ -197,7 +200,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         try? FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
         let ticks=cameraTickGaps.sorted()
         let tickP95=ticks.isEmpty ? 0:ticks[min(ticks.count-1,Int(Double(ticks.count)*0.95))]
-        let value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":screenAccessGranted,"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"localCameraPreview":cameraActive && !paused && !busy && mode == .wechat,"independentApplicationsWhenLocked":independentApplicationsWhenLocked,"primaryLocked":primaryLocked,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"cameraTickP95Milliseconds":tickP95,"maximumCameraTickMilliseconds":maximumCameraTickMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
+        var value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":screenAccessGranted,"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"localCameraPreview":cameraActive && !paused && !busy && mode == .wechat,"independentApplicationsWhenLocked":independentApplicationsWhenLocked,"primaryLocked":primaryLocked,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"cameraTickP95Milliseconds":tickP95,"maximumCameraTickMilliseconds":maximumCameraTickMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
+        let mirrorStats=scannerMirror.session.timingSnapshot
+        value["mirrorRelativeBacklogP95Milliseconds"]=mirrorStats.relativeBacklogP95Milliseconds
+        value["mirrorRelativeBacklogMaxMilliseconds"]=mirrorStats.relativeBacklogMaxMilliseconds
+        value["mirrorDecodeP95Milliseconds"]=mirrorStats.decodeP95Milliseconds
+        value["mirrorVideoPacketCount"]=mirrorStats.videoPacketCount
+        value["mirrorDecodedFrameCount"]=mirrorStats.decodedFrameCount
         if let data=try? JSONSerialization.data(withJSONObject:value,options:.sortedKeys){try? data.write(to:folder.appendingPathComponent("diagnostic-state.json"),options:.atomic)}
     }
     private func connect(){
@@ -285,6 +294,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if previewsReceived%60==1 {writeDiagnosticState()}
     }
     @objc private func presentMirrorFrame(){
+        performanceCheck?.tick(at:ProcessInfo.processInfo.systemUptime)
         updateCameraTick();detachedApplications?.present()
         if primaryLocked {_=physicalMirror.frames.takeLatest()}
         else if wechatWindow != nil,let frame=physicalMirror.frames.takeLatest(),frame.generation==physicalMirror.incarnation {
@@ -440,13 +450,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard connected && !busy && !stopping else{return}
         let alreadyOpen=wechatWindow != nil && mode == .wechat && mirrorDisplay != nil
         configureWechatWindow(at:point)
+        if alreadyOpen,scan,cameraActive,!paused {
+            status("拖动窗口扫码","桌面相机已运行，移动窗口即可扫码。");return
+        }
         busy=true;cameraSuppressed=false;operationTask?.cancel()
         status("正在打开微信","微信会保留在这个独立窗口里。")
         operationTask=Task {
             do {
                 let endpoint=try await phone.mirrorEndpoint()
                 try await prepareMirror(display:endpoint.display)
-                if !alreadyOpen {
+                // A retained Mac window is not proof that Android still has a
+                // resumed WeChat task (the phone can reclaim/move it meanwhile).
+                let foreground=alreadyOpen ? try await phone.foreground(onVirtualDisplay:true) : nil
+                if !alreadyOpen || foreground?.hasPrefix("com.tencent.mm/") != true {
                     let began=ProcessInfo.processInfo.systemUptime
                     let apps=try await phone.applications()
                     guard let wechat=apps.first(where:{$0.packageName=="com.tencent.mm"}) else {throw ScanError("手机中没有找到微信入口。")}
@@ -474,8 +490,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func returnToPhone(){
         guard connected && !stopping else{return}
+        let checking=performanceTask;checking?.cancel()
         busy=true;refresh();let opening=operationTask;opening?.cancel()
         operationTask=Task {
+            await checking?.value
             await opening?.value
             do {
                 await clearCamera();try await phone.restoreScannerApplications();try Task.checkCancellation()
@@ -522,6 +540,69 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
     }
+
+    @objc private func runPerformanceCheck() {
+        guard performanceTask == nil,connected,!busy,!stopping,screenAccessGranted else {
+            status("自检尚未开始","请先连接手机并打开已授权的桌面扫码窗口。");return
+        }
+        performanceTask=Task { [weak self] in
+            guard let self else{return}
+            var report:[String:Any]=["qrRecognized":false]
+            do {
+                if !cameraActive { enterWechat(scan:true) }
+                let ready=ProcessInfo.processInfo.systemUptime+12
+                while !cameraActive && ProcessInfo.processInfo.systemUptime<ready {
+                    try Task.checkCancellation();try await Task.sleep(nanoseconds:100_000_000)
+                }
+                guard cameraActive,let scanner=wechatWindow else{throw ScanError("微信尚未进入扫一扫；未运行移动测试。")}
+                busy=true
+                await clearCamera()
+                let check=try ScanPerformanceCheck(scanner:scanner);performanceCheck=check
+                await capture.setDiagnosticBoard(CGWindowID(check.board.windowNumber))
+                // Capture starts only now, after the synthetic board is visible.
+                try await capture.prepare();try Task.checkCancellation()
+                cameraSuppressed=false;cameraActive=true;paused=false;busy=false
+                startCameraLoop();status("正在检查流畅度","先往返移动 6 秒，再验证纯文本测试二维码；不会操作登录或支付。")
+                let started=ProcessInfo.processInfo.systemUptime
+                check.start(at:started)
+                while ProcessInfo.processInfo.systemUptime-started<14 {
+                    try Task.checkCancellation()
+                    try await Task.sleep(nanoseconds:200_000_000)
+                    if check.qrVisible,let pixels=latestPhoneFrame {
+                        let component=try await phone.foreground(onVirtualDisplay:true)
+                        if component?.hasPrefix("com.tencent.mm/")==true,component?.lowercased().contains("scanner") != true {
+                            let words=try await Task.detached {try Self.textIn(pixels)}.value
+                            if words.contains(where:{$0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)}) {
+                                report["qrRecognized"]=true;break
+                            }
+                        }
+                    }
+                }
+            } catch { report["failure"]=error.localizedDescription }
+            if let check=performanceCheck {report.merge(check.finish()){_,new in new}}
+            performanceCheck=nil
+            report["captureMilliseconds"]=captureMilliseconds
+            report["transferMilliseconds"]=transferMilliseconds
+            report["cameraFPS"]=cameraFPS
+            report["maximumSendGapMilliseconds"]=maximumCameraGapMilliseconds
+            let mirrorStats=scannerMirror.session.timingSnapshot
+            report["mirrorRelativeBacklogP95Milliseconds"]=mirrorStats.relativeBacklogP95Milliseconds
+            report["mirrorDecodeP95Milliseconds"]=mirrorStats.decodeP95Milliseconds
+            cameraSuppressed=true
+            if connected {await clearCamera()}
+            await capture.setDiagnosticBoard(nil)
+            let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
+            report["updatedAt"]=ISO8601DateFormatter().string(from:Date())
+            if let data=try? JSONSerialization.data(withJSONObject:report,options:[.sortedKeys,.prettyPrinted]) {
+                try? data.write(to:folder.appendingPathComponent("performance-last.json"),options:.atomic)
+            }
+            performanceTask=nil
+            guard connected,!stopping,!Task.isCancelled else{return}
+            busy=false
+            let recognized=report["qrRecognized"] as? Bool == true
+            status("流畅度检查已结束",recognized ? "测试二维码已由手机微信识别，性能数据已保存；桌面相机已暂停。" : "性能数据已保存；本轮未确认手机识别结果，桌面相机已暂停。")
+        }
+    }
     private func startLoop(){
         loop?.cancel()
         loop=Task {
@@ -536,7 +617,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             let scanning=component?.hasPrefix("com.tencent.mm/")==true && component?.lowercased().contains("scanner")==true
                             if scanning && !cameraActive && !cameraSuppressed {startCamera()}
                             else if !scanning {
-                                if cameraActive {await clearCamera();cameraSuppressed=false;status("微信","已离开扫一扫；结果保留在此窗口中。")}
+                                if cameraActive {
+                                    // During the QR phase, leaving Scanner is the
+                                    // expected result. Earlier navigation aborts the test.
+                                    if performanceCheck?.qrVisible != true {
+                                        let checking=performanceTask;checking?.cancel();await checking?.value
+                                    }
+                                    await clearCamera();cameraSuppressed=false;status("微信","已离开扫一扫；结果保留在此窗口中。")
+                                }
                             }
                         } else if Date().timeIntervalSince(lastUserInput)<12 {
                             let component=try await phone.foreground(onVirtualDisplay:false)
@@ -567,8 +655,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func suspendHiddenCamera(){
         guard connected,!stopping,!busy,cameraActive else{return}
+        let checking=performanceTask;checking?.cancel()
         busy=true;cameraSuppressed=true;cameraPump?.stop();refresh()
         operationTask=Task {
+            await checking?.value
             await clearCamera()
             guard connected,!stopping,!Task.isCancelled else{return}
             busy=false;status("桌面相机已暂停","窗口已收起；恢复窗口后点扫码继续。")
@@ -589,17 +679,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cameraTickAt=tick
         if tick>=nextCameraGeometry {
             nextCameraGeometry=tick+1.0/30
-            do {pump.publish(try DesktopCaptureTarget.current(for:control.desktopCaptureRect))}
+            do {
+                let rect=control.desktopCaptureRect
+                performanceCheck?.recordCaptureRect(rect,at:tick)
+                pump.publish(try DesktopCaptureTarget.current(for:rect))
+            }
             catch {pump.fail(error)}
         }
         let snapshot=pump.snapshot(),stats=snapshot.statistics
+        performanceCheck?.recordPump(stats,at:tick)
         framesSent=cameraFramesBase+stats.sent;cameraFPS=stats.fps
         captureMilliseconds=stats.captureMilliseconds;transferMilliseconds=stats.transferMilliseconds
         droppedCameraFrames=stats.dropped;maximumCameraGapMilliseconds=stats.maximumGapMilliseconds
         if let error=snapshot.failure {
+            let checking=performanceTask;checking?.cancel()
             pump.stop();cameraPump=nil;cameraSuppressed=true;cameraLoop?.cancel()
             cameraActive=false;paused=true;busy=true;refresh()
             operationTask=Task {
+                await checking?.value
                 await clearCamera()
                 guard connected,!stopping else{return}
                 busy=false;status("桌面相机已暂停",error.localizedDescription)
@@ -694,7 +791,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 tappedScanner=true;continue
             }
             let home=words.contains{$0.value.contains("通讯录") && $0.rect.midY>1000} && words.contains{$0.value.contains("发现") && $0.rect.midY>1000}
-            if !openedMenu,!tappedScanner,home,let title=words.filter({$0.value.hasPrefix("微信") && $0.rect.midY<250}).min(by:{$0.rect.minY<$1.rect.minY}) {
+            // Android may add a window caption above WeChat's own toolbar.
+            // The lower matching title is the app toolbar; tapping the caption
+            // instead leaves the menu closed until the navigation timeout.
+            if !openedMenu,!tappedScanner,home,let title=words.filter({$0.value.hasPrefix("微信") && $0.rect.midY<250}).max(by:{$0.rect.minY<$1.rect.minY}) {
                 mirror.tap(x:665.0/720,y:Double(title.rect.midY/1280))
                 openedMenu=true
             }
@@ -707,8 +807,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard connected && !busy else{return}
         guard mode == .wechat else{enterWechat(scan:true);return}
         if cameraActive {
+            let checking=performanceTask;checking?.cancel()
             cameraSuppressed=true;busy=true;refresh()
             operationTask=Task {
+                await checking?.value
                 await clearCamera()
                 guard connected && !stopping && !Task.isCancelled else{return}
                 busy=false;status("桌面相机已暂停","镜像仍可操作，点桌面扫码可再次启动。")
@@ -717,9 +819,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func back(){
         guard connected && !busy else{return}
+        let checking=performanceTask;checking?.cancel()
         busy=true;cameraSuppressed=true
         refresh()
         operationTask=Task {
+            await checking?.value
             await clearCamera()
             guard connected && !stopping && !Task.isCancelled else{return}
             mirror.key(4)
@@ -755,12 +859,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func disconnect(preserveError:Bool=false){
         guard !stopping else{return}
+        let checking=performanceTask;checking?.cancel()
         stopping=true;busy=true;paused=true;cameraActive=false;scanGeneration+=1;mirrorGeneration+=1;physicalMirror.frames.stop();scannerMirror.frames.stop()
         let chooser=connectionWindow;chooser?.close();connectionWindow=nil
         connectionTask?.cancel();catalogTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;cameraLoop?.cancel()
         refresh()
         if !preserveError {status("正在断开","正在结束手机镜像并清理临时连接…")}
         Task {
+            await checking?.value
             let chooserClean=await chooser?.waitForCleanup() ?? true
             await capture.stop();await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
             var problem=await phoneSession?.disconnect() ?? ""
@@ -795,12 +901,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool)->Bool {showMainWindow();return true}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
+        let checking=performanceTask;checking?.cancel()
         stopping=true;let chooser=connectionWindow;chooser?.close();connectionWindow=nil
         connectionTask?.cancel();catalogTask?.cancel();operationTask?.cancel();loop?.cancel();cameraPump?.stop();cameraPump=nil;cameraLoop?.cancel()
         paused=true;cameraActive=false;scanGeneration+=1;mirrorGeneration+=1;busy=true
         physicalMirror.frames.stop();scannerMirror.frames.stop();previewTimer?.invalidate();previewTimer=nil
         status("正在退出","正在停止镜像并清理手机临时连接…")
         Task {
+            await checking?.value
             let chooserClean=await chooser?.waitForCleanup() ?? true
             await capture.stop();await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
             var problem=await phoneSession?.disconnect() ?? ""
