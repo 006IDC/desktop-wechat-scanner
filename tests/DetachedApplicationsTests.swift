@@ -23,6 +23,7 @@ actor PhoneSession {
         return AndroidAppDisplay(id: 7, width: 1080, height: 1920, dpi: 420)
     }
     func mirrorEndpoint(display: Int) throws -> Endpoint { Endpoint() }
+    func directMirror(display: Int) throws -> DirectMirrorDescriptor? { nil }
     func launchApplication(_ app: AndroidApplication, on display: Int) throws {}
     func closeAppDisplay(_ display: Int) throws { closed.append(display) }
 }
@@ -39,6 +40,7 @@ final class MirrorSession: @unchecked Sendable {
     func swipe(x1: Double, y1: Double, x2: Double, y2: Double) {}
     func key(_ value: Int) {}
     func startVideo(adbURL: URL, serverURL: URL, serial: String, displayID: Int, serverSocket: String?,
+                    direct: DirectMirrorDescriptor?,
                     onFrame: @escaping @Sendable (CVPixelBuffer) -> Void,
                     onFailure: @escaping @Sendable (String) -> Void) async throws { try Task.checkCancellation() }
     func stop() async {}

@@ -474,7 +474,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func returnToPhone(){
         guard connected && !stopping else{return}
-        busy=true;let opening=operationTask;opening?.cancel()
+        busy=true;refresh();let opening=operationTask;opening?.cancel()
         operationTask=Task {
             await opening?.value
             do {
