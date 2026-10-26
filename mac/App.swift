@@ -66,6 +66,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var scanNavigation:[[String:Any]]=[]
     private var scannerNavigationMilliseconds=0.0
     private var savedDiagnosticToolbar=false
+    private var diagnosticExitStatus:Int32=0
+    private let diagnosticWriter=DiagnosticStateWriter(fileURL:FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0]
+        .appendingPathComponent("006IDC/DesktopWeChatScanner/diagnostic-state.json"))
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         buildMenu();control.window?.delegate=self
@@ -96,7 +99,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         control.showWindow(nil);refresh();writeDiagnosticState()
         NSApp.activate(ignoringOtherApps:true)
         refreshScreenAccess()
-        if CommandLine.arguments.contains("--run-scan-diagnostic") {
+        if CommandLine.arguments.contains("--run-scan-diagnostic") || CommandLine.arguments.contains("--run-desktop-diagnostic") {
             launchDiagnosticGeneration+=1
             let generation=launchDiagnosticGeneration
             launchDiagnosticTask=Task { await runLaunchDiagnostic(generation:generation) }
@@ -129,15 +132,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             try await manager.connect(endpoint:remembered.endpoint);try check()
             let devices=try await manager.devices();try check()
             guard let device=devices.first(where:{$0.authorization == .authorized && $0.serial==remembered.endpoint}) else{throw ScanError("此前配对的手机当前不可连接。")}
-            connectDevice(device,adb:adb,allowLockedApplications:UserDefaults.standard.bool(forKey:"allowsLockedApplications.v1"),diagnostic:true)
+            let desktopDiagnostic=CommandLine.arguments.contains("--run-desktop-diagnostic")
+            connectDevice(device,adb:adb,allowLockedApplications:UserDefaults.standard.bool(forKey:"allowsLockedApplications.v1"),diagnostic:!desktopDiagnostic)
             await connectionTask?.value;try check()
             guard connected,!busy,!stopping else{throw ScanError("手机诊断连接未就绪。")}
-            runPerformanceCheck()
-            await performanceTask?.value;try check()
+            if desktopDiagnostic {await runDesktopDiagnostic()}
+            else {runPerformanceCheck();await performanceTask?.value}
+            try check()
         } catch is CancellationError {return} catch {
+            diagnosticExitStatus=1
             let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
             let report:[String:Any]=["qrRecognized":false,"failure":error.localizedDescription,"updatedAt":ISO8601DateFormatter().string(from:Date())]
-            if let data=try? JSONSerialization.data(withJSONObject:report,options:.sortedKeys){try? data.write(to:folder.appendingPathComponent("performance-last.json"),options:.atomic)}
+            let file=CommandLine.arguments.contains("--run-desktop-diagnostic") ? "desktop-performance-last.json":"performance-last.json"
+            if let data=try? JSONSerialization.data(withJSONObject:report,options:.sortedKeys){try? data.write(to:folder.appendingPathComponent(file),options:.atomic)}
         }
         guard generation==launchDiagnosticGeneration,!stopping,!Task.isCancelled else{return}
         launchDiagnosticTask=nil
@@ -259,8 +266,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         control.setMode(cameraActive ? "桌面相机" : (desktopMode ? "手机桌面" : (mode == .phone ? "手机镜像" : "手机应用")))
     }
     private func writeDiagnosticState(){
-        let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
-        try? FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
         let ticks=cameraTickGaps.sorted()
         let tickP95=ticks.isEmpty ? 0:ticks[min(ticks.count-1,Int(Double(ticks.count)*0.95))]
         var value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":screenAccessGranted,"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"localCameraPreview":false,"independentApplicationsWhenLocked":independentApplicationsWhenLocked,"primaryLocked":primaryLocked,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"cameraTickP95Milliseconds":tickP95,"maximumCameraTickMilliseconds":maximumCameraTickMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
@@ -272,7 +277,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         value["mirrorDecodeP95Milliseconds"]=mirrorStats.decodeP95Milliseconds
         value["mirrorVideoPacketCount"]=mirrorStats.videoPacketCount
         value["mirrorDecodedFrameCount"]=mirrorStats.decodedFrameCount
-        if let data=try? JSONSerialization.data(withJSONObject:value,options:.sortedKeys){try? data.write(to:folder.appendingPathComponent("diagnostic-state.json"),options:.atomic)}
+        diagnosticWriter.submit(value)
     }
     private func connect(){
         guard !connected && !busy else{return}
@@ -633,6 +638,121 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             }
         }
+    }
+
+    /// Explicit integration test of the ordinary HOME -> application -> native
+    /// scanner route. Only our own window moves; no OS input is synthesized.
+    /// Capture is restricted to the synthetic board before a scanner opens.
+    private func runDesktopDiagnostic() async {
+        var report:[String:Any]=["test":"desktop-native-app-flow","physicalMouseDragMeasured":false]
+        var applications=[[String:Any]]()
+        do {
+            guard desktopMode,screenAccessGranted else{throw ScanError("通用桌面诊断尚未就绪。")}
+            report["primaryLockedBefore"]=try await !phone.primaryUserUnlocked()
+            let homeDeadline=ProcessInfo.processInfo.systemUptime+10
+            while !applicationPickerVisible && ProcessInfo.processInfo.systemUptime<homeDeadline {
+                try Task.checkCancellation();try await Task.sleep(nanoseconds:100_000_000)
+            }
+            report["applicationPickerVisible"]=applicationPickerVisible
+            let apps=try await phone.applications()
+            for package in ["com.tencent.mm","com.eg.android.AlipayGphone"] {
+                try Task.checkCancellation()
+                guard let app=apps.first(where:{$0.packageName==package}) else{throw ScanError("测试应用未安装。")}
+                var item:[String:Any]=["package":package,"qrRecognized":false]
+                do {
+                    cameraSuppressed=true
+                    openMainApplication(app);await operationTask?.value
+                    try Task.checkCancellation()
+                    guard connected,!busy,!stopping else{throw ScanError("测试应用未打开。")}
+                    let check=try ScanPerformanceCheck(scanner:mainControl);performanceCheck=check
+                    await capture.setDiagnosticBoard(CGWindowID(check.board.windowNumber))
+                    cameraSuppressed=false
+                    try await navigateDiagnosticScanner(package:package)
+                    let deadline=ProcessInfo.processInfo.systemUptime+8
+                    while !cameraActive && ProcessInfo.processInfo.systemUptime<deadline {
+                        try Task.checkCancellation();try await Task.sleep(nanoseconds:100_000_000)
+                    }
+                    guard cameraActive,cameraWindow === mainControl else{throw ScanError("应用内扫一扫未自动启用桌面相机。")}
+                    item["automaticCameraStarted"]=true
+                    let started=ProcessInfo.processInfo.systemUptime
+                    check.start(at:started)
+                    while ProcessInfo.processInfo.systemUptime-started<14 {
+                        try Task.checkCancellation();try await Task.sleep(nanoseconds:200_000_000)
+                        if check.qrVisible,let pixels=latestPhoneFrame {
+                            let found=try await Task.detached {
+                                try ScannerNavigationOCR.recognize(pixels).contains {
+                                    $0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)
+                                }
+                            }.value
+                            if found {item["qrRecognized"]=true;break}
+                        }
+                    }
+                } catch {item["failure"]=error.localizedDescription}
+                if let check=performanceCheck {item.merge(check.finish()){_,new in new}}
+                performanceCheck=nil;cameraSuppressed=true
+                await clearCamera();await capture.setDiagnosticBoard(nil)
+                applications.append(item)
+                // This is the same Home command as the ordinary toolbar.
+                home();try await Task.sleep(nanoseconds:500_000_000)
+            }
+            report["primaryLockedAfter"]=try await !phone.primaryUserUnlocked()
+        } catch {report["failure"]=error.localizedDescription}
+        if let check=performanceCheck {_=check.finish()};performanceCheck=nil
+        cameraSuppressed=true;await clearCamera();await capture.setDiagnosticBoard(nil)
+        report["applications"]=applications
+        let passed=applications.count==2 && applications.allSatisfy {
+            $0["automaticCameraStarted"] as? Bool == true && $0["qrRecognized"] as? Bool == true && $0["failure"] == nil
+        } && report["failure"] == nil
+        report["passed"]=passed
+        if !passed {diagnosticExitStatus=1}
+        report["screenPermission"]=screenAccessGranted
+        report["updatedAt"]=ISO8601DateFormatter().string(from:Date())
+        let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
+        if let data=try? JSONSerialization.data(withJSONObject:report,options:[.prettyPrinted,.sortedKeys]) {
+            try? data.write(to:folder.appendingPathComponent("desktop-performance-last.json"),options:.atomic)
+        }
+    }
+    private func navigateDiagnosticScanner(package:String) async throws {
+        var plusTapped=false,scanTapped=false,returnedFromResult=false
+        let deadline=ProcessInfo.processInfo.systemUptime+10
+        try await Task.sleep(nanoseconds:500_000_000)
+        while ProcessInfo.processInfo.systemUptime<deadline {
+            try Task.checkCancellation()
+            let state=try await phone.cameraState()
+            if let scanner=state.scannerActivity(),scanner.component.hasPrefix(package+"/") {return}
+            guard let display=await phone.scannerDisplay()?.id,
+                  state.activities.contains(where:{$0.displayId==display && $0.component.hasPrefix(package+"/")}) else {
+                try await Task.sleep(nanoseconds:120_000_000);continue
+            }
+            if let pixels=latestPhoneFrame,!scanTapped {
+                let point=try await Task.detached { () -> (CGPoint?,Bool,Bool) in
+                    let words=try ScannerNavigationOCR.recognize(pixels)
+                    let ownResult=words.contains{$0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)}
+                    if ownResult {return (nil,false,true)}
+                    // Alipay business pages may also contain this text. Require
+                    // its home navigation and payment toolbar before any tap.
+                    let alipayHome=package != "com.eg.android.AlipayGphone" || (
+                        words.contains{$0.value=="首页" && $0.rect.midY>1000} &&
+                        words.contains{$0.value=="我的" && $0.rect.midY>1000} &&
+                        words.contains{["收付款","收付钱"].contains($0.value) && $0.rect.midY<400})
+                    if alipayHome,let scan=words.first(where:{$0.value.replacingOccurrences(of:" ",with:"")=="扫一扫" && $0.rect.midY<(package=="com.eg.android.AlipayGphone" ? 400:800)}) {
+                        return (CGPoint(x:scan.rect.midX/720,y:scan.rect.midY/1280),false,false)
+                    }
+                    if package=="com.tencent.mm",let plus=try ScannerNavigationOCR.plusButton(in:pixels,homeWords:words) {
+                        return (CGPoint(x:plus.x/720,y:plus.y/1280),true,false)
+                    }
+                    return (nil,false,false)
+                }.value
+                if point.2,!returnedFromResult {scannerMirror.session.key(4);returnedFromResult=true}
+                else if let target=point.0,!(point.1 && plusTapped) {
+                    scannerMirror.session.tap(x:target.x,y:target.y)
+                    if point.1 {plusTapped=true}else{scanTapped=true}
+                    try await Task.sleep(nanoseconds:400_000_000)
+                }
+            }
+            try await Task.sleep(nanoseconds:120_000_000)
+        }
+        throw ScanError("未确认真实应用的扫一扫入口，测试未点击其他内容。")
     }
 
     @objc private func runPerformanceCheck() {
@@ -1123,6 +1243,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool)->Bool {showMainWindow();return true}
+    func applicationWillTerminate(_ notification:Notification) {
+        if diagnosticExitStatus != 0 {exit(diagnosticExitStatus)}
+    }
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
         if terminationReady {return .terminateNow}
         guard !terminating else{return .terminateCancel}
@@ -1145,9 +1268,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !networkProblem.isEmpty {problem += " " + networkProblem}
             if !chooserClean {problem += " 部分未选中的无线连接未清理，请在手机关闭无线调试。"}
             if !problem.isEmpty {
+                if CommandLine.arguments.contains("--run-desktop-diagnostic") {diagnosticExitStatus=1}
                 let alert=NSAlert();alert.messageText="连接已停止，手机清理待恢复";alert.informativeText=problem
                 alert.addButton(withTitle:"退出，下次连接时清理");alert.runModal()
             }
+            await diagnosticWriter.flush()
             if relaunchAfterExit {scheduleRelaunch()}
             terminationReady=true
             NSApp.terminate(nil)
