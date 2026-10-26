@@ -84,7 +84,7 @@ def main():
         if hashlib.sha1(certificate).hexdigest().upper() != expected_identity:
             raise RuntimeError('Release certificate differs from persistent identity')
         requirement = 'identifier "com.idc006.DesktopWeChatScanner" and certificate root = H"'+expected_identity+'"'
-        subprocess.run(['codesign', '--verify', '--strict', '-R', requirement, str(app)], check=True)
+        subprocess.run(['codesign', '--verify', '--strict', '-R='+requirement, str(app)], check=True)
         resources = app/'Contents/Resources'
         if not (resources/'adb/bin/adb').is_file():
             raise RuntimeError('Missing bundled ADB')
