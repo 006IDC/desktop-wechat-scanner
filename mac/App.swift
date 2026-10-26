@@ -488,6 +488,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.onTouch={ [weak self] action,x,y in
             guard let self,self.connected,!self.stopping else{return}
             self.lastUserInput=Date();self.scannerMirror.session.touch(action:action,x:x,y:y)
+            // Finish the real gesture before restoring the full phone view.
+            // Menus/gallery can remain in ScannerUI, so activity polling alone
+            // cannot know that the transparent aperture would hide them.
+            if action==1,self.cameraActive,ScanPreviewAperture.isControl(at:CGPoint(x:x,y:y)) {
+                self.togglePause()
+            }
         }
         window.onTap={ [weak self] x,y in self?.tap(x,y) }
         window.onSwipe={ [weak self] x1,y1,x2,y2 in

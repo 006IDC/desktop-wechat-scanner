@@ -58,8 +58,7 @@ final class DirectDisplayStream implements AutoCloseable {
             codec = MediaCodec.createEncoderByType("video/avc");
             MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-            // Share the wireless transport with desktop camera uploads.
-            format.setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000);
+            format.setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000);
             format.setInteger(MediaFormat.KEY_FRAME_RATE, 60);
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);

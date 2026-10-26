@@ -27,14 +27,23 @@ import AVFoundation
             guard let view = preview(in: root), let layers = view.layer?.sublayers else { fatalError("No preview layers") }
             let masks = layers.compactMap { $0.mask as? CAShapeLayer }
             require(masks.count == 2, "Both still and video layers need a mask")
-            for fraction: CGFloat in [0.10, 0.20, 0.50, 0.70, 0.80, 0.90] {
-                let point = view.convertToLayer(CGPoint(x: view.bounds.midX, y: view.bounds.height * fraction))
-                let keepsPhonePixels = fraction < 0.16 || fraction >= 0.75
+            let samples: [(CGFloat, CGFloat, Bool)] = [
+                (0.02, 0.087, false), (0.079, 0.087, true), (0.15, 0.087, false),
+                (0.927, 0.087, true), (0.50, 0.50, false), (0.50, 0.82, false),
+                (0.30, 0.862, true), (0.65, 0.862, false),
+                (0.871, 0.862, true), (0.50, 0.905, false), (0.50, 0.95, true)
+            ]
+            for (x, y, keepsPhonePixels) in samples {
+                let point = view.convertToLayer(CGPoint(x: view.bounds.width * x, y: view.bounds.height * y))
                 for mask in masks {
                     require(mask.path?.contains(point, using: .evenOdd) == keepsPhonePixels,
-                            "Native view/layer mask mismatch at \(fraction); likely a second Y flip")
+                            "Native mask mismatch at (\(x), \(y)); likely a second Y flip or a lost control island")
                 }
             }
+            let outsidePillCorner = view.convertToLayer(CGPoint(x: view.bounds.width * 0.055,
+                                                                 y: view.bounds.height * 0.835))
+            require(masks.allSatisfy { $0.path?.contains(outsidePillCorner, using: .evenOdd) == false },
+                    "Video island became a rectangular background patch")
             require(window.level == .floating && window.collectionBehavior == [.canJoinAllApplications],
                     "Scanner is not eligible to float over another app")
             control.setLocalScanPreview(false)
@@ -43,6 +52,6 @@ import AVFoundation
                     "Leaving scanner did not restore original window behavior")
         }
         require(!window.isVisible && !NSApp.isActive, "Fixture displayed or activated a window")
-        print("PASS native mask alignment for both layers/aspects, retained controls and window behavior restoration; no displayed window")
+        print("PASS continuous desktop mask and four real video-control islands for both layers/aspects, with restoration; no displayed window")
     }
 }

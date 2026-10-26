@@ -10,10 +10,17 @@ private enum ViewStyle {
     static let phoneRatio: CGFloat = 9.0 / 16.0
 }
 
-/// The live camera occupies this part of the mirrored phone image. Coordinates
-/// are normalized from its top-left corner, independent of window letterboxing.
+/// The scanner surface shows the live desktop continuously above WeChat's
+/// bottom tabs. Keep only the real controls as small islands of mirrored video.
+/// Coordinates are normalized from the phone image's top-left corner.
 enum ScanPreviewAperture {
-    static let standard = CGRect(x: 0, y: 0.16, width: 1, height: 0.59)
+    static let standard = CGRect(x: 0, y: 0, width: 1, height: 0.918)
+    static let buttonIslands: [CGRect] = [
+        CGRect(x: 0.079 - 0.0315, y: 0.087 - 0.0145, width: 0.063, height: 0.029),
+        CGRect(x: 0.927 - 0.0315, y: 0.087 - 0.0145, width: 0.063, height: 0.029),
+        CGRect(x: 0.052, y: 0.832, width: 0.52, height: 0.061),
+        CGRect(x: 0.804, y: 0.832, width: 0.135, height: 0.061)
+    ]
 
     static func valid(_ rect: CGRect) -> Bool {
         rect.minX.isFinite && rect.minY.isFinite && rect.width.isFinite && rect.height.isFinite &&
@@ -32,6 +39,13 @@ enum ScanPreviewAperture {
         guard enabled else { return nil }
         let result = opening(in: image, normalized: rect)
         return result.isEmpty ? nil : result
+    }
+    static func isControl(at point: CGPoint) -> Bool {
+        standard.maxY <= point.y || buttonIslands.contains{$0.contains(point)}
+    }
+
+    static func retainedButtons(in image: CGRect, opening: CGRect) -> [CGRect] {
+        buttonIslands.map { self.opening(in: image, normalized: $0) }.filter { opening.contains($0) }
     }
 }
 
@@ -74,7 +88,7 @@ private final class PhoneWindowBackgroundView: NSView {
                                                                   enabled: localScanPreview) {
             let opening = convert(localOpening, from: preview)
             if opening.width > 0, opening.height > 0 {
-                background.append(NSBezierPath(roundedRect: opening, xRadius: 12, yRadius: 12))
+                background.append(NSBezierPath(rect: opening))
                 background.windingRule = .evenOdd
             }
         }
@@ -244,6 +258,10 @@ private final class PhonePreviewView: NSView {
             let path = CGMutablePath()
             path.addRect(bounds)
             path.addRect(opening)
+            for button in ScanPreviewAperture.retainedButtons(in: imageRect, opening: opening) {
+                let radius = min(button.width, button.height) / 2
+                path.addRoundedRect(in: button, cornerWidth: radius, cornerHeight: radius)
+            }
             mask.frame = bounds
             mask.fillRule = .evenOdd
             mask.path = path

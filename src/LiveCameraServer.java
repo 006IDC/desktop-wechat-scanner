@@ -529,7 +529,9 @@ public final class LiveCameraServer {
     private boolean handleSession(LocalSocket socket) throws IOException {
         socket.setSoTimeout(SOCKET_IDLE_MS);
         DataInputStream input = new DataInputStream(socket.getInputStream());
-        DataOutputStream output = new DataOutputStream(socket.getOutputStream());
+        // One small ACK must not become separate forwarded writes for status,
+        // length and timing. reply() still flushes each complete response.
+        DataOutputStream output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 16 * 1024));
         while (!stopping) {
             int command;
             try { command = input.readUnsignedByte(); } catch (EOFException eof) { return false; }
