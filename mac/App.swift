@@ -714,6 +714,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func navigateDiagnosticScanner(package:String) async throws {
         var plusTapped=false,scanTapped=false,returnedFromResult=false
+        var observedHomeLabels=Set<String>()
         let deadline=ProcessInfo.processInfo.systemUptime+10
         try await Task.sleep(nanoseconds:500_000_000)
         while ProcessInfo.processInfo.systemUptime<deadline {
@@ -725,10 +726,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 try await Task.sleep(nanoseconds:120_000_000);continue
             }
             if let pixels=latestPhoneFrame,!scanTapped {
-                let point=try await Task.detached { () -> (CGPoint?,Bool,Bool) in
+                let point=try await Task.detached { () -> (CGPoint?,Bool,Bool,[String]) in
                     let words=try ScannerNavigationOCR.recognize(pixels)
+                    let known=["首页","消息","生活","理财","我的","支付宝","收付款","收付钱","扫一扫"]
+                    let labels=words.filter{known.contains($0.value)}.map(\.value)
                     let ownResult=words.contains{$0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)}
-                    if ownResult {return (nil,false,true)}
+                    if ownResult {return (nil,false,true,labels)}
                     // Alipay business pages may also contain this text. Require
                     // its home navigation and payment toolbar before any tap.
                     let alipayHome=package != "com.eg.android.AlipayGphone" || (
@@ -736,13 +739,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         words.contains{$0.value=="我的" && $0.rect.midY>1000} &&
                         words.contains{["收付款","收付钱"].contains($0.value) && $0.rect.midY<400})
                     if alipayHome,let scan=words.first(where:{$0.value.replacingOccurrences(of:" ",with:"")=="扫一扫" && $0.rect.midY<(package=="com.eg.android.AlipayGphone" ? 400:800)}) {
-                        return (CGPoint(x:scan.rect.midX/720,y:scan.rect.midY/1280),false,false)
+                        return (CGPoint(x:scan.rect.midX/720,y:scan.rect.midY/1280),false,false,labels)
                     }
                     if package=="com.tencent.mm",let plus=try ScannerNavigationOCR.plusButton(in:pixels,homeWords:words) {
-                        return (CGPoint(x:plus.x/720,y:plus.y/1280),true,false)
+                        return (CGPoint(x:plus.x/720,y:plus.y/1280),true,false,labels)
                     }
-                    return (nil,false,false)
+                    return (nil,false,false,labels)
                 }.value
+                observedHomeLabels.formUnion(point.3)
                 if point.2,!returnedFromResult {scannerMirror.session.key(4);returnedFromResult=true}
                 else if let target=point.0,!(point.1 && plusTapped) {
                     scannerMirror.session.tap(x:target.x,y:target.y)
@@ -752,7 +756,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             try await Task.sleep(nanoseconds:120_000_000)
         }
-        throw ScanError("未确认真实应用的扫一扫入口，测试未点击其他内容。")
+        throw ScanError("未确认真实应用的扫一扫入口，测试未点击其他内容。已见固定标签："+observedHomeLabels.sorted().joined(separator:","))
     }
 
     @objc private func runPerformanceCheck() {
@@ -916,7 +920,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
                         failures=0
                     } catch {failures+=1}
-                    nextActivity=Date().addingTimeInterval(desktopMode ? 0.1 : (mode == .wechat ? 0.25:0.7))
+                    // An active scanner shares this socket with desktop frames.
+                    // Keep entry detection quick, but avoid ten competing state
+                    // round trips per second while scanning. Android still
+                    // invalidates ownership/activity on every submitted frame.
+                    nextActivity=Date().addingTimeInterval(desktopMode ? (cameraActive ? 0.25:0.1) : (mode == .wechat ? 0.25:0.7))
                 }
                 if Date()>=nextHeartbeat && !Task.isCancelled {
                     do {try await phone.heartbeat();failures=0} catch {failures+=1}
