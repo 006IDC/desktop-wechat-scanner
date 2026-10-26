@@ -671,7 +671,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 var item:[String:Any]=["package":package,"qrRecognized":false]
                 do {
                     cameraSuppressed=true
-                    openMainApplication(app);await operationTask?.value
+                    try await performMainApplicationOpen(app)
                     try Task.checkCancellation()
                     guard connected,!busy,!stopping else{throw ScanError("测试应用未打开。")}
                     let check=try ScanPerformanceCheck(scanner:mainControl);performanceCheck=check
@@ -897,20 +897,34 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func openMainApplication(_ app:AndroidApplication) {
         guard connected,!busy,!stopping else{return}
-        busy=true;status("正在打开 \(app.name)","应用在手机运行，画面保留在当前窗口。")
+        busy=true;refresh()
         operationTask=Task { [self] in
             do {
-                await clearCamera()
-                guard let display=await phone.scannerDisplay()?.id else{throw ScanError("手机桌面尚未准备好。")}
-                try await phone.launchApplication(app,on:display);try Task.checkCancellation()
-                guard connected,!stopping else{return}
-                applicationPickerVisible=false;mainControl.hideApplicationPicker()
-                busy=false;status(app.name,"直接操作手机应用。")
+                try await performMainApplicationOpen(app)
             } catch {
-                guard connected,!stopping else{return}
+                guard connected,!stopping,!Task.isCancelled else{return}
                 busy=false;status("应用打开未完成",error.localizedDescription)
             }
         }
+    }
+    /// Shared by a user selection and the explicit integration diagnostic. An
+    /// unsuccessful launch must propagate before any scanner navigation begins.
+    private func performMainApplicationOpen(_ app:AndroidApplication) async throws {
+        try Task.checkCancellation()
+        guard connected,!stopping else{throw ScanError("手机暂时无法打开应用。")}
+        let generation=mirrorGeneration
+        busy=true;status("正在打开 \(app.name)","应用在手机运行，画面保留在当前窗口。")
+        defer {if connected,!stopping,mirrorGeneration==generation {busy=false;refresh()}}
+        await clearCamera()
+        try Task.checkCancellation()
+        guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
+        guard let display=await phone.scannerDisplay()?.id else{throw ScanError("手机桌面尚未准备好。")}
+        try Task.checkCancellation()
+        guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
+        try await phone.launchApplication(app,on:display);try Task.checkCancellation()
+        guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
+        applicationPickerVisible=false;mainControl.hideApplicationPicker()
+        status(app.name,"直接操作手机应用。")
     }
     private func startLoop(){
         loop?.cancel()
@@ -1305,9 +1319,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !networkProblem.isEmpty {problem += " " + networkProblem}
             if !chooserClean {problem += " 部分未选中的无线连接未清理，请在手机关闭无线调试。"}
             if !problem.isEmpty {
-                if CommandLine.arguments.contains("--run-desktop-diagnostic") {diagnosticExitStatus=1}
-                let alert=NSAlert();alert.messageText="连接已停止，手机清理待恢复";alert.informativeText=problem
-                alert.addButton(withTitle:"退出，下次连接时清理");alert.runModal()
+                let diagnostic=CommandLine.arguments.contains("--run-desktop-diagnostic") || CommandLine.arguments.contains("--run-scan-diagnostic")
+                if diagnostic {diagnosticExitStatus=1}
+                else {
+                    let alert=NSAlert();alert.messageText="连接已停止，手机清理待恢复";alert.informativeText=problem
+                    alert.addButton(withTitle:"退出，下次连接时清理");alert.runModal()
+                }
+            }
+            if CommandLine.arguments.contains("--run-desktop-diagnostic") {
+                let file=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0]
+                    .appendingPathComponent("006IDC/DesktopWeChatScanner/desktop-performance-last.json")
+                if let data=try? Data(contentsOf:file),var report=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any] {
+                    report["cleanupSucceeded"]=problem.isEmpty
+                    if !problem.isEmpty {report["passed"]=false}
+                    let writer=DiagnosticStateWriter(fileURL:file);writer.submit(report);await writer.flush()
+                }
             }
             connected=false;busy=false
             status(problem.isEmpty ? "已退出":"已退出，清理待恢复",problem)

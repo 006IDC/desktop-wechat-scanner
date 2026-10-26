@@ -565,6 +565,10 @@ actor PhoneSession {
     private func moveTask(_ id: Int, to display: Int, expectedRoot: Int? = nil) throws {
         let snapshot = try tasks()
         guard let task = snapshot.first(where: { $0.id == id }) else { return }
+        guard task.userID == 0, !task.rootContainsOtherUsers,
+              snapshot.filter({ $0.rootID == task.rootID }).allSatisfy({ $0.userID == 0 && !$0.rootContainsOtherUsers }) else {
+            throw ScanError("任务容器包含其他手机用户，不能移动。")
+        }
         guard expectedRoot == nil || task.rootID == expectedRoot else { throw ScanError("应用任务容器已变化，已保留恢复记录。") }
         // Android may already have returned the task while a window is closing.
         // Moving a root to its current display throws instead of being a no-op.
@@ -580,11 +584,11 @@ actor PhoneSession {
         try requireApplicationAccess(on:target)
         // Revalidate against the authenticated launcher catalog, never execute an arbitrary component.
         guard let channel, try catalog(channel).contains(where: { $0.canonicalComponent == app.canonicalComponent }) else { throw ScanError("手机主用户中未找到此应用入口。") }
-        let before = try tasks()
-        let moving = before.filter { $0.packageName == app.packageName && $0.display != target }
+        let before = try tasks(requiredDisplay: target)
+        let moving = before.filter { $0.userID == 0 && $0.packageName == app.packageName && $0.display != target }
         let groups = Dictionary(grouping: moving, by: \.rootID)
         for root in groups.keys {
-            guard before.filter({ $0.rootID == root }).allSatisfy({ $0.packageName == app.packageName && $0.display != target }) else {
+            guard before.filter({ $0.rootID == root }).allSatisfy({ $0.userID == 0 && !$0.rootContainsOtherUsers && $0.packageName == app.packageName && $0.display != target }) else {
                 throw ScanError("此应用与其他应用共享任务容器，无法安全地单独移入窗口。")
             }
         }
@@ -600,7 +604,7 @@ actor PhoneSession {
         for root in groups.keys.sorted() {
             guard let group = groups[root], let representative = group.first else { continue }
             let current = try tasks().filter { $0.rootID == root }
-            guard current.allSatisfy({ task in group.contains(where: { $0.id == task.id && $0.packageName == task.packageName && $0.display == task.display }) }) else {
+            guard current.allSatisfy({ task in task.userID == 0 && !task.rootContainsOtherUsers && group.contains(where: { $0.id == task.id && $0.packageName == task.packageName && $0.display == task.display }) }) else {
                 throw ScanError("应用任务在移动前发生变化，已保留恢复记录。")
             }
             try moveTask(representative.id, to: target, expectedRoot: root)
@@ -609,8 +613,8 @@ actor PhoneSession {
         guard !result.lowercased().contains("error:"), !result.lowercased().contains("exception") else { throw ScanError("手机应用启动失败。") }
         for _ in 0..<8 {
             let activityDump = try shell("dumpsys activity activities")
-            let after = try AndroidTaskSnapshot.parseChecked(activityDump)
-            for task in after where task.packageName == app.packageName && task.display == target && !(recovery?.appTasks?.contains(where: { $0.id == task.id }) ?? false) {
+            let after = try AndroidTaskSnapshot.parseChecked(activityDump, requiredDisplay: target)
+            for task in after where task.userID == 0 && !task.rootContainsOtherUsers && task.packageName == app.packageName && task.display == target && !(recovery?.appTasks?.contains(where: { $0.id == task.id }) ?? false) {
                 appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: 0, packageName: app.packageName, ownedDisplay: target))
                 try save()
             }
@@ -621,6 +625,9 @@ actor PhoneSession {
     }
     private func restoreTasks(on target: Int) throws {
         let snapshot = try tasks(requiredDisplay: target)
+        guard snapshot.filter({ $0.display == target }).allSatisfy({ $0.userID == 0 && !$0.rootContainsOtherUsers }) else {
+            throw ScanError("应用窗口包含其他手机用户，已保留窗口和恢复记录。")
+        }
         let recorded = recovery?.appTasks ?? []
         // Native secondary HOME belongs to the owned display itself. Android
         // destroys it with that display; never move it onto the physical phone.
@@ -643,7 +650,7 @@ actor PhoneSession {
         for root in groups.keys.sorted() {
             guard let group = groups[root], let representative = group.first, let destination = destinations[root] else { continue }
             let current = try tasks().filter { $0.rootID == root }
-            guard current.allSatisfy({ task in group.contains(where: { $0.id == task.id && $0.packageName == task.packageName && task.display == target }) }) else {
+            guard current.allSatisfy({ task in task.userID == 0 && !task.rootContainsOtherUsers && group.contains(where: { $0.id == task.id && $0.packageName == task.packageName && task.display == target }) }) else {
                 throw ScanError("应用任务在恢复前发生变化，已保留窗口和恢复记录。")
             }
             try moveTask(representative.id, to: destination, expectedRoot: root)

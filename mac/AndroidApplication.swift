@@ -61,12 +61,17 @@ struct AndroidTaskSnapshot: Equatable {
     let display: Int
     let packageName: String
     let rootID: Int
+    let userID: Int
+    let rootContainsOtherUsers: Bool
     let isHome: Bool
-    init(id: Int, display: Int, packageName: String, rootID: Int, isHome: Bool = false) {
+    init(id: Int, display: Int, packageName: String, rootID: Int, isHome: Bool = false,
+         userID: Int = 0, rootContainsOtherUsers: Bool = false) {
         self.id = id
         self.display = display
         self.packageName = packageName
         self.rootID = rootID
+        self.userID = userID
+        self.rootContainsOtherUsers = rootContainsOtherUsers
         self.isHome = isHome
     }
     /// Convenience for historical fixtures; production must use parseChecked.
@@ -79,16 +84,23 @@ struct AndroidTaskSnapshot: Equatable {
         let id: Int
         let size: Int?
         let isHome: Bool
+        let userID: Int?
         var childTasks = 0
         var histories = 0
+    }
+    private struct RootKey: Hashable {
+        let display: Int
+        let id: Int
     }
     private static func scan(_ dump: String, strict: Bool, requiredDisplay: Int?) throws -> [Self] {
         var display: Int?, displayIndent = -1, tasks: [Int: Self] = [:]
         var displays = Set<Int>(), containerDiagnostics = false
         var nodes: [TaskNode] = [], roots: [Int] = []
+        var rootUsers: [RootKey: Set<Int>] = [:]
         let displayPattern = try! NSRegularExpression(pattern: "^Display #([0-9]+) \\(activities from top to bottom\\):$")
         let taskPattern = try! NSRegularExpression(pattern: "^\\*\\s+Task\\{[^}]* #([0-9]+)(?:[ }])")
         let sizePattern = try! NSRegularExpression(pattern: "(?:^|\\s)sz=([0-9]+)(?:[ }])")
+        let taskUserPattern = try! NSRegularExpression(pattern: "(?:^|\\s)U=([0-9]+)(?:[ }])")
         let historyStart = try! NSRegularExpression(pattern: "^(?:\\*\\s*)?Hist\\b")
         let historyPattern = try! NSRegularExpression(pattern: "^\\*\\s+Hist\\s+#[0-9]+:\\s+ActivityRecord\\{[^}]* u([0-9]+) ([A-Za-z_][A-Za-z0-9_.]*)/[^ }]+ t([0-9]+)(?:[ }])")
         let invalid = ScanError("无法完整核实手机任务树，已保留窗口和恢复记录。")
@@ -114,14 +126,18 @@ struct AndroidTaskSnapshot: Equatable {
             while let last = roots.last, nodes[last].indent >= indent { roots.removeLast() }
             if let match = taskPattern.firstMatch(in: line, range: range), let id = Int(ns.substring(with: match.range(at: 1))), id > 0 {
                 let size = sizePattern.firstMatch(in: line, range: range).flatMap { Int(ns.substring(with: $0.range(at: 1))) }
+                let userID = taskUserPattern.firstMatch(in: line, range: range).flatMap { Int(ns.substring(with: $0.range(at: 1))) }
                 // Only the authoritative Task header after its numeric ID may
                 // declare home. A task name or activity package is not evidence.
                 let tail = ns.substring(from: NSMaxRange(match.range(at: 1)))
                     .split(separator: "}", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
                 let isHome = tail.range(of: "(?:^|\\s)type=home(?:\\s|$)", options: .regularExpression) != nil
-                if strict && line.contains("sz=") && size == nil { throw invalid }
+                if strict && ((line.contains("sz=") && size == nil) || (line.contains("U=") && userID == nil)) { throw invalid }
+                if strict && requiredDisplay.map({ $0 > 0 && currentDisplay == $0 }) == true && userID.map({ $0 != 0 }) == true { throw invalid }
+                let rootKey = RootKey(display: currentDisplay, id: roots.first.map { nodes[$0].id } ?? id)
+                if let userID { rootUsers[rootKey, default: []].insert(userID) }
                 if let parent = roots.last { nodes[parent].childTasks += 1 }
-                nodes.append(TaskNode(indent: indent, id: id, size: size, isHome: isHome)); roots.append(nodes.count - 1); continue
+                nodes.append(TaskNode(indent: indent, id: id, size: size, isHome: isHome, userID: userID)); roots.append(nodes.count - 1); continue
             }
             if strict && line.hasPrefix("*") && line.dropFirst().trimmingCharacters(in: .whitespaces).hasPrefix("Task") { throw invalid }
             guard historyStart.firstMatch(in: line, range: range) != nil else { continue }
@@ -132,13 +148,13 @@ struct AndroidTaskSnapshot: Equatable {
                 if strict { throw invalid }; continue
             }
             nodes[leaf].histories += 1
-            guard user == 0 else {
-                if strict { throw invalid }
-                continue
-            }
+            if strict && (nodes[leaf].userID.map({ $0 != user }) == true ||
+                          (requiredDisplay.map({ $0 > 0 && currentDisplay == $0 }) == true && user != 0)) { throw invalid }
+            let rootKey = RootKey(display: currentDisplay, id: nodes[root].id)
+            rootUsers[rootKey, default: []].insert(user)
             let entry = Self(id: id, display: currentDisplay, packageName: ns.substring(with: match.range(at: 2)),
-                             rootID: nodes[root].id, isHome: nodes[root].isHome)
-            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID || old.isHome != entry.isHome { throw invalid }
+                             rootID: nodes[root].id, isHome: nodes[root].isHome, userID: user)
+            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID || old.isHome != entry.isHome || old.userID != entry.userID { throw invalid }
             tasks[id] = entry
         }
         if strict {
@@ -154,6 +170,10 @@ struct AndroidTaskSnapshot: Equatable {
                 }
             }
         }
-        return tasks.values.sorted { $0.id < $1.id }
+        return tasks.values.map { entry in
+            Self(id: entry.id, display: entry.display, packageName: entry.packageName,
+                 rootID: entry.rootID, isHome: entry.isHome, userID: entry.userID,
+                 rootContainsOtherUsers: rootUsers[RootKey(display: entry.display, id: entry.rootID)]?.contains(where: { $0 != 0 }) == true)
+        }.sorted { $0.id < $1.id }
     }
 }

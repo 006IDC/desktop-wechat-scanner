@@ -168,10 +168,38 @@ import Foundation
         """
         let multiTasks = try AndroidTaskSnapshot.parseChecked(multipleHistory, requiredDisplay: 0)
         require(multiTasks.count == 1 && multiTasks[0].id == 12 && multiTasks[0].rootID == 6, "sz direct child task count was confused with descendant Hist count")
-        do {
-            _ = try AndroidTaskSnapshot.parseChecked(multipleHistory + "\nDisplay #8 (activities from top to bottom):\n  * Task{foreign #9 sz=1}\n    * Hist  #0: ActivityRecord{x u10 org.example.other/.Main t9}")
-            fatalError("Foreign user was omitted from a production move snapshot")
-        } catch {}
+        let withOtherUser = multipleHistory + "\nDisplay #8 (activities from top to bottom):\n  * Task{foreign #9 U=999 sz=1}\n    * Hist  #0: ActivityRecord{x u999 org.example.other/.Main t9}"
+        let allUsers = try AndroidTaskSnapshot.parseChecked(withOtherUser, requiredDisplay: 0)
+        require(allUsers.count == 2 && allUsers.first(where: { $0.id == 12 })?.userID == 0 &&
+                allUsers.first(where: { $0.id == 9 })?.userID == 999,
+                "An unrelated, valid cloned-app task must remain visible for root safety without blocking the primary user")
+        do { _ = try AndroidTaskSnapshot.parseChecked(withOtherUser, requiredDisplay: 8); fatalError("Other user accepted on an owned display") } catch {}
+        let emptyForeignDisplay = "Display #0 (activities from top to bottom):\n  * Task{primary #12 U=0 sz=0}\nDisplay #8 (activities from top to bottom):\n  * Task{clone #13 U=999 sz=0}"
+        do { _ = try AndroidTaskSnapshot.parseChecked(emptyForeignDisplay, requiredDisplay: 8); fatalError("An empty other-user task on an owned display was invisible") } catch {}
+        let physicalClone = """
+        Display #0 (activities from top to bottom):
+          * Task{primary #12 U=0 sz=1}
+            * Hist  #0: ActivityRecord{main u0 org.example.app/.Main t12}
+          * Task{clone #13 U=999 sz=1}
+            * Hist  #0: ActivityRecord{other u999 org.example.app/.Main t13}
+        Display #8 (activities from top to bottom):
+        """
+        let physicalTasks = try AndroidTaskSnapshot.parseChecked(physicalClone, requiredDisplay: 0)
+        require(physicalTasks.count == 2 && physicalTasks.first(where: { $0.id == 13 })?.userID == 999 &&
+                physicalTasks.first(where: { $0.id == 12 })?.rootContainsOtherUsers == false,
+                "An unrelated clone on the physical display blocked a complete primary-user snapshot")
+        let mixedRoot = """
+        Display #0 (activities from top to bottom):
+          * Task{shared #6 U=0 sz=2}
+            * Task{primary #12 U=0 sz=1}
+              * Hist  #0: ActivityRecord{main u0 org.example.app/.Main t12}
+            * Task{otherEmpty #13 U=999 sz=0}
+        """
+        let shared = try AndroidTaskSnapshot.parseChecked(mixedRoot)
+        require(shared.count == 1 && shared[0].userID == 0 && shared[0].rootContainsOtherUsers,
+                "A foreign empty child must block moving its primary-user root")
+        let mismatchedUser = "Display #0 (activities from top to bottom):\n  * Task{foreign #9 U=999 sz=1}\n    * Hist  #0: ActivityRecord{x u0 org.example.other/.Main t9}"
+        do { _ = try AndroidTaskSnapshot.parseChecked(mismatchedUser); fatalError("Task header/history user mismatch accepted") } catch {}
         let rejectedTrees = [
             "Display #0 (unknown tree):\n  * Task{x #6 sz=0}",
             "Display #0 (activities from top to bottom):\n  * Task{x #6 sz=1}",
@@ -181,7 +209,7 @@ import Foundation
             "Display #0 (activities from top to bottom):\n  * Task{x #6 sz=2}\n    * Task{oneKnownChild #7 sz=0}",
             "Display #0 (activities from top to bottom):\n  * Task{x #6}",
             "Display #0 (activities from top to bottom):\nDisplay #9 (unknown tree):\n  * Task{x #6 sz=0}",
-            "Display #0 (activities from top to bottom):\n  * Task{x #6 sz=1}\n    * Hist  #0: ActivityRecord{x u10 org.example.app/.Main t6}"
+            "Display #0 (activities from top to bottom):\n  * Task{x #6 U=10 sz=1}\n    * Hist  #0: ActivityRecord{x u0 org.example.app/.Main t6}"
         ]
         for tree in rejectedTrees {
             do { _ = try AndroidTaskSnapshot.parseChecked(tree, requiredDisplay: 0); fatalError("Unknown or incomplete tree accepted as safe") } catch {}
