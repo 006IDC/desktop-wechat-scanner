@@ -84,6 +84,45 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         control.showWindow(nil);refresh();writeDiagnosticState()
         NSApp.activate(ignoringOtherApps:true)
         refreshScreenAccess()
+        if CommandLine.arguments.contains("--run-scan-diagnostic") {
+            Task { await runLaunchDiagnostic() }
+        }
+    }
+
+    /// Explicit native integration-test entry. Reuses only a previously chosen
+    /// paired device and permission; never requests access, accepts a dialog or
+    /// synthesizes OS input. The ordinary launch path is unchanged.
+    private func runLaunchDiagnostic() async {
+        do {
+            await permissionCheck?.value
+            guard screenAccessGranted else{throw ScanError("诊断需要既有录屏授权，不会自动申请。")}
+            let others=NSWorkspace.shared.runningApplications.filter {
+                $0.bundleIdentifier==Bundle.main.bundleIdentifier && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
+            }
+            guard others.isEmpty else{throw ScanError("请先退出另一个扫码实例，诊断不共享正在运行的手机会话。")}
+            guard let remembered=WirelessReconnectStore().load() else{throw ScanError("没有已选择的无线手机，诊断不自动配对新设备。")}
+            guard let resources=Bundle.main.resourceURL else{throw ScanError("随包资源不可用。")}
+            let adb=try await ADBConfiguration.validateAsync(resources.appendingPathComponent("adb/bin/adb"))
+            let owned=try await ADBManagedServer.start(adbURL:adb)
+            wirelessServer=owned;adbServerSocket=owned.socket;wirelessEndpoint=remembered.endpoint;adbURL=adb
+            let manager=ADBConnectionManager(adbURL:adb,serverSocket:owned.socket)
+            try await manager.connect(endpoint:remembered.endpoint)
+            let devices=try await manager.devices()
+            guard let device=devices.first(where:{$0.authorization == .authorized && $0.serial==remembered.endpoint}) else{throw ScanError("此前配对的手机当前不可连接。")}
+            connectDevice(device,adb:adb,allowLockedApplications:UserDefaults.standard.bool(forKey:"allowsLockedApplications.v1"))
+            await connectionTask?.value
+            // connectDevice owns any failure cleanup; do not race a second
+            // termination cleanup against that still-running recovery task.
+            while stopping {try await Task.sleep(nanoseconds:100_000_000)}
+            guard connected,!busy,!stopping else{throw ScanError("手机诊断连接未就绪。")}
+            runPerformanceCheck()
+            await performanceTask?.value
+        } catch {
+            let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
+            let report:[String:Any]=["qrRecognized":false,"failure":error.localizedDescription,"updatedAt":ISO8601DateFormatter().string(from:Date())]
+            if let data=try? JSONSerialization.data(withJSONObject:report,options:.sortedKeys){try? data.write(to:folder.appendingPathComponent("performance-last.json"),options:.atomic)}
+        }
+        NSApp.terminate(nil)
     }
     private func buildMenu(){
         let menu=NSMenu(),appItem=NSMenuItem(),appMenu=NSMenu()
