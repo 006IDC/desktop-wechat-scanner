@@ -14,12 +14,16 @@ ROOT=Path(__file__).resolve().parents[1]
 APP=ROOT/'build/桌面微信扫码.app'
 ZIP=ROOT/'build/桌面微信扫码.zip'
 parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--local-signing',action='store_true',
+                    help='sign with the persistent project-local identity and produce a separate ZIP')
 parser.add_argument('--install',type=Path,metavar='PATH',
                     help='install the verified app at this explicit .app path')
 args=parser.parse_args()
+if args.local_signing:
+    ZIP=ROOT/'build/桌面微信扫码-本机签名.zip'
 revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
 if subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip():
-    raise RuntimeError('Commit all source changes before building a public app')
+    raise RuntimeError('Commit all source changes before building an app')
 
 def copy_without_metadata(source: str, destination: str) -> str:
     """Copy bytes and POSIX mode; never transfer FinderInfo or ResourceFork."""
@@ -110,8 +114,8 @@ info={
     'CFBundleIdentifier':'com.idc006.DesktopWeChatScanner',
     'CFBundleName':'桌面微信扫码','CFBundleDisplayName':'桌面微信扫码',
     'CFBundleExecutable':'DesktopWeChatScanner','CFBundlePackageType':'APPL',
-    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'15',
-    'DesktopScannerRelease':'0.4.0-preview.4',
+    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'16',
+    'DesktopScannerRelease':'0.4.0-preview.5',
     'CFBundleIconFile':'AppIcon.icns',
     'LSMinimumSystemVersion':'14.4','NSHighResolutionCapable':True,
     'NSLocalNetworkUsageDescription':'连接同一局域网内已由你配对授权的 Android 手机，以显示镜像并发送点击。',
@@ -146,7 +150,13 @@ with tempfile.TemporaryDirectory(prefix='006idc-app-sign-') as temp:
     for name in ('com.apple.FinderInfo','com.apple.ResourceFork'):
         subprocess.run(['xattr','-dr',name,str(staged)],
                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    subprocess.run(['codesign','--force','--sign','-','--identifier',info['CFBundleIdentifier'],str(staged)],check=True)
+    if args.local_signing:
+        from local_signing import KEYCHAIN, fingerprint
+        signing_identity=fingerprint()
+        signing_args=['--keychain',str(KEYCHAIN),'--sign',signing_identity]
+    else:
+        signing_args=['--sign','-']
+    subprocess.run(['codesign','--force',*signing_args,'--identifier',info['CFBundleIdentifier'],str(staged)],check=True)
     verify(staged)
     package_zip(staged)
     if args.install:

@@ -48,6 +48,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var previewTimer:Timer?
     private var captureMilliseconds=0.0, transferMilliseconds=0.0, previewWaitMilliseconds=0.0
     private var droppedCameraFrames=0, maximumCameraGapMilliseconds=0.0
+    private var screenAccessGranted=false
+    private var permissionCheck:Task<Void,Never>?
+    private var cameraTickAt:TimeInterval?,cameraTickGaps:[Double]=[]
+    private var maximumCameraTickMilliseconds=0.0
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         buildMenu();control.window?.delegate=self
@@ -77,6 +81,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         control.showWindow(nil);refresh();writeDiagnosticState()
         NSApp.activate(ignoringOtherApps:true)
+        refreshScreenAccess()
     }
     private func buildMenu(){
         let menu=NSMenu(),appItem=NSMenuItem(),appMenu=NSMenu()
@@ -179,9 +184,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         adbSettingsItem?.isEnabled = !connected && !busy && !stopping
         control.update(status:currentStatus,detail:currentDetail,connected:connected,busy:busy,paused:paused)
         control.setCameraActive(cameraActive && !paused)
-        // Keep the complete, interactive WeChat scanner. The transparent-only
-        // experiment hides its controls and does not match the reference video.
-        control.setLocalScanPreview(false)
+        // Composite only the camera aperture locally. Real WeChat controls and
+        // result frames remain in the decoded video, with the same input mapping.
+        control.setLocalScanPreview(cameraActive && !paused && !busy && mode == .wechat)
         if wechatWindow != nil {
             mainControl.update(status:primaryLocked ? "手机主屏已锁定" : (connected ? "手机镜像 · \(model)" : currentStatus),detail:primaryLocked ? "独立应用仍可使用；正常解锁手机后恢复主屏镜像。" : "通过应用列表拖出应用，分别在 Mac 窗口里使用。",connected:connected,busy:stopping,paused:true)
         }
@@ -190,7 +195,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func writeDiagnosticState(){
         let folder=FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent("006IDC/DesktopWeChatScanner")
         try? FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
-        let value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":CGPreflightScreenCaptureAccess(),"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"independentApplicationsWhenLocked":independentApplicationsWhenLocked,"primaryLocked":primaryLocked,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
+        let ticks=cameraTickGaps.sorted()
+        let tickP95=ticks.isEmpty ? 0:ticks[min(ticks.count-1,Int(Double(ticks.count)*0.95))]
+        let value:[String:Any]=["status":currentStatus,"connected":connected,"paused":paused,"framesSent":framesSent,"previewsReceived":previewsReceived,"screenPermission":screenAccessGranted,"mode":mode == .phone ? "phone" : "wechat","cameraActive":cameraActive,"localCameraPreview":cameraActive && !paused && !busy && mode == .wechat,"independentApplicationsWhenLocked":independentApplicationsWhenLocked,"primaryLocked":primaryLocked,"cameraFPS":cameraFPS,"captureMilliseconds":captureMilliseconds,"transferMilliseconds":transferMilliseconds,"previewWaitMilliseconds":previewWaitMilliseconds,"droppedCameraFrames":droppedCameraFrames,"maximumCameraGapMilliseconds":maximumCameraGapMilliseconds,"scannerSwitchMilliseconds":scannerSwitchMilliseconds,"cameraTickP95Milliseconds":tickP95,"maximumCameraTickMilliseconds":maximumCameraTickMilliseconds,"updatedAt":ISO8601DateFormatter().string(from:Date())]
         if let data=try? JSONSerialization.data(withJSONObject:value,options:.sortedKeys){try? data.write(to:folder.appendingPathComponent("diagnostic-state.json"),options:.atomic)}
     }
     private func connect(){
@@ -356,7 +363,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func updatePrimaryLock() async throws {
         guard independentApplicationsWhenLocked else{return}
         let wasLocked=primaryLocked
-        let locked = !(try await phone.primaryUserUnlocked())
+        let locked = !(try await phone.pollPrimaryUserUnlocked())
         guard connected,!stopping,!Task.isCancelled else{return}
         primaryLocked=locked
         if locked {
@@ -494,6 +501,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 await clearCamera();let generation=scanGeneration
                 status("准备桌面相机","正在读取当前窗口后方的桌面画面…")
                 try await capture.prepare();try Task.checkCancellation()
+                screenAccessGranted=true
                 control.showPermissionHelp(false)
                 guard connected && mode == .wechat && generation==scanGeneration else{return}
                 guard control.window?.isVisible == true,control.window?.isMiniaturized == false else {
@@ -571,6 +579,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             suspendHiddenCamera();return
         }
         let tick=ProcessInfo.processInfo.systemUptime
+        if let previous=cameraTickAt {
+            let gap=(tick-previous)*1000
+            cameraTickGaps.append(gap)
+            if cameraTickGaps.count>180 {cameraTickGaps.removeFirst()}
+            maximumCameraTickMilliseconds=max(maximumCameraTickMilliseconds,gap)
+        }
+        cameraTickAt=tick
         if tick>=nextCameraGeometry {
             nextCameraGeometry=tick+1.0/30
             do {pump.publish(try DesktopCaptureTarget.current(for:control.desktopCaptureRect))}
@@ -595,6 +610,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func startCameraLoop(){
         cameraLoop?.cancel();cameraPump?.stop()
+        cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0
         let pump=CameraPumpMailbox(),generation=scanGeneration
         cameraPump=pump;cameraFramesBase=framesSent
         updateCameraTick()
@@ -605,7 +621,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             while !Task.isCancelled,let target=pump.latest() {
                 let began=ProcessInfo.processInfo.systemUptime
                 do {
-                    let image=try await capture.capture(target)
+                    let image=try await capture.capture(target,maximumDimension:1280)
                     stats.captureMilliseconds=(ProcessInfo.processInfo.systemUptime-began)*1000
                     try Task.checkCancellation()
                     guard pump.latest() != nil else{break}
@@ -659,11 +675,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Bounded navigation only: recognise the WeChat home/menu labels. Never
     /// click a scan result, authorization button, link, payment or chat item.
     private func openScanner() async throws -> Bool {
+        if let foreground=try await phone.foreground(onVirtualDisplay:true),
+           foreground.hasPrefix("com.tencent.mm/"),foreground.lowercased().contains("scanner") {return true}
         let deadline=ProcessInfo.processInfo.systemUptime+4
         var openedMenu=false,tappedScanner=false
+        var recognisedFrame = -1
         while ProcessInfo.processInfo.systemUptime<deadline {
             try await Task.sleep(nanoseconds:120_000_000)
-            guard let image=latestPhoneFrame else{continue}
+            guard let image=latestPhoneFrame,previewsReceived != recognisedFrame else{continue}
+            recognisedFrame=previewsReceived
             let words=try await Task.detached(priority:.userInitiated) {try Self.textIn(image)}.value
             try Task.checkCancellation()
             let scan=words.first{$0.value.replacingOccurrences(of:" ",with:"").contains("扫一扫")}
@@ -758,11 +778,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sender.orderOut(nil);return false
     }
     func applicationDidBecomeActive(_ notification:Notification) {
-        // Refresh only an already granted permission. Activating the app must
-        // never request capture or reopen the system permission prompt.
-        if CGPreflightScreenCaptureAccess() {
-            mainControl.showPermissionHelp(false);wechatWindow?.showPermissionHelp(false)
-            refresh();writeDiagnosticState()
+        refreshScreenAccess()
+    }
+    private func refreshScreenAccess() {
+        // A TCC query is synchronous IPC. Keep it out of the presentation tick,
+        // and never request permission just because this window became active.
+        guard permissionCheck == nil else{return}
+        permissionCheck=Task { [weak self] in
+            let granted=await Task.detached(priority:.utility) {CGPreflightScreenCaptureAccess()}.value
+            guard let self else{return}
+            self.screenAccessGranted=granted || self.cameraActive
+            if granted {self.mainControl.showPermissionHelp(false);self.wechatWindow?.showPermissionHelp(false)}
+            self.permissionCheck=nil;self.refresh();self.writeDiagnosticState()
         }
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool)->Bool {showMainWindow();return true}

@@ -28,6 +28,21 @@ import CoreGraphics
             require(result==preview.offsetBy(dx:delta.x,dy:delta.y),"Cached frame drag translation incorrect")
             require(result.size==preview.size,"Movement changed ROI size/aspect")
         }
+        // The native drag can move WindowServer first while AppKit still reports
+        // the old frame. Once AppKit catches up, its ROI is already in the new
+        // place; reusing the old query would apply the displacement twice.
+        let movedFrame=cachedFrame.offsetBy(dx:45,dy:-35)
+        let movedPreview=preview.offsetBy(dx:45,dy:-35)
+        let dragSnapshot=WindowCaptureGeometry.BoundsSnapshot(
+            serverBounds:cgBounds(movedFrame,top:top),queriedAppKitFrame:cachedFrame)
+        require(WindowCaptureGeometry.correctedRect(cachedRect:preview,appKitFrame:cachedFrame,
+                    windowServerBounds:dragSnapshot.bounds(for:cachedFrame),primaryScreenTop:top)==movedPreview,
+                "Cached AppKit origin stopped native drag correction")
+        require(dragSnapshot.bounds(for:movedFrame)==nil,
+                "Old WindowServer query survived AppKit origin update")
+        require(WindowCaptureGeometry.correctedRect(cachedRect:movedPreview,appKitFrame:movedFrame,
+                    windowServerBounds:dragSnapshot.bounds(for:movedFrame),primaryScreenTop:top)==movedPreview,
+                "AppKit catch-up applied stale drag displacement twice")
         // Secondary displays can be left of, above, or below the primary. Use
         // the primary top in every case; no clipping or display-local origin.
         for origin in [CGPoint(x:-1600,y:100),CGPoint(x:-400,y:1300),CGPoint(x:300,y:-1000)] {
@@ -75,7 +90,7 @@ import CoreGraphics
             require(CFArrayGetCount(array)==1,"Exact-ID array contains more than one ID")
             require(UInt(bitPattern:CFArrayGetValueAtIndex(array,0))==UInt(id),"Window ID was boxed instead of encoded as raw pointer-sized value")
         }
-        print("PASS own-window ID/PID metadata validation; stationary/cached native-drag geometry; negative/above/below displays; Retina points; missing/invalid server fallback; resize fallback and settled layout. Synthetic only, no native drag or UI performed.")
+        print("PASS own-window ID/PID metadata validation; stationary/cached native-drag geometry; AppKit origin catch-up drops stale query; negative/above/below displays; Retina points; missing/invalid server fallback; resize fallback and settled layout. Synthetic only, no native drag or UI performed.")
     }
 
     @MainActor private static func ownWindowIntegration() {

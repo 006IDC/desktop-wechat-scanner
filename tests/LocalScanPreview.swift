@@ -1,8 +1,9 @@
 import AppKit
 
-// Manual synthetic fixture: verify titlebar/background, desktop visibility and
-// click targeting in the actual UI. Running or compiling this fixture alone does
-// not prove that the aperture blocks clicks to phone or background UI.
+// Manual synthetic fixture: verify the center shows the blue desktop, while
+// the orange top and green bottom stay visible and forward phone taps. Press
+// the fixture Scan button to re-enable the aperture, Back to restore all pixels.
+// Running or compiling this fixture alone does not prove native click targeting.
 @MainActor final class PreviewFixture:NSObject,NSApplicationDelegate {
     let control=ControlWindowController()
     let background=NSWindow(contentRect:NSRect(x:100,y:100,width:660,height:760),styleMask:[.titled,.closable],backing:.buffered,defer:false)
@@ -22,13 +23,24 @@ import AppKit
         background.makeKeyAndOrderFront(nil)
         control.window?.title="本地预览验收（合成）"
         control.setPhoneImage(NSImage(size:NSSize(width:1268,height:2756),flipped:false){r in
-            NSColor.systemIndigo.setFill();r.fill();return true
+            NSColor.systemIndigo.setFill();r.fill()
+            NSColor.systemOrange.setFill()
+            NSRect(x:0,y:r.height*0.84,width:r.width,height:r.height*0.16).fill()
+            NSColor.systemGreen.setFill()
+            NSRect(x:0,y:0,width:r.width,height:r.height*0.25).fill()
+            return true
         })
         control.update(status:"透明预览测试",detail:"纯合成；无手机连接",connected:true,busy:false,paused:false)
         control.setCameraActive(true);control.setLocalScanPreview(true)
         control.onScan={ [weak self] in self?.control.setLocalScanPreview(true) }
         control.onBack={ [weak self] in self?.control.setLocalScanPreview(false) }
-        control.onTap={ [weak self] _,_ in guard let self else{return};self.phoneHits+=1;self.report() }
+        control.onTap={ [weak self] x,y in
+            guard let self else{return}
+            self.phoneHits+=1
+            print(String(format:"PHONE_TAP x=%.3f y=%.3f region=%@",x,y,
+                         y < 0.16 ? "top" : (y >= 0.75 ? "bottom" : "center")))
+            self.report()
+        }
         control.showWindow(nil)
         control.window?.contentView?.layoutSubtreeIfNeeded()
         let phone=control.desktopCaptureRect,target=background.convertToScreen(button.frame).center

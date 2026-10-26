@@ -49,6 +49,7 @@ final class CameraSocket {
         setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET); address.sin_port = port.bigEndian
@@ -463,6 +464,20 @@ actor PhoneSession {
     }
     func primaryUserUnlocked() throws -> Bool {
         let trust = try shell("dumpsys trust")
+        return try Self.primaryUserUnlocked(in:trust)
+    }
+    /// Monitoring must not block the frame channel while an ADB subprocess waits.
+    func pollPrimaryUserUnlocked() async throws -> Bool {
+        guard let state=recovery else {throw ScanError("手机未连接。")}
+        let adb=adbURL,route=serverSocket.map { ["-L",$0] } ?? []
+        let trust=try await Task.detached(priority:.utility) {
+            try ShellCommand.run(adb,route+["-s",state.serial,"shell","dumpsys trust"],timeout:5)
+        }.value
+        try Task.checkCancellation()
+        guard recovery?.path==state.path,recovery?.serial==state.serial else {throw CancellationError()}
+        return try Self.primaryUserUnlocked(in:trust)
+    }
+    private static func primaryUserUnlocked(in trust:String) throws -> Bool {
         guard let owner = trust.split(separator: "\n").first(where: { $0.contains("(id=0,") && $0.contains("(current)") }) else {throw ScanError("无法确认手机主用户的锁屏状态。")}
         if owner.contains("deviceLocked=0") {return true}
         if owner.contains("deviceLocked=1") {return false}

@@ -4,29 +4,125 @@ import CoreGraphics
 /// Public CoreGraphics metadata corrects AppKit's potentially cached origin
 /// during native title-bar dragging. This never captures window pixels.
 enum WindowCaptureGeometry {
+    private struct QueryKey: Equatable {
+        let object: ObjectIdentifier
+        let id: CGWindowID
+        let pid: pid_t
+        let display: UInt32
+        let primaryTop: CGFloat
+        let scale: CGFloat
+        let originX: CGFloat
+        let originY: CGFloat
+        let width: CGFloat
+        let height: CGFloat
+    }
+
+    private struct Query {
+        let key: QueryKey
+        let id: CGWindowID
+        let appKitFrame: CGRect
+    }
+
+    /// Keep the AppKit frame observed when the WindowServer query was requested.
+    /// A late result from an earlier drag position must never shift a new ROI.
+    struct BoundsSnapshot {
+        let serverBounds: CGRect
+        let queriedAppKitFrame: CGRect
+
+        func bounds(for currentAppKitFrame: CGRect) -> CGRect? {
+            queriedAppKitFrame == currentAppKitFrame ? serverBounds : nil
+        }
+    }
+
+    private struct CachedBounds {
+        let key: QueryKey
+        let snapshot: BoundsSnapshot
+        let time: TimeInterval
+    }
+
+    private static let queue = DispatchQueue(label: "006idc.window-geometry", qos: .userInitiated)
+    private static let lock = NSLock()
+    private static var cached: [CGWindowID: CachedBounds] = [:]
+    private static var pending: [CGWindowID: Query] = [:]
+    private static var workerScheduled = false
+    private static var lastSubmission: [CGWindowID: TimeInterval] = [:]
+
     @MainActor static func correctedCaptureRect(for window:NSWindow,cachedRect:CGRect) -> CGRect {
         let number=window.windowNumber
         guard number>0,UInt64(number)<=UInt64(UInt32.max),
               let primaryTop=NSScreen.screens.first?.frame.maxY else {return cachedRect}
-        let id=CGWindowID(number)
-        guard let descriptions=ownWindowDescriptions(for:window),
-              let bounds=serverBounds(from:descriptions,windowID:id,ownerPID:ProcessInfo.processInfo.processIdentifier) else {
-            return cachedRect
+        let frame = window.frame
+        let key = QueryKey(object: ObjectIdentifier(window), id: CGWindowID(number),
+                           pid: ProcessInfo.processInfo.processIdentifier,
+                           display: (window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0,
+                           primaryTop: primaryTop,
+                           scale: window.backingScaleFactor,
+                           originX: frame.minX, originY: frame.minY,
+                           width: frame.width, height: frame.height)
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        if cached[key.id]?.key != key { cached.removeValue(forKey: key.id) }
+        let bounds = cached[key.id].flatMap {
+            now - $0.time <= 0.15 ? $0.snapshot.bounds(for: frame) : nil
         }
-        return correctedRect(cachedRect:cachedRect,appKitFrame:window.frame,
+        if now - (lastSubmission[key.id] ?? 0) >= 1.0 / 60.0 {
+            lastSubmission[key.id] = now
+            pending[key.id] = Query(key: key, id: key.id, appKitFrame: frame)
+            if !workerScheduled {
+                workerScheduled = true
+                queue.async { drainQueries() }
+            }
+        }
+        // The app normally owns only a few windows. Remove closed-window state
+        // so identifiers and cached results cannot accumulate indefinitely.
+        if lastSubmission.count > 16 {
+            let recent = lastSubmission.filter { now - $0.value < 1 }
+            lastSubmission = recent
+            cached = cached.filter { recent[$0.key] != nil }
+            pending = pending.filter { recent[$0.key] != nil }
+        }
+        lock.unlock()
+        return correctedRect(cachedRect:cachedRect,appKitFrame:frame,
                              windowServerBounds:bounds,primaryScreenTop:primaryTop)
+    }
+
+    private static func drainQueries() {
+        while true {
+            lock.lock()
+            guard let (id, query) = pending.first else {
+                workerScheduled = false
+                lock.unlock()
+                return
+            }
+            pending.removeValue(forKey: id)
+            lock.unlock()
+            let descriptions = ownWindowDescriptions(id: query.id)
+            let bounds = descriptions.flatMap { serverBounds(from: $0, windowID: query.id, ownerPID: query.key.pid) }
+            lock.lock()
+            if let bounds {
+                cached[id] = CachedBounds(key: query.key,
+                                          snapshot: BoundsSnapshot(serverBounds: bounds,
+                                                                   queriedAppKitFrame: query.appKitFrame),
+                                          time: ProcessInfo.processInfo.systemUptime)
+            }
+            lock.unlock()
+        }
     }
 
     @MainActor static func ownWindowDescriptions(for window:NSWindow) -> [[String:Any]]? {
         let number=window.windowNumber
-        guard number>0,UInt64(number)<=UInt64(UInt32.max),
-              let ids=windowIDArray(CGWindowID(number)),
+        guard number>0,UInt64(number)<=UInt64(UInt32.max) else { return nil }
+        return ownWindowDescriptions(id: CGWindowID(number))
+    }
+
+    private static func ownWindowDescriptions(id: CGWindowID) -> [[String:Any]]? {
+        guard let ids=windowIDArray(id),
               let descriptions=CGWindowListCreateDescriptionFromArray(ids) as? [[String:Any]] else {return nil}
-        let id=Double(number),pid=Double(ProcessInfo.processInfo.processIdentifier)
+        let expectedID=Double(id),pid=Double(ProcessInfo.processInfo.processIdentifier)
         // An absent/closed window can produce an empty array. Never accept an
         // unexpected window even if the system returned additional metadata.
         guard descriptions.count<=1,descriptions.allSatisfy({
-            ($0[kCGWindowNumber as String] as? NSNumber)?.doubleValue==id &&
+            ($0[kCGWindowNumber as String] as? NSNumber)?.doubleValue==expectedID &&
             ($0[kCGWindowOwnerPID as String] as? NSNumber)?.doubleValue==pid
         }) else {return nil}
         return descriptions

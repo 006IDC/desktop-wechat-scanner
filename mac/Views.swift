@@ -10,6 +10,31 @@ private enum ViewStyle {
     static let phoneRatio: CGFloat = 9.0 / 16.0
 }
 
+/// The live camera occupies this part of the mirrored phone image. Coordinates
+/// are normalized from its top-left corner, independent of window letterboxing.
+enum ScanPreviewAperture {
+    static let standard = CGRect(x: 0, y: 0.16, width: 1, height: 0.59)
+
+    static func valid(_ rect: CGRect) -> Bool {
+        rect.minX.isFinite && rect.minY.isFinite && rect.width.isFinite && rect.height.isFinite &&
+        rect.width > 0 && rect.height > 0 && rect.minX >= 0 && rect.minY >= 0 &&
+        rect.maxX <= 1 && rect.maxY <= 1
+    }
+
+    static func opening(in image: CGRect, normalized rect: CGRect) -> CGRect {
+        guard valid(rect), image.width > 0, image.height > 0 else { return .zero }
+        return CGRect(x: image.minX + rect.minX * image.width,
+                      y: image.minY + rect.minY * image.height,
+                      width: rect.width * image.width, height: rect.height * image.height)
+    }
+
+    static func visibleOpening(in image: CGRect, normalized rect: CGRect, enabled: Bool) -> CGRect? {
+        guard enabled else { return nil }
+        let result = opening(in: image, normalized: rect)
+        return result.isEmpty ? nil : result
+    }
+}
+
 private func text(_ value: String, size: CGFloat, weight: NSFont.Weight = .regular,
                   color: NSColor = .labelColor) -> NSTextField {
     let field = NSTextField(labelWithString: value)
@@ -33,8 +58,9 @@ private func button(_ title: String, tooltip: String) -> NSButton {
 /// Paint the native window surface around an optional live desktop aperture.
 /// The aperture is computed from the same preview bounds as desktopCaptureRect.
 private final class PhoneWindowBackgroundView: NSView {
-    weak var preview: NSView?
+    weak var preview: PhonePreviewView?
     var localScanPreview = false { didSet { needsDisplay = true } }
+    var aperture = ScanPreviewAperture.standard { didSet { needsDisplay = true } }
     override var isOpaque: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -42,8 +68,11 @@ private final class PhoneWindowBackgroundView: NSView {
         NSColor.clear.setFill()
         bounds.fill(using: .copy)
         let background = NSBezierPath(rect: bounds)
-        if localScanPreview, let preview, preview.window === window {
-            let opening = convert(preview.bounds, from: preview)
+        if let preview, preview.window === window,
+           let localOpening = ScanPreviewAperture.visibleOpening(in: preview.imageArea,
+                                                                  normalized: aperture,
+                                                                  enabled: localScanPreview) {
+            let opening = convert(localOpening, from: preview)
             if opening.width > 0, opening.height > 0 {
                 background.append(NSBezierPath(roundedRect: opening, xRadius: 12, yRadius: 12))
                 background.windingRule = .evenOdd
@@ -63,20 +92,29 @@ private final class PhoneWindowBackgroundView: NSView {
 private final class PhonePreviewView: NSView {
     private let frameLayer = CALayer()
     private let videoLayer = AVSampleBufferDisplayLayer()
+    private let frameMask = CAShapeLayer()
+    private let videoMask = CAShapeLayer()
     private var videoFormat: CMVideoFormatDescription?
     private var mirrorPixels: CVPixelBuffer?
     private var mirrorFrame: CGImage?
     private var hasFrame: Bool { mirrorPixels != nil || mirrorFrame != nil }
     private var mirrorSize: NSSize = .zero
+    var aperture = ScanPreviewAperture.standard {
+        didSet { updateLayerMasks(); needsDisplay = true }
+    }
+    var imageArea: CGRect { imageRect }
+    var scanOpening: CGRect? {
+        ScanPreviewAperture.visibleOpening(in: imageRect, normalized: aperture, enabled: localScanPreview)
+    }
     var localScanPreview = false {
         didSet {
             touchStart = nil; touchStartLocation = nil
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            frameLayer.isHidden = localScanPreview || mirrorFrame == nil
-            videoLayer.isHidden = localScanPreview || mirrorPixels == nil
+            frameLayer.isHidden = mirrorFrame == nil
+            videoLayer.isHidden = mirrorPixels == nil
+            updateLayerMasks()
             CATransaction.commit()
-            if !localScanPreview, let mirrorPixels { enqueuePixels(mirrorPixels) }
             needsDisplay = true
         }
     }
@@ -123,7 +161,7 @@ private final class PhonePreviewView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         frameLayer.contents = frame
-        frameLayer.isHidden = localScanPreview || frame == nil
+        frameLayer.isHidden = frame == nil
         videoLayer.isHidden = true
         CATransaction.commit()
         // Only empty/filled state changes redraw the static black/placeholder
@@ -141,9 +179,9 @@ private final class PhonePreviewView: NSView {
         CATransaction.setDisableActions(true)
         frameLayer.contents = nil
         frameLayer.isHidden = true
-        videoLayer.isHidden = localScanPreview
+        videoLayer.isHidden = false
         CATransaction.commit()
-        if !localScanPreview { enqueuePixels(pixels) }
+        enqueuePixels(pixels)
         if !hadFrame { needsDisplay = true }
     }
 
@@ -193,7 +231,27 @@ private final class PhonePreviewView: NSView {
         CATransaction.setDisableActions(true)
         frameLayer.frame = bounds
         videoLayer.frame = bounds
+        updateLayerMasks()
         CATransaction.commit()
+    }
+
+    private func updateLayerMasks() {
+        for (content, mask) in [(frameLayer, frameMask), (videoLayer, videoMask)] {
+            guard localScanPreview else { content.mask = nil; continue }
+            guard let opening = scanOpening else { content.mask = nil; continue }
+            // Core Animation's layer coordinates are bottom-left even though
+            // this NSView uses top-left image coordinates.
+            let lowerOpening = CGRect(x: opening.minX, y: bounds.height - opening.maxY,
+                                      width: opening.width, height: opening.height)
+            let path = CGMutablePath()
+            path.addRect(bounds)
+            path.addRect(lowerOpening)
+            mask.frame = bounds
+            mask.fillRule = .evenOdd
+            mask.path = path
+            mask.fillColor = NSColor.white.cgColor
+            content.mask = mask
+        }
     }
 
     override func viewDidMoveToWindow() {
@@ -227,26 +285,11 @@ private final class PhonePreviewView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         if localScanPreview {
-            // A nonzero alpha keeps this visible desktop aperture eligible for
-            // WindowServer hit testing; actual mouse targeting must be verified with the synthetic UI fixture.
-            NSColor.black.withAlphaComponent(0.01).setFill()
+            NSColor.black.setFill()
             bounds.fill(using: .copy)
-            let guide = bounds.insetBy(dx: 10, dy: 10)
-            let length: CGFloat = 20
-            let corners = NSBezierPath()
-            corners.lineWidth = 1.5
-            corners.lineCapStyle = .round
-            for x in [guide.minX, guide.maxX] {
-                for y in [guide.minY, guide.maxY] {
-                    let dx: CGFloat = x == guide.minX ? length : -length
-                    let dy: CGFloat = y == guide.minY ? length : -length
-                    corners.move(to: NSPoint(x: x + dx, y: y))
-                    corners.line(to: NSPoint(x: x, y: y))
-                    corners.line(to: NSPoint(x: x, y: y + dy))
-                }
-            }
-            ViewStyle.green.setStroke()
-            corners.stroke()
+            // Keep a tiny alpha so this window remains the pointer target.
+            NSColor.black.withAlphaComponent(0.01).setFill()
+            scanOpening?.fill(using: .copy)
             return
         }
         NSColor.black.setFill()
@@ -277,7 +320,7 @@ private final class PhonePreviewView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard !localScanPreview, hasFrame else { return }
+        guard hasFrame else { return }
         let location = convert(event.locationInWindow, from: nil)
         guard imageRect.contains(location) else { return }
         touchStart = normalized(location)
@@ -286,13 +329,13 @@ private final class PhonePreviewView: NSView {
     }
 
     override func mouseDragged(with event:NSEvent) {
-        guard !localScanPreview,touchStart != nil,onTouch != nil else{return}
+        guard touchStart != nil,onTouch != nil else{return}
         let point=normalized(convert(event.locationInWindow,from:nil))
         onTouch?(2,Double(point.x),Double(point.y))
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard !localScanPreview, let start = touchStart, let location = touchStartLocation else { return }
+        guard let start = touchStart, let location = touchStartLocation else { return }
         defer { touchStart = nil; touchStartLocation = nil }
         let finishLocation = convert(event.locationInWindow, from: nil)
         let end = normalized(finishLocation)
@@ -305,7 +348,7 @@ private final class PhonePreviewView: NSView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard !localScanPreview, hasFrame else { return }
+        guard hasFrame else { return }
         let amount = min(0.40, max(-0.40, event.scrollingDeltaY * 0.006))
         guard abs(amount) > 0.02 else { return }
         onSwipe?(0.5, 0.5 - Double(amount), 0.5, 0.5 + Double(amount))
@@ -603,14 +646,22 @@ final class ControlWindowController: NSWindowController {
         holder.phone.localScanPreview = enabled
         background.localScanPreview = enabled
         holder.phone.setAccessibilityLabel(enabled
-            ? "桌面扫码预览；拖动窗口标题栏对准二维码，手机画面操作已暂停"
+            ? "真实微信扫码画面；拖动窗口标题栏对准二维码，手机按钮仍可操作"
             : "真实手机画面；点击或拖动可操作手机")
         holder.phone.toolTip = enabled
-            ? "拖动窗口标题栏，让二维码位于此区域；使用顶部按钮返回手机画面"
+            ? "拖动窗口标题栏，让二维码位于相机区域；微信按钮可直接点击"
             : "真实手机画面；点击、拖动或滚动可操作手机"
         window?.contentView?.layoutSubtreeIfNeeded()
         background.needsDisplay = true
         window?.invalidateShadow()
+    }
+
+    /// Calibrate against a real scan screen without changing phone tap coordinates.
+    func setLocalScanAperture(_ normalizedRect: CGRect) {
+        guard ScanPreviewAperture.valid(normalizedRect) else { return }
+        holder.phone.aperture = normalizedRect
+        background.aperture = normalizedRect
+        background.needsDisplay = true
     }
 
     func setPhoneImage(_ image: NSImage?) {
