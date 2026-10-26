@@ -239,13 +239,11 @@ private final class PhonePreviewView: NSView {
         for (content, mask) in [(frameLayer, frameMask), (videoLayer, videoMask)] {
             guard localScanPreview else { content.mask = nil; continue }
             guard let opening = scanOpening else { content.mask = nil; continue }
-            // Core Animation's layer coordinates are bottom-left even though
-            // this NSView uses top-left image coordinates.
-            let lowerOpening = CGRect(x: opening.minX, y: bounds.height - opening.maxY,
-                                      width: opening.width, height: opening.height)
+            // These sublayers inherit the flipped NSView's coordinate space.
+            // A second Y flip shifts the video hole away from the backing hole.
             let path = CGMutablePath()
             path.addRect(bounds)
-            path.addRect(lowerOpening)
+            path.addRect(opening)
             mask.frame = bounds
             mask.fillRule = .evenOdd
             mask.path = path
