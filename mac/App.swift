@@ -41,6 +41,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var currentStatus="未连接", currentDetail="点击连接，选择 USB 手机或设置无线连接。"
     private var model="", scanGeneration=1, mirrorGeneration=0
     private var relaunchAfterExit=false, lastUserInput=Date.distantPast
+    private var terminationReady=false,terminating=false
     private var framesSent=0, previewsReceived=0, cameraFPS=0.0
     private var latestPhoneFrame:CVPixelBuffer?
     private var mirrorDisplay:Int?
@@ -830,11 +831,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let foreground=try await phone.foreground(onVirtualDisplay:true),
            foreground.hasPrefix("com.tencent.mm/"),foreground.lowercased().contains("scanner") {return true}
         let deadline=ProcessInfo.processInfo.systemUptime+4
-        var openedMenu=false,tappedScanner=false
+        var openedMenu=false,tappedScanner=false,menuAttempts=0
+        var lastMenuTap=0.0
         var recognisedFrame = -1
         while ProcessInfo.processInfo.systemUptime<deadline {
             try await Task.sleep(nanoseconds:120_000_000)
-            guard let image=latestPhoneFrame,previewsReceived != recognisedFrame else{continue}
+            guard let image=latestPhoneFrame else{continue}
+            let retryDue=openedMenu && !tappedScanner && menuAttempts<3 && ProcessInfo.processInfo.systemUptime-lastMenuTap>0.7
+            guard previewsReceived != recognisedFrame || retryDue else{continue}
             recognisedFrame=previewsReceived
             let ocrStarted=ProcessInfo.processInfo.systemUptime
             let words=try await Task.detached(priority:.userInitiated) {try Self.textIn(image)}.value
@@ -844,7 +848,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let allowed=words.filter{labels.contains($0.value.replacingOccurrences(of:" ",with:""))}
             if scanNavigation.count<32 {scanNavigation.append(["ocrMilliseconds":(ProcessInfo.processInfo.systemUptime-ocrStarted)*1000,
                 "labels":allowed.map{["label":$0.value.replacingOccurrences(of:" ",with:""),"x":Int($0.rect.midX),"y":Int($0.rect.midY)]},
-                "menuTapped":openedMenu,"scannerTapped":tappedScanner,"frame":previewsReceived])}
+                "menuTapped":openedMenu,"menuAttempts":menuAttempts,"scannerTapped":tappedScanner,"frame":previewsReceived])}
             let scan=words.first{$0.value.replacingOccurrences(of:" ",with:"").contains("扫一扫")}
             if let scan,scan.rect.midY>950 {return true}
             if !tappedScanner,let scan,scan.rect.midY<950 && words.contains(where:{$0.value.contains("发起群聊") || $0.value.contains("添加朋友")}) {
@@ -855,15 +859,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // Android may add a window caption above WeChat's own toolbar.
             // The lower matching title is the app toolbar; tapping the caption
             // instead leaves the menu closed until the navigation timeout.
-            if !openedMenu,!tappedScanner,home,let title=words.filter({
+            if (!openedMenu || retryDue),!tappedScanner,home,let title=words.filter({
                 $0.value.replacingOccurrences(of:" ",with:"")=="微信" &&
                 $0.rect.midY<170 && (300...420).contains($0.rect.midX)
             }).max(by:{$0.rect.minY<$1.rect.minY}) {
-                mirror.tap(x:665.0/720,y:Double(title.rect.midY/1280))
-                openedMenu=true
+                if menuAttempts==2 {
+                    // A bounded compatibility fallback, only after the exact
+                    // home screen survives two direct-channel attempts.
+                    try await phone.tap(x:665,y:Int(title.rect.midY))
+                } else {mirror.tap(x:665.0/720,y:Double(title.rect.midY/1280))}
+                openedMenu=true;menuAttempts+=1;lastMenuTap=ProcessInfo.processInfo.systemUptime
             }
-            // Never repeat a tap against a not-yet-updated mirror frame, and
-            // never navigate away from an unrecognised or scan-result page.
+            // A launch transition may discard the first input. Retry only the
+            // same plus button after re-confirming the home screen and waiting
+            // 700ms; never navigate an unrecognised page or any scan result.
         }
         return false
     }
@@ -966,6 +975,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool)->Bool {showMainWindow();return true}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
+        if terminationReady {return .terminateNow}
+        guard !terminating else{return .terminateCancel}
+        terminating=true
         launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
         stopping=true;let chooser=connectionWindow;chooser?.close();connectionWindow=nil
@@ -986,8 +998,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 alert.addButton(withTitle:"退出，下次连接时清理");alert.runModal()
             }
             if relaunchAfterExit {scheduleRelaunch()}
-            NSApp.reply(toApplicationShouldTerminate:true)
+            terminationReady=true
+            NSApp.terminate(nil)
         }
-        return .terminateLater
+        // Returning cancel lets the normal event loop service MainActor cleanup.
+        // A later terminate returns immediately once resources are released.
+        return .terminateCancel
     }
 }

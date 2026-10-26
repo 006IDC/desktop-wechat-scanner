@@ -17,6 +17,7 @@ import CoreImage.CIFilterBuiltins
     private var previousTick: TimeInterval?
     private var tickGaps: [Double] = []
     private var positionErrors: [Double] = []
+    private var lastSampledSent=0
     private var movementSent=0
     private var movementDuration=0.0
     private var captureCosts:[Double]=[],transferCosts:[Double]=[]
@@ -85,7 +86,8 @@ import CoreImage.CIFilterBuiltins
     func recordPump(_ stats:CameraPumpMailbox.Statistics,at now:TimeInterval) {
         guard let started,now-started<=6 else{return}
         movementSent=stats.sent;movementDuration=now-started
-        if stats.sent>0,captureCosts.count<600 {
+        if stats.sent>0,stats.sent != lastSampledSent,captureCosts.count<600 {
+            lastSampledSent=stats.sent
             captureCosts.append(stats.captureMilliseconds);transferCosts.append(stats.transferMilliseconds)
         }
     }
