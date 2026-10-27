@@ -180,6 +180,11 @@ final class NativeScannerMatte {
         let nextDrawable=layer.nextDrawable()
         stats.drawableWait(milliseconds:(ProcessInfo.processInfo.systemUptime-drawableBegan)*1000)
         guard let drawable=nextDrawable else { return false }
+        return try present(black:black,drawable:drawable,stats:stats)
+    }
+    /// CAMetalDisplayLink already supplies its drawable; never acquire another.
+    func present(black:CIImage,drawable:CAMetalDrawable,stats:NativeMattePresentationStats) throws -> Bool {
+        guard black.extent==extent else{throw Unavailable("dimensions")}
         guard let command=queue.makeCommandBuffer() else { throw Unavailable() }
         context.render(black,to:input,commandBuffer:command,bounds:extent,colorSpace:CGColorSpaceCreateDeviceRGB())
         try Self.encode(command,pipeline:composite,a:input,b:transmission,output:output)

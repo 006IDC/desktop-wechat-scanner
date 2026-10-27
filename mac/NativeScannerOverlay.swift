@@ -20,7 +20,8 @@ import CoreVideo
         guard let binding=decodedBinding else{return false}
         return binding.mailbox.hasDecodedFrameObserver(binding.id,generation:binding.generation)
     }
-    private var worker:Task<Void,Never>?
+    private var displayDriver:NativeMetalDisplayDriver?
+    var presentationClock:String {displayDriver == nil ? "notStarted":"metalDisplayLink"}
     private var identity:(Int,Int)?
     private let display:Int,package:String
     private let fastCalibration:Bool
@@ -180,37 +181,33 @@ import CoreVideo
         layer.device=renderer.metalDevice;layer.pixelFormat = .bgra8Unorm
         layer.framebufferOnly=false;layer.isOpaque=false;layer.maximumDrawableCount=2
         layer.allowsNextDrawableTimeout=true;layer.displaySyncEnabled=true
-        // Layer is attached/sized by the native view before this worker starts.
-        worker=Task.detached(priority:.userInitiated) { [frames,layer,statistics,weak self] in
-            var last=0
-            do {
-                while !Task.isCancelled {
-                    let sample=frames.latest()
-                    guard sample.2 else{break}
-                    if sample.0 != last,let pixels=sample.1,layer.drawableSize.width>0,layer.drawableSize.height>0 {
-                        _=try renderer.present(black:CIImage(cvPixelBuffer:pixels),layer:layer,stats:statistics)
-                        last=sample.0
-                    }
-                    try await Task.sleep(nanoseconds:5_000_000)
-                }
-            } catch {
-                if let owner=self,!Task.isCancelled {await owner.recordFailure()}
-            }
-            let deadline=ProcessInfo.processInfo.systemUptime+0.5
-            // Hidden windows may never present their final drawable. Waiting
-            // for its presentation callback would turn Back/close into a pause.
-            // GPU completion is sufficient for releasing renderer resources;
-            // the statistics still disclose pending presentation callbacks.
-            while ProcessInfo.processInfo.systemUptime<deadline,statistics.snapshot()["pendingGPU"] as? Int != 0 {
-                try? await Task.sleep(nanoseconds:20_000_000)
-            }
-        }
+        let input=frames,statistics=statistics
+        var lastRenderedRevision=0 // Only the dedicated render run loop accesses this.
+        let driver=NativeMetalDisplayDriver(layer:layer,active:{input.latest().2},render:{drawable in
+            let sample=input.latest()
+            guard sample.2,sample.0 != lastRenderedRevision,let pixels=sample.1 else{return}
+            _=try renderer.present(black:CIImage(cvPixelBuffer:pixels),drawable:drawable,stats:statistics)
+            lastRenderedRevision=sample.0
+        },failure:{ [weak self] in Task { @MainActor in self?.recordFailure() } })
+        displayDriver=driver
     }
+    func startPresentation() {if !frozen {displayDriver?.start()}}
     /// Keep the last original UI over the desktop while the real phone decides
     /// the QR result. No stale pointer input is accepted during this interval.
     func freeze() {
         frozen=true;frames.stop()
+        displayDriver?.stop()
         if let binding=decodedBinding {binding.mailbox.removeDecodedFrameObserver(binding.id);decodedBinding=nil}
     }
-    func stop() async {noteEnd(.cleared);freeze();await worker?.value;worker=nil}
+    func stop() async {
+        noteEnd(.cleared);freeze()
+        await displayDriver?.waitUntilStopped()
+        let deadline=ProcessInfo.processInfo.systemUptime+0.5
+        // Occluded drawables may have no presentation callback. Drain GPU work
+        // only; keep the callback accounting visible in the final statistics.
+        while ProcessInfo.processInfo.systemUptime<deadline,statistics.snapshot()["pendingGPU"] as? Int != 0 {
+            try? await Task.sleep(nanoseconds:20_000_000)
+        }
+        displayDriver=nil
+    }
 }

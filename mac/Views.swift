@@ -831,6 +831,7 @@ final class ControlWindowController: NSWindowController {
         holder.phone.setNativeScannerLayer(overlay.layer)
         holder.phone.interactionEnabled=true
         setScannerFloating(true)
+        overlay.startPresentation()
     }
     func freezeNativeScanner() {holder.phone.interactionEnabled=false}
     func endNativeScanner() {

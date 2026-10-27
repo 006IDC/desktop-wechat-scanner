@@ -856,6 +856,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let nativeOverlay=nativeScannerOverlay;observedOverlay=nativeOverlay
                     item["nativeScannerPreviewVisible"]=mainControl.nativeScannerVisible
                     item["nativeDecodedFrameDelivery"]=nativeOverlay?.decodedFrameDelivery ?? false
+                    item["nativePresentationClock"]=nativeOverlay?.presentationClock ?? "none"
                     if let nativeOverlay {item["nativeCalibration"]=nativeOverlay.calibrationTiming}
                     if CommandLine.arguments.contains("--diagnostic-main-actor-pause") {
                         guard let nativeOverlay else{throw ScanError("主线程隔离测试需要原生预览。")}
