@@ -860,11 +860,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if let nativeOverlay {item["nativeCalibration"]=nativeOverlay.calibrationTiming}
                     if CommandLine.arguments.contains("--diagnostic-main-actor-pause") {
                         guard let nativeOverlay else{throw ScanError("主线程隔离测试需要原生预览。")}
-                        // Explicit fault injection in this synthetic-board test
-                        // only. Give AppKit time to commit the attached layer;
-                        // decoded input and GPU presentation must then proceed
-                        // while this app's MainActor cannot service its timer.
-                        try await Task.sleep(nanoseconds:1_000_000_000)
+                        // Wait for measured display readiness rather than
+                        // assuming one second means the layer is on screen.
+                        // Occluded/hidden drawables may complete with time=0;
+                        // GPU completion alone cannot establish this precondition.
+                        let readyBegan=ProcessInfo.processInfo.systemUptime
+                        while (nativeOverlay.statistics.snapshot()["presented"] as? Int ?? 0)==0,
+                              ProcessInfo.processInfo.systemUptime-readyBegan<3 {
+                            try Task.checkCancellation()
+                            try await Task.sleep(nanoseconds:25_000_000)
+                        }
+                        item["displayReadinessWaitMilliseconds"]=(ProcessInfo.processInfo.systemUptime-readyBegan)*1000
+                        item["windowVisibleBeforePause"]=mainControl.window?.isVisible ?? false
+                        item["windowUnoccludedBeforePause"]=mainControl.window?.occlusionState.contains(.visible) ?? false
+                        if let window=mainControl.window {
+                            item["windowFrameBeforePause"]=[window.frame.minX,window.frame.minY,window.frame.width,window.frame.height]
+                            item["windowScreenIntersectionBeforePause"]=window.screen.map {$0.frame.intersection(window.frame).size != .zero} ?? false
+                        }
+                        guard (nativeOverlay.statistics.snapshot()["presented"] as? Int ?? 0)>0 else {
+                            throw ScanError("未确认原生层实际上屏，主线程暂停实验不成立。")
+                        }
                         try Task.checkCancellation()
                         guard nativeScannerOverlay === nativeOverlay,cameraActive else{throw ScanError("主线程隔离测试的原生预览已变化。")}
                         let before=nativeOverlay.statistics.snapshot()
