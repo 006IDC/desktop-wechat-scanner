@@ -11,6 +11,7 @@ import CoreImage.CIFilterBuiltins
     private let pattern = ScanPerformancePattern()
     private var originalOrigin: NSPoint
     private var scanner: NSWindow
+    private var lastStackingLevel:Int?
     private var center: NSPoint
     private var captureOffsetX: CGFloat
     private var started: TimeInterval?
@@ -45,10 +46,10 @@ import CoreImage.CIFilterBuiltins
         board.title = "扫码流畅度自检 · 合成图案"
         board.contentView = pattern
         board.collectionBehavior = [.canJoinAllApplications]
-        // Keep the synthetic board behind the floating scanner even if
-        // Stage Manager moves ordinary application windows into thumbnails.
-        board.level = NSWindow.Level(rawValue:NSWindow.Level.floating.rawValue-1)
-        board.orderFront(nil)
+        // Before a scanner opens, the mirror is an ordinary window. A board
+        // already at floating-1 would cover it and consume real pointer input.
+        board.level=window.level
+        board.order(.below,relativeTo:window.windowNumber)
         let capture = scanner.desktopCaptureRect
         captureOffsetX=capture.minX-window.frame.minX
         // Center QR in the actual transparent camera aperture, not in the whole phone.
@@ -68,6 +69,7 @@ import CoreImage.CIFilterBuiltins
     func bindLocalFrame(_ controller:ScanFrameController) {
         guard let window=controller.window else{return}
         scanner=window;originalOrigin=window.frame.origin
+        lastStackingLevel=nil
         captureOffsetX=controller.captureRect.minX-window.frame.minX
         center=NSPoint(x:board.frame.midX-window.frame.width/2,
                        y:board.frame.midY-176)
@@ -76,6 +78,7 @@ import CoreImage.CIFilterBuiltins
 
     /// Called by the same common-mode presentation tick as the product camera.
     func tick(at now: TimeInterval) {
+        synchronizeStacking()
         guard let started else { return }
         let elapsed=now-started
         if let previousTick, elapsed <= 6 { tickGaps.append((now-previousTick)*1000) }
@@ -91,6 +94,17 @@ import CoreImage.CIFilterBuiltins
             scanner.setFrameOrigin(center)
             qrVisible=true; pattern.showQR=true; pattern.needsDisplay=true
         }
+    }
+
+    private func synchronizeStacking() {
+        guard lastStackingLevel != scanner.level.rawValue else{return}
+        lastStackingLevel=scanner.level.rawValue
+        let desired=NSWindow.Level(rawValue:max(NSWindow.Level.normal.rawValue,scanner.level.rawValue-1))
+        if board.level != desired {board.level=desired}
+        // Same-level ordering matters before the phone's camera promotes the
+        // scanner to floating. With different levels, the levels keep it below.
+        if board.level == scanner.level {board.order(.below,relativeTo:scanner.windowNumber)}
+        else if !board.isVisible {board.orderFront(nil)}
     }
 
     func recordCaptureRect(_ captureRect: CGRect, at now: TimeInterval) {

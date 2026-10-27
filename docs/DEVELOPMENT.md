@@ -292,3 +292,9 @@ GPU资源复用依据[Apple CIContext文档](https://developer.apple.com/documen
 机主再次解锁后的f3a1f04手动验收：CUA对候选和系统设置均报ScreenCaptureKit -3811，但仍可读应用清单；重建CUA JavaScript会话后恢复，并实际读到支付宝首页。没有修改TCC或系统权限。不要把这个工具失败直接归为App权限错误，也不能保证同法能修复所有-3811。
 
 本轮随后ADB报告设备不可达，复查授权USB设备=0、已连接无线设备=0，5秒无线调试Bonjour浏览也未发现服务；支付宝点按/原生扫码未完成验收。测试前端已通过正常退出关闭，恢复记录仍保留，不能宣称已核对本轮手机侧资源清理。需要恢复到此前准确的USB连接再用既有生产恢复逻辑核对/清理；未重启手机、未新配对、未切换设备身份或改动安装版。
+
+USB重新接入后，生产恢复逻辑清理旧journal成功，三个系统服务均正常响应。f3a1f04与8b0f600两轮手动入口诊断均未确认扫一扫，均正常清理，不能当作流畅度通过；既有screenPermission持续true。8b0f600的显式手动诊断同时记录主窗口局部事件、最多8个自有命中view类型及PhonePreview down/up累计计数（含before快照）；不记录Android正文或图片。该轮两应用的局部事件与preview计数均为0，尚不足以断定输入被App拦截，需要与自有纯测试窗口对照。单独普通AppKit探针能收到工具的down/drag/up，但原生标题拖动的窗口位置仍未变化。
+
+8b0f600修复同值localScanPreview状态刷新清空尚未完成触摸的问题：同值不改变触摸，真正模式变化才发送UP并释放。组件回归覆盖down→同值刷新→up，以及实际view树hitTest命中PhonePreview。AppKit hitTest参数属于receiver的superview坐标（[Apple文档](https://developer.apple.com/documentation/appkit/nsview/hittest(_:))）；不能套用UIKit坐标约定。此修复不等于已定位全部卡顿。另在恢复原尺寸后仍观察到微信重复标题，因此此前balanced-display与该现象的关联不能表述为唯一根因。
+
+随后纯合成输入探针复用真实ControlWindowController，工具重建会话后收到down/up、localEvents=2，触点坐标与合成圆点一致。产品诊断仍未收到事件，进一步查明自检棋盘在扫码启动前已固定floating-1，而主镜像尚为normal；其遮挡会拦截坐标点击，单窗口截图却排除了棋盘。当前修复仅涉及诊断：初始棋盘与镜像同级并order below，随后按镜像normal/floating变化同步层级，停止扫码时退回normal；缓存层级避免60Hz重复排序。组件回归验证normal→floating→normal，实际view树命中与同值刷新触摸均通过；含NSScreen的层级测试需在可访问WindowServer的环境运行。此前“坐标点击未交付”不能解释成所有普通AppKit输入或真实手机控制故障；修正后的手动真机验收另记。

@@ -18,6 +18,8 @@ import CoreVideo
         var events=[UInt8]()
         ui.onTouch={action,_,_ in events.append(action)}
         let location=phone.convert(NSPoint(x:phone.bounds.midX,y:phone.bounds.midY),to:nil)
+        let hitPoint=root.superview?.convert(location,from:nil) ?? location
+        precondition(root.hitTest(hitPoint) === phone,"The phone preview did not receive its actual view-tree hit")
         let down=NSEvent.mouseEvent(with:.leftMouseDown,location:location,modifierFlags:[],timestamp:1,
             windowNumber:window.windowNumber,context:nil,eventNumber:1,clickCount:1,pressure:1)!
         let up=NSEvent.mouseEvent(with:.leftMouseUp,location:location,modifierFlags:[],timestamp:2,
@@ -60,6 +62,13 @@ import CoreVideo
         NotificationCenter.default.post(name:NSWindow.didResignKeyNotification,object:window)
         phone.mouseUp(with:up)
         precondition(events==[0,1,0,1,0,1,0,1],"Window focus loss left a pressed touch")
+        let check=try! ScanPerformanceCheck(scanner:ui)
+        precondition(check.board.level==window.level,"Diagnostic board covered an ordinary mirror")
+        window.level = .floating;check.tick(at:0)
+        precondition(check.board.level.rawValue==window.level.rawValue-1,"Diagnostic board did not follow scanner promotion")
+        window.level = .normal;check.tick(at:0)
+        precondition(check.board.level == .normal,"Diagnostic board stayed above the mirror after scanner exit")
+        _=check.finish()
         print("PASS native overlay: full-window transparency and titlebar restoration; calibration/handoff release and reject touches; native input recovers. No phone, capture or OS input.")
     }
 }
