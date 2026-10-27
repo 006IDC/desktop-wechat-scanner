@@ -910,15 +910,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         defer {_=input?.finish()}
                         let initial=mainControl.window?.frame.origin ?? .zero
                         let initialDragRequests=mainControl.nativeTitleDragRequests
-                        let until=ProcessInfo.processInfo.systemUptime+60
+                        let holdBegan=ProcessInfo.processInfo.systemUptime,until=holdBegan+60
                         var maximumDisplacement=0.0
+                        var visibleSamples=0,occludedSamples=0,miniaturizedSamples=0
                         while ProcessInfo.processInfo.systemUptime<until {
                             try Task.checkCancellation()
+                            guard cameraActive,!busy,nativeScannerOverlay === nativeOverlay else{break}
+                            if let window=mainControl.window {
+                                if window.isVisible && window.occlusionState.contains(.visible) {visibleSamples+=1}
+                                else {occludedSamples+=1}
+                                if window.isMiniaturized {miniaturizedSamples+=1}
+                            }
                             if let origin=mainControl.window?.frame.origin {
                                 maximumDisplacement=max(maximumDisplacement,hypot(origin.x-initial.x,origin.y-initial.y))
                             }
                             try await Task.sleep(nanoseconds:50_000_000)
                         }
+                        item["interactivePreviewObservedSeconds"]=ProcessInfo.processInfo.systemUptime-holdBegan
+                        item["holdVisibleSamples"]=visibleSamples
+                        item["holdOccludedSamples"]=occludedSamples
+                        item["holdMiniaturizedSamples"]=miniaturizedSamples
                         item["observedHoldWindowDisplacementPoints"]=maximumDisplacement
                         item["observedOwnWindowInput"]=input?.finish()
                         item["nativeTitleDragRequests"]=mainControl.nativeTitleDragRequests-initialDragRequests

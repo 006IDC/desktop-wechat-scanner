@@ -49,6 +49,9 @@ import QuartzCore
         termination["sameGeneration"]=identity?.0==state.generation
         termination["sameOwnerGeneration"]=identity?.1==state.ownerGeneration
         termination["activeStreams"]=state.activeStreams
+        let activity=state.activities.first {$0.displayId==display}
+        termination["ownedDisplayHasActivity"]=activity != nil
+        termination["sameApplicationOnOwnedDisplay"]=activity?.component.hasPrefix(package+"/") ?? false
     }
     func notePumpFailure(_ error:Error) {
         guard termination.isEmpty else{return}
