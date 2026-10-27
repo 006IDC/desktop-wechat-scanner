@@ -1690,6 +1690,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     report["cleanupStage"]=await phoneSession?.cleanupStage
                     report["cleanupCameraStreamsBeforeSleep"]=await phoneSession?.cleanupCameraStreamsBeforeSleep
                     report["cleanupCameraClosureConfirmed"]=await phoneSession?.cleanupCameraClosureConfirmed
+                    report["cleanupScannerBeforeSleep"]=await phoneSession?.cleanupScannerBeforeSleep
+                    if report["test"] as? String == "desktop-native-active-scanner-exit" {
+                        let beforeSleepScanner=await phoneSession?.cleanupScannerBeforeSleep
+                        let beforeSleepStreams=await phoneSession?.cleanupCameraStreamsBeforeSleep
+                        let closureConfirmed=await phoneSession?.cleanupCameraClosureConfirmed
+                        let verified=problem.isEmpty && beforeSleepScanner==true && (beforeSleepStreams ?? 0)>0 && closureConfirmed==true
+                        report["activeScannerExitVerified"]=verified
+                        if !verified {report["passed"]=false;diagnosticExitStatus=1}
+                    }
                     if !problem.isEmpty {report["passed"]=false}
                     let writer=DiagnosticStateWriter(fileURL:file);writer.submit(report);await writer.flush()
                 }

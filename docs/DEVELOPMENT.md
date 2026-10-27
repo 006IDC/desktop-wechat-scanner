@@ -275,3 +275,10 @@ GPU资源复用依据[Apple CIContext文档](https://developer.apple.com/documen
 8e9f980微信已通过原生校准、测试码识别/返回：约1202ms校准，呈现p95=33.33ms、最大50ms、GPU p95=4.73ms，编码器报告latency=1帧（不是端到端输入延迟）；支付宝本轮自动入口未确认，整体passed=false。退出complete、journal清除、系统相机健康。此结果也不证明此前重复标题一定由分辨率单一因素导致，只能说明保留原尺寸候选的微信主流程已通过。
 
 退出取消边界：先取消并等待启动诊断结束，再停止镜像/手机会话，避免还在收尾的诊断与设备释放交错。`--diagnostic-active-scanner-exit`在显式桌面诊断下只打开微信，确认原生扫码层及认证scanner状态，不展示QR、不发送Home，随后走正常退出；用独立test名称/通过条件，不冒充双应用QR通过。cleanup另记录休眠前流数、是否完成双闭合及固定阶段，不输出owner包名/页面/设备标识。此模式待真机验证。
+
+
+6f7c41d活跃退出真机实测：test=desktop-native-active-scanner-exit，开始退出前认证scanner存在、流数1；PhoneSession在cmd24前再次认证读取仍为1流，随后双闭合确认true、cleanupStage=complete、journal消失；virtualdevice/virtual_camera/media.camera均健康。此实验不验证QR识别，也不证明ROM底层无缺陷。后续将cmd24前scanner布尔、正流数与闭合/清理共同作为activeScannerExitVerified门槛，缺证据不通过。
+
+同轮CUA主显示器拖动：窗口收到down/drag/up与1次NSWindow.performDrag请求，按下/松开WindowServer边界仍(555,46,360,820)，60秒位移0。排除了仅负坐标屏幕导致此现象的解释，仍不能用CUA替代物理拖动验收。呈现p95约33.33ms，最大216.67ms；长间隔集中于CUA观测时段，只是相关，不能归定某个系统组件。原生微信控件在截图中可见；单窗口捕获不能证明真实桌面透视已等价参考视频。
+
+随后6f7c41d手动双应用诊断被CUA明确报告的Mac锁屏挡住；既有screenPermission=true。尚未完成支付宝手动入口、真实桌面透视及物理拖动手感验收，已安装build41没有替换，未发布候选。
