@@ -802,6 +802,7 @@ final class ControlWindowController: NSWindowController {
     }
     func freezeNativeScanner() {holder.phone.interactionEnabled=false}
     func endNativeScanner() {
+        setScannerFloating(false)
         holder.phone.nativeScannerFrames=nil;holder.phone.setNativeScannerLayer(nil)
         holder.phone.interactionEnabled=true;background.nativeScannerPreview=false
         window?.styleMask.remove(.fullSizeContentView);window?.titlebarAppearsTransparent=false

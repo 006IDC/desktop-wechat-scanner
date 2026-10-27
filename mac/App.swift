@@ -839,6 +839,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     guard cameraActive,!busy,cameraPump != nil,cameraWindow === mainControl else{throw ScanError("应用内扫一扫未自动启用桌面相机。")}
                     let nativeOverlay=nativeScannerOverlay
                     item["nativeScannerPreviewVisible"]=mainControl.nativeScannerVisible
+                    if nativeOverlay != nil,CommandLine.arguments.contains("--diagnostic-native-hold") {
+                        // Bounded observation window for real CUA pointer dragging;
+                        // only the synthetic board remains eligible for capture.
+                        item["interactivePreviewHoldSeconds"]=60
+                        try await Task.sleep(nanoseconds:60_000_000_000)
+                        guard cameraActive,!busy,nativeScannerOverlay === nativeOverlay else {
+                            throw ScanError("原生预览在观察期间已结束，诊断不继续点击。")
+                        }
+                    }
                     item["automaticCameraStarted"]=true
                     item["localFrameVisible"]=localScanFrame?.window?.isVisible == true
                     if localScanFrame != nil {
@@ -903,6 +912,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func navigateDiagnosticScanner(package:String,evidence:inout [String:Any]) async throws {
         var plusTapped=false,scanTapped=false,returnedFromResult=false
+        var scanAttempts=0,lastScanTap=0.0
         var observedHomeLabels=Set<String>()
         var stateSamples=0,targetActivitySamples=0,frameSamples=0
         defer {
@@ -911,9 +921,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             evidence["navigationFrameSamples"]=frameSamples
             evidence["navigationPlusTapped"]=plusTapped
             evidence["navigationScanTapped"]=scanTapped
+            evidence["navigationScanAttempts"]=scanAttempts
             evidence["navigationKnownLabels"]=observedHomeLabels.sorted()
         }
-        let deadline=ProcessInfo.processInfo.systemUptime+10
+        let deadline=ProcessInfo.processInfo.systemUptime+30
         try await Task.sleep(nanoseconds:500_000_000)
         while ProcessInfo.processInfo.systemUptime<deadline {
             try Task.checkCancellation()
@@ -925,9 +936,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 try await Task.sleep(nanoseconds:120_000_000);continue
             }
             targetActivitySamples+=1
-            if let pixels=latestPhoneFrame,!scanTapped {
+            let retryScan=scanTapped && scanAttempts<3 && ProcessInfo.processInfo.systemUptime-lastScanTap>=0.8
+            if let pixels=latestPhoneFrame,!scanTapped || retryScan {
                 frameSamples+=1
-                let point=try await Task.detached { () -> (CGPoint?,Bool,Bool,[String]) in
+                let point=try await Task.detached(priority:.userInitiated) { () -> (CGPoint?,Bool,Bool,[String]) in
                     let words=try ScannerNavigationOCR.recognize(pixels)
                     let known=["首页","消息","生活","理财","我的","支付宝","收付款","收付钱","扫一扫","微信","通讯录","发现","我"]
                     let labels=words.filter{known.contains($0.value)}.map(\.value)
@@ -951,8 +963,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 observedHomeLabels.formUnion(point.3)
                 if point.2,!returnedFromResult {scannerMirror.session.key(4);returnedFromResult=true}
                 else if let target=point.0,!(point.1 && plusTapped) {
+                    let current=try await phone.cameraState()
+                    guard current.scannerActivity()==nil,
+                          current.activities.first(where:{$0.displayId==display})?.component == state.activities.first(where:{$0.displayId==display})?.component else {
+                        continue
+                    }
                     scannerMirror.session.tap(x:target.x,y:target.y)
-                    if point.1 {plusTapped=true}else{scanTapped=true}
+                    if point.1 {plusTapped=true}else{scanTapped=true;scanAttempts+=1;lastScanTap=ProcessInfo.processInfo.systemUptime}
                     try await Task.sleep(nanoseconds:400_000_000)
                 }
             }

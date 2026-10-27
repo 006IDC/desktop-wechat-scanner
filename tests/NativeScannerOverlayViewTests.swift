@@ -24,6 +24,7 @@ import AppKit
         phone.mouseDown(with:down)
         precondition(events==[0],"Synthetic component touch did not start")
         let overlay=NativeScannerOverlay(display:7,package:"com.tencent.mm")
+        let originalLevel=window.level,originalBehavior=window.collectionBehavior
         ui.prepareNativeScanner(overlay)
         precondition(events==[0,1],"Calibration failed to release the active touch")
         phone.mouseDown(with:down);phone.mouseUp(with:up)
@@ -37,6 +38,7 @@ import AppKit
         precondition(events==[0,1,0,1],"Frozen scanner accepted input")
         ui.endNativeScanner()
         precondition(!ui.nativeScannerVisible && window.isOpaque && !window.styleMask.contains(.fullSizeContentView))
+        precondition(window.level==originalLevel && window.collectionBehavior==originalBehavior,"Overlay kept the result above other apps")
         phone.mouseDown(with:down);phone.mouseUp(with:up)
         precondition(events==[0,1,0,1,0,1],"Native input did not recover")
         phone.mouseDown(with:down)
