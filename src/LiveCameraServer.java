@@ -72,6 +72,7 @@ public final class LiveCameraServer {
     private static final String CAMERA_OWNER_PERMISSION = "android.permission.CAMERA_OPEN_CLOSE_LISTENER";
     private boolean independentLockRequested;
     private boolean desktopHomeRequested;
+    private boolean balancedDisplayRequested, displayBeforeCameraRequested;
     // Android 16 DisplayManager.VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS.
     private static final int DISPLAY_SYSTEM_DECORATIONS = 1 << 9;
 
@@ -147,24 +148,32 @@ public final class LiveCameraServer {
     static final class SessionFlags {
         final boolean independentLock;
         final boolean desktopHome;
-        SessionFlags(boolean independentLock, boolean desktopHome) {
+        final boolean balancedDisplay, displayBeforeCamera;
+        SessionFlags(boolean independentLock, boolean desktopHome, boolean balancedDisplay, boolean displayBeforeCamera) {
             this.independentLock = independentLock;
             this.desktopHome = desktopHome;
+            this.balancedDisplay = balancedDisplay;
+            this.displayBeforeCamera = displayBeforeCamera;
         }
     }
 
     static SessionFlags parseSessionFlags(String[] args) {
-        if (args == null || args.length < 3 || args.length > 5 ||
+        if (args == null || args.length < 3 || args.length > 7 ||
                 !args[1].matches("006idc_scan_[0-9a-f]{8}") || !args[2].matches("[0-9a-f]{32}"))
-            throw new IllegalArgumentException("Expected associationId 006idc_scan_<8 hex> <32 hex token> [independent-lock] [desktop-home]");
+            throw new IllegalArgumentException("Expected associationId 006idc_scan_<8 hex> <32 hex token> [independent-lock] [desktop-home] [balanced-display] [display-before-camera]");
         boolean independentLock = false;
         boolean desktopHome = false;
+        boolean balancedDisplay = false, displayBeforeCamera = false;
         for (int index = 3; index < args.length; index++) {
             if ("independent-lock".equals(args[index]) && !independentLock) independentLock = true;
             else if ("desktop-home".equals(args[index]) && !desktopHome) desktopHome = true;
+            else if ("balanced-display".equals(args[index]) && !balancedDisplay) balancedDisplay = true;
+            else if ("display-before-camera".equals(args[index]) && !displayBeforeCamera) displayBeforeCamera = true;
             else throw new IllegalArgumentException("Unsupported or duplicate virtual display flag");
         }
-        return new SessionFlags(independentLock, desktopHome);
+        if ((balancedDisplay || displayBeforeCamera) && !desktopHome)
+            throw new IllegalArgumentException("Research display flags require desktop-home");
+        return new SessionFlags(independentLock, desktopHome, balancedDisplay, displayBeforeCamera);
     }
 
     static boolean requestedIndependentLock(String[] args) {
@@ -498,9 +507,12 @@ public final class LiveCameraServer {
         call(builder, "setSensorOrientation", new Class[]{int.class}, 90);
         call(builder, "setVirtualCameraCallback", new Class[]{Executor.class, callbackClass}, callbacks, callback);
         Object config = call(builder, "build", new Class[]{});
+        log("setup_phase", "camera_register");
         camera = call(device, "createVirtualCamera", new Class[]{configClass}, config);
+        log("setup_phase", "camera_identifier");
         virtualCameraId = (String) call(camera, "getId", new Class[]{});
         log("camera_id", virtualCameraId);
+        log("setup_phase", "camera_owner_watch");
         watchCameraOwner();
         painter.scheduleWithFixedDelay(() -> {
             // Arrival-driven drawing already supplies the active 30fps stream.
@@ -754,6 +766,10 @@ public final class LiveCameraServer {
         displayWidth = metrics.widthPixels;
         displayHeight = metrics.heightPixels;
         displayDpi = metrics.densityDpi;
+        if (balancedDisplayRequested) {
+            DesktopDisplayGeometry geometry = DesktopDisplayGeometry.fromPrimary(displayWidth, displayHeight, displayDpi);
+            displayWidth = geometry.width; displayHeight = geometry.height; displayDpi = geometry.dpi;
+        }
         if (displayWidth <= 0 || displayHeight <= 0 || displayWidth > 4096 || displayHeight > 4096 || displayDpi <= 0)
             throw new IllegalStateException("Invalid primary display geometry");
         displayReader = ImageReader.newInstance(displayWidth, displayHeight, PixelFormat.RGBA_8888, 3);
@@ -1236,6 +1252,8 @@ public final class LiveCameraServer {
             SessionFlags flags = parseSessionFlags(args);
             live.independentLockRequested = flags.independentLock;
             live.desktopHomeRequested = flags.desktopHome;
+            live.balancedDisplayRequested = flags.balancedDisplay;
+            live.displayBeforeCameraRequested = flags.displayBeforeCamera;
             int association = Integer.parseInt(args[0]);
             if (association <= 0) throw new IllegalArgumentException("Association ID must be positive");
             byte[] token = args[2].getBytes(StandardCharsets.US_ASCII);
@@ -1243,10 +1261,22 @@ public final class LiveCameraServer {
             CameraProbe.context = live.context;
             log("pid", Process.myPid());
             Runtime.getRuntime().addShutdownHook(new Thread(live::close));
+            log("setup_phase", "virtual_device");
             live.createVirtualDevice(association);
+            // Explicit research switch; default product order is unchanged.
+            if (live.displayBeforeCameraRequested) {
+                log("setup_phase", "owned_display");
+                live.createVirtualDisplay();
+            }
+            log("setup_phase", "camera_policy");
             live.grantSupportedCameras();
+            log("setup_phase", "virtual_camera");
             live.createVirtualCamera();
-            live.createVirtualDisplay();
+            if (!live.displayBeforeCameraRequested) {
+                log("setup_phase", "owned_display");
+                live.createVirtualDisplay();
+            }
+            log("setup_phase", "session_channel");
             live.serve(args[1], token);
         } catch (Throwable error) {
             while (error instanceof InvocationTargetException && error.getCause() != null) error = error.getCause();

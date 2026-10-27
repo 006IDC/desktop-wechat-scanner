@@ -91,6 +91,12 @@ public final class LiveIndependentLockContractTests {
         rejects(() -> LiveCameraServer.requestedIndependentLock(new String[]{legacy[0], "unscoped_socket", legacy[2], "independent-lock"}), "Unscoped socket accepted");
         rejects(() -> LiveCameraServer.requestedIndependentLock(new String[]{legacy[0], legacy[1], "invalid", "independent-lock"}), "Malformed token accepted");
 
+        LiveCameraServer.SessionFlags normalFlags = LiveCameraServer.parseSessionFlags(legacy);
+        require(!normalFlags.balancedDisplay && !normalFlags.displayBeforeCamera, "Research paths enabled by default");
+        LiveCameraServer.SessionFlags research = LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-home","balanced-display","display-before-camera"});
+        require(research.balancedDisplay && research.displayBeforeCamera && research.desktopHome, "Explicit research flags lost");
+        rejects(() -> LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"balanced-display"}), "Unscoped research accepted");
+        rejects(() -> LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-home","balanced-display","balanced-display"}), "Duplicate research accepted");
         java.util.Map<Integer, String> ownedApps = java.util.Map.of(11, "owned");
         require(LiveCameraServer.isOwnedDisplayId(7, 7, ownedApps), "Owned desktop display filtered");
         require(LiveCameraServer.isOwnedDisplayId(11, 7, ownedApps), "Owned app display filtered");

@@ -21,6 +21,13 @@ import Foundation
         do {_ = try await exitWaiter.value;fatalError("Exited server accepted readiness")}
         catch {guard error.localizedDescription.contains("退出") else{throw error}}
         guard Date().timeIntervalSince(exitStarted)<1 else{fatalError("Exited server waited for full startup timeout")}
+        for phase in ["virtual_device", "camera_policy", "virtual_camera", "camera_register", "camera_identifier", "camera_owner_watch", "owned_display", "session_channel"] {
+            let phased = ServerLog()
+            phased.append(Data("QR_LIVE setup_phase=\(phase)\n".utf8)); phased.finish()
+            do { _ = try phased.waitReady(); fatalError("Exited staged server accepted readiness") }
+            catch { guard let description = ServerLog.setupDescription(phase), error.localizedDescription.contains(description) else { throw error } }
+        }
+        guard ServerLog.setupDescription("untrusted raw text") == nil else { fatalError("Unknown phase echoed") }
         let readyThenEOF=ServerLog()
         readyThenEOF.append(Data("QR_LIVE device_id=7\nQR_LIVE display_id=9\nQR_LIVE pid=123\nQR_LIVE ready=1\n".utf8))
         readyThenEOF.finish()

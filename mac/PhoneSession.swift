@@ -144,6 +144,19 @@ final class ServerLog {
         condition.lock();defer {condition.unlock()}
         return (Int(fields["display_width"] ?? "") ?? 720,Int(fields["display_height"] ?? "") ?? 1280)
     }
+    static func setupDescription(_ phase:String?) -> String? {
+        switch phase {
+        case "virtual_device": return "创建独立设备"
+        case "camera_policy": return "配置本次虚拟相机"
+        case "virtual_camera": return "注册虚拟相机"
+        case "camera_register": return "提交虚拟相机注册"
+        case "camera_identifier": return "取得虚拟相机标识"
+        case "camera_owner_watch": return "确认虚拟相机归属"
+        case "owned_display": return "创建独立屏幕"
+        case "session_channel": return "建立本次连接通道"
+        default: return nil
+        }
+    }
     func waitReady() throws -> (Int,Int,Int) {
         condition.lock(); defer { condition.unlock() }
         let end = Date().addingTimeInterval(25)
@@ -155,7 +168,8 @@ final class ServerLog {
         guard fields["ready"] == "1", let device = Int(fields["device_id"] ?? ""),
               let display = Int(fields["display_id"] ?? ""), let pid = Int(fields["pid"] ?? ""),
               device > 0, display > 0, pid > 0 else {
-            throw ScanError(ended ? "手机连接服务在准备完成前退出，请重新连接。" : "手机连接服务准备超时，已停止本次连接。")
+            let phase = Self.setupDescription(fields["setup_phase"]).map { "（\($0)）" } ?? ""
+            throw ScanError(ended ? "手机连接服务在准备完成前退出\(phase)，请重新连接。" : "手机连接服务准备超时\(phase)，已停止本次连接。")
         }
         return (device,display,pid)
     }
@@ -222,6 +236,7 @@ actor PhoneSession {
     private var displayID: Int?
     private(set) var independentApplicationsWhenLocked=false
     private var cleaning=false
+    private(set) var connectionStage = "idle"
     init(resources: URL, adbURL: URL? = nil, serverSocket: String? = nil) {
         self.serverSocket = serverSocket
         self.adbURL = adbURL ?? resources.appendingPathComponent("adb")
@@ -240,9 +255,10 @@ actor PhoneSession {
         try JSONEncoder().encode(state).write(to: recoveryURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:recoveryURL.path)
     }
-    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, desktopHome: Bool = false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
+    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, desktopHome: Bool = false, balancedDisplay: Bool = false, displayBeforeCamera: Bool = false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
         guard server == nil else { throw ScanError("手机已经连接。") }
         do {
+            connectionStage = "enumeration"
             progress("正在检查手机连接…")
             let listing = try adb(["devices","-l"])
             let lines = listing.split(separator:"\n").map { $0.split(whereSeparator:{$0==" " || $0=="\t"}).map(String.init) }
@@ -259,10 +275,12 @@ actor PhoneSession {
                 let old = try JSONDecoder().decode(Recovery.self,from:Data(contentsOf:recoveryURL))
                 guard old.valid,old.serial==serial else { throw ScanError("上次会话的设备标识与当前连接不一致；无线地址与 USB 标识不能自动互换，请使用上次的准确连接清理。") }
                 recovery=old
+                connectionStage = "recovery"
                 progress("正在清理上次未结束的连接…")
                 let problems = disconnect()
                 guard problems.isEmpty else { throw ScanError(problems) }
             }
+            connectionStage = "android_version"
             let api = Int(try adb(["shell","getprop ro.build.version.sdk"],serial:serial)) ?? 0
             guard api >= 36 else { throw ScanError("此版本需要 Android 16 或更新系统。") }
             if openWechatOnConnect {
@@ -276,36 +294,45 @@ actor PhoneSession {
             recovery=Recovery(serial:serial,suffix:suffix,token:token,mac:mac)
             try save(); try Task.checkCancellation()
             let r = recovery!
+            connectionStage = "session_directory"
             _ = try shell("mkdir \(r.path) && printf '%s' '\(r.token)' > \(r.path)/owner")
             progress("正在创建临时手机摄像头…")
+            connectionStage = "association"
             _ = try shell("cmd companiondevice associate 0 com.android.shell \(r.mac) android.app.role.COMPANION_DEVICE_APP_STREAMING")
             let entries = try shell("cmd companiondevice list 0").split(separator:"\n").map { $0.split(separator:"|").map { $0.trimmingCharacters(in:.whitespaces) } }
             guard let entry = entries.first(where:{$0.count==3 && $0[1]=="com.android.shell" && $0[2].uppercased()==r.mac}), let association=Int(entry[0]) else { throw ScanError("手机未返回有效的临时连接编号。") }
             recovery?.association=association; try save()
+            connectionStage = "service_transfer"
             _ = try adb(["push",jarURL.path,r.path+"/server.jar"])
             try Task.checkCancellation()
             let process=Process(), pipe=Pipe(), log=ServerLog()
             process.executableURL=adbURL
-            let lockArgument=(allowLockedApplications ? " independent-lock":"") + (desktopHome ? " desktop-home":"")
+            let lockArgument=(allowLockedApplications ? " independent-lock":"") + (desktopHome ? " desktop-home":"") + (balancedDisplay ? " balanced-display":"") + (displayBeforeCamera ? " display-before-camera":"")
             process.arguments=(serverSocket.map { ["-L", $0] } ?? []) + ["-s",r.serial,"shell","CLASSPATH=\(r.path)/server.jar app_process / LiveCameraServer \(association) \(r.socketName) \(r.token)\(lockArgument)"]
             process.standardOutput=pipe;process.standardError=pipe
             pipe.fileHandleForReading.readabilityHandler = { handle in let data=handle.availableData; if !data.isEmpty {log.append(data)} else {log.finish()} }
+            connectionStage = "service_startup"
             server=process;serverPipe=pipe;try process.run()
             let (device,display,pid)=try log.waitReady()
             (displayWidth,displayHeight)=log.dimensions(); displayDpi=log.dpi()
             displayID=display;recovery?.display=display;recovery?.device=device;recovery?.pid=pid;try save()
             independentApplicationsWhenLocked=allowLockedApplications && log.independentLockReady()
             if allowLockedApplications && !independentApplicationsWhenLocked {throw ScanError("手机没有确认独立窗口的锁屏策略，已停止连接。")}
+            connectionStage = "image_forward"
             let portText=try adb(["forward","tcp:0","localabstract:"+r.socketName])
             guard let port=UInt16(portText), port>0 else {throw ScanError("USB 图像通道创建失败。")}
             recovery?.port=port;try save()
+            connectionStage = "authentication"
             channel=try CameraSocket(port:port,token:r.token)
             if openWechatOnConnect {
                 progress("正在打开手机微信…")
                 try openWechat()
             }
             try Task.checkCancellation()
-            return try shell("getprop ro.product.model")
+            connectionStage = "model_query"
+            let model = try shell("getprop ro.product.model")
+            connectionStage = "ready"
+            return model
         } catch {
             let cleanup=disconnect()
             throw ScanError(error.localizedDescription + (cleanup.isEmpty ? "" : "\n"+cleanup))
