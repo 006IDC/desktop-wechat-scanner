@@ -872,13 +872,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
                         item["displayReadinessWaitMilliseconds"]=(ProcessInfo.processInfo.systemUptime-readyBegan)*1000
                         item["windowVisibleBeforePause"]=mainControl.window?.isVisible ?? false
-                        item["windowUnoccludedBeforePause"]=mainControl.window?.occlusionState.contains(.visible) ?? false
+                        item["windowHasVisibleRegionBeforePause"]=mainControl.window?.occlusionState.contains(.visible) ?? false
                         if let window=mainControl.window {
                             item["windowFrameBeforePause"]=[window.frame.minX,window.frame.minY,window.frame.width,window.frame.height]
-                            item["windowScreenIntersectionBeforePause"]=window.screen.map {$0.frame.intersection(window.frame).size != .zero} ?? false
+                            item["windowScreenIntersectionBeforePause"]=window.screen.map {!$0.frame.intersection(window.frame).isEmpty} ?? false
                         }
-                        guard (nativeOverlay.statistics.snapshot()["presented"] as? Int ?? 0)>0 else {
-                            throw ScanError("未确认原生层实际上屏，主线程暂停实验不成立。")
+                        guard (nativeOverlay.statistics.snapshot()["presented"] as? Int ?? 0)>0,
+                              item["windowVisibleBeforePause"] as? Bool == true,
+                              item["windowHasVisibleRegionBeforePause"] as? Bool == true,
+                              item["windowScreenIntersectionBeforePause"] as? Bool == true else {
+                            throw ScanError("未确认可见窗口及有效呈现时间，主线程暂停实验不成立。")
                         }
                         try Task.checkCancellation()
                         guard nativeScannerOverlay === nativeOverlay,cameraActive else{throw ScanError("主线程隔离测试的原生预览已变化。")}

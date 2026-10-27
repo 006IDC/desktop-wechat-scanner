@@ -192,6 +192,7 @@ import CoreVideo
         displayDriver=driver
     }
     func startPresentation() {if !frozen {displayDriver?.start()}}
+    func requestDrawableSize(_ size:CGSize) {if !frozen {displayDriver?.requestDrawableSize(size)}}
     /// Keep the last original UI over the desktop while the real phone decides
     /// the QR result. No stale pointer input is accepted during this interval.
     func freeze() {

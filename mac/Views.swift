@@ -107,6 +107,7 @@ private final class PhoneWindowBackgroundView: NSView {
 /// Emits 0…1 coordinates from the actual image area, with a top-left origin.
 private final class PhonePreviewView: NSView {
     var nativeScannerFrames:((CVPixelBuffer)->Bool)?
+    var nativeScannerResize:((CGSize)->Void)?
     private var nativeScannerLayer:CAMetalLayer?
     var interactionEnabled=true {didSet {if !interactionEnabled {cancelTouch()}}}
     private let frameLayer = CALayer()
@@ -263,10 +264,11 @@ private final class PhonePreviewView: NSView {
         frameLayer.frame = bounds
         videoLayer.frame = bounds
         if let nativeScannerLayer {
-            nativeScannerLayer.frame=imageRect
-            nativeScannerLayer.contentsScale=window?.backingScaleFactor ?? 2
-            nativeScannerLayer.drawableSize=CGSize(width:imageRect.width*nativeScannerLayer.contentsScale,
-                height:imageRect.height*nativeScannerLayer.contentsScale)
+            let rect=imageRect,scale=window?.backingScaleFactor ?? 2
+            if nativeScannerLayer.frame != rect {nativeScannerLayer.frame=rect}
+            if nativeScannerLayer.contentsScale != scale {nativeScannerLayer.contentsScale=scale}
+            let size=CGSize(width:rect.width*scale,height:rect.height*scale)
+            nativeScannerResize?(size)
         }
         updateLayerMasks()
         CATransaction.commit()
@@ -828,6 +830,7 @@ final class ControlWindowController: NSWindowController {
         window.styleMask.insert(.fullSizeContentView);window.titlebarAppearsTransparent=true
         window.isOpaque=false;window.backgroundColor = .clear
         background.nativeScannerPreview=true
+        holder.phone.nativeScannerResize={ [weak overlay] in overlay?.requestDrawableSize($0) }
         holder.phone.setNativeScannerLayer(overlay.layer)
         holder.phone.interactionEnabled=true
         setScannerFloating(true)
@@ -836,7 +839,7 @@ final class ControlWindowController: NSWindowController {
     func freezeNativeScanner() {holder.phone.interactionEnabled=false}
     func endNativeScanner() {
         setScannerFloating(false)
-        holder.phone.nativeScannerFrames=nil;holder.phone.setNativeScannerLayer(nil)
+        holder.phone.nativeScannerFrames=nil;holder.phone.nativeScannerResize=nil;holder.phone.setNativeScannerLayer(nil)
         holder.phone.interactionEnabled=true;background.nativeScannerPreview=false
         window?.styleMask.remove(.fullSizeContentView);window?.titlebarAppearsTransparent=false
         window?.isOpaque=true;window?.backgroundColor = .windowBackgroundColor

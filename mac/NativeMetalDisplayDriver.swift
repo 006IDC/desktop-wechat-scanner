@@ -10,10 +10,23 @@ final class NativeMetalDisplayDriver:NSObject,CAMetalDisplayLinkDelegate,@unchec
     private let failure:@Sendable ()->Void
     private let lock=NSLock(),finished=DispatchGroup()
     private var started=false,stopped=false,runLoop:CFRunLoop?
+    private var pendingDrawableSize:CGSize?
 
     init(layer:CAMetalLayer,active:@escaping @Sendable ()->Bool,
          render:@escaping (CAMetalDrawable)throws->Void,failure:@escaping @Sendable ()->Void) {
         self.layer=layer;self.active=active;self.render=render;self.failure=failure
+    }
+    /// AppKit publishes geometry; only the render thread changes the drawable
+    /// pool, between callbacks, after the preceding drawable was submitted.
+    func requestDrawableSize(_ size:CGSize) {
+        guard size.width.isFinite,size.height.isFinite,size.width>0,size.height>0 else{return}
+        lock.withLock {if !stopped {pendingDrawableSize=size}}
+    }
+    private func applyPendingDrawableSize() {
+        let size=lock.withLock {()->CGSize? in
+            let size=pendingDrawableSize;pendingDrawableSize=nil;return size
+        }
+        if let size,layer.drawableSize != size {layer.drawableSize=size}
     }
     func start() {
         let launch=lock.withLock {()->Bool in
@@ -37,6 +50,7 @@ final class NativeMetalDisplayDriver:NSObject,CAMetalDisplayLinkDelegate,@unchec
             let keepAlive=CFRunLoopSourceCreate(nil,0,&context)!
             CFRunLoopAddSource(loop,keepAlive,.commonModes)
             defer {CFRunLoopRemoveSource(loop,keepAlive,.commonModes);CFRunLoopSourceInvalidate(keepAlive)}
+            applyPendingDrawableSize()
             let link=CAMetalDisplayLink(metalLayer:layer)
             link.delegate=self
             link.preferredFrameRateRange=CAFrameRateRange(minimum:60,maximum:60,preferred:60)
@@ -52,7 +66,10 @@ final class NativeMetalDisplayDriver:NSObject,CAMetalDisplayLinkDelegate,@unchec
     }
     func metalDisplayLink(_ link:CAMetalDisplayLink,needsUpdate update:CAMetalDisplayLink.Update) {
         guard !lock.withLock({stopped}),active() else{stop();return}
-        do {try autoreleasepool {try render(update.drawable)}}
+        do {
+            try autoreleasepool {try render(update.drawable)}
+            applyPendingDrawableSize()
+        }
         catch {stop();failure()}
     }
     func stop() {
