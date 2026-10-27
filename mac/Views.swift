@@ -65,6 +65,9 @@ private final class PhoneWindowBackgroundView: NSView {
     var aperture = ScanPreviewAperture.standard { didSet { needsDisplay = true } }
     override var isOpaque: Bool { false }
 
+    override func acceptsFirstMouse(for event:NSEvent?)->Bool {
+        nativeScannerPreview || super.acceptsFirstMouse(for:event)
+    }
     override func mouseDown(with event:NSEvent) {
         // Full-size transparent content covers AppKit's title surface. Route
         // only its empty title band through the native window-server drag;
@@ -103,7 +106,7 @@ private final class PhoneWindowBackgroundView: NSView {
 
 /// Emits 0…1 coordinates from the actual image area, with a top-left origin.
 private final class PhonePreviewView: NSView {
-    var nativeScannerFrames:((CVPixelBuffer)->Void)?
+    var nativeScannerFrames:((CVPixelBuffer)->Bool)?
     private var nativeScannerLayer:CAMetalLayer?
     var interactionEnabled=true {didSet {if !interactionEnabled {cancelTouch()}}}
     private let frameLayer = CALayer()
@@ -190,7 +193,10 @@ private final class PhonePreviewView: NSView {
 
     func setPixelBuffer(_ pixels: CVPixelBuffer?) {
         guard let pixels else { setFrame(nil); return }
-        if let nativeScannerFrames {nativeScannerFrames(pixels);return}
+        if let nativeScannerFrames {
+            let hideCalibration=nativeScannerFrames(pixels)
+            if hideCalibration || nativeScannerLayer != nil {return}
+        }
         let hadFrame = hasFrame
         mirrorFrame = nil
         mirrorPixels = pixels
@@ -803,7 +809,7 @@ final class ControlWindowController: NSWindowController {
 
     func prepareNativeScanner(_ overlay:NativeScannerOverlay) {
         holder.phone.interactionEnabled=false
-        holder.phone.nativeScannerFrames={ [weak overlay] in overlay?.receive($0) }
+        holder.phone.nativeScannerFrames={ [weak overlay] in overlay?.receive($0) ?? true }
     }
     func showNativeScanner(_ overlay:NativeScannerOverlay) {
         guard let window else{return}

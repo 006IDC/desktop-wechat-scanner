@@ -20,6 +20,7 @@ import CoreVideo
     let layer=CAMetalLayer()
     let statistics=NativeMattePresentationStats()
     private(set) var frozen=false
+    private var hidesCalibrationFrames=false
     private(set) var failure:String?
     private(set) var calibrationTiming=[String:Double]()
     enum EndReason:String {case cleared,scannerStateChanged,windowHidden,pumpFailure,qrHandoff,returnedToApplication,pausedByControl}
@@ -51,7 +52,11 @@ import CoreVideo
     init(display:Int,package:String,fastCalibration:Bool=false) {
         self.display=display;self.package=package;self.fastCalibration=fastCalibration
     }
-    func receive(_ pixels:CVPixelBuffer) {frames.publish(pixels)}
+    /// Show genuine black-background frames during calibration, so opening the
+    /// Android scanner keeps its own animation. Hide only the blue-key phase.
+    func receive(_ pixels:CVPixelBuffer)->Bool {
+        frames.publish(pixels);return hidesCalibrationFrames || frozen
+    }
     func matches(_ state:PhoneCameraState)->Bool {
         guard let scanner=state.scannerActivity(),scanner.displayId==display,scanner.package==package else{return false}
         return identity.map {$0 == (state.generation,state.ownerGeneration)} ?? true
@@ -118,6 +123,7 @@ import CoreVideo
         mark("rendererReadyMilliseconds")
         samples.removeAll()
         try await requireCurrent(phone)
+        hidesCalibrationFrames=true
         let blue=try await Task.detached {try Self.background(blue:true)}.value
         _=try await phone.frame(blue,epoch:epoch)
         mark("blueAcknowledgedMilliseconds")

@@ -1,4 +1,5 @@
 import AppKit
+import CoreVideo
 
 @main enum NativeScannerOverlayViewTests {
     @MainActor static func main() {
@@ -26,11 +27,17 @@ import AppKit
         let overlay=NativeScannerOverlay(display:7,package:"com.tencent.mm")
         let originalLevel=window.level,originalBehavior=window.collectionBehavior
         ui.prepareNativeScanner(overlay)
+        var fresh:CVPixelBuffer?
+        precondition(CVPixelBufferCreate(kCFAllocatorDefault,720,1280,kCVPixelFormatType_32BGRA,nil,&fresh)==kCVReturnSuccess)
+        ui.setPhonePixelBuffer(fresh)
+        let calibratingVideo=phone.layer?.sublayers?.first{$0.name=="phone.video"}
+        precondition(calibratingVideo?.isHidden==false,"Black-phase native animation was frozen")
         precondition(events==[0,1],"Calibration failed to release the active touch")
         phone.mouseDown(with:down);phone.mouseUp(with:up)
         precondition(events==[0,1],"Calibration accepted input through a stale frame")
         ui.showNativeScanner(overlay)
         ui.setLocalScanPreview(false) // The ordinary status refresh must not reveal an obsolete frame.
+        ui.setPhonePixelBuffer(fresh) // An attached native layer still owns presentation.
         let obsolete=phone.layer?.sublayers?.filter { ["phone.still-frame","phone.video"].contains($0.name ?? "") } ?? []
         precondition(obsolete.count==2 && obsolete.allSatisfy(\.isHidden),"Status refresh exposed an old mirror underneath native alpha")
         precondition(ui.nativeScannerVisible && !window.isOpaque && window.styleMask.contains(.fullSizeContentView))
