@@ -52,6 +52,30 @@ enum NativeScannerMatteProbe {
             return max(min(a, b), min(max(a, b), c))
         }
     }
+    // Numeric coverage only; never persists pixels or text from the phone.
+    static func coverage(source: CVPixelBuffer, output: CGImage) throws -> [[String: Any]] {
+        let input = try sample(source)
+        var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        let context = CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+        let reduced = CIImage(cgImage: output, options: [.colorSpace: NSNull()]).transformed(by:
+            CGAffineTransform(scaleX: Double(width) / Double(output.width), y: Double(height) / Double(output.height)))
+        rgba.withUnsafeMutableBytes {
+            context.render(reduced, toBitmap: $0.baseAddress!, rowBytes: width * 4,
+                bounds: CGRect(x: 0,y: 0,width: width,height: height), format: .RGBA8, colorSpace: nil)
+        }
+        return [("upper",0,80),("middle",80,240),("lower",240,320)].map { name,top,bottom in
+            var alpha = 0.0, nearClear = 0, blue = 0.0, red = 0.0, green = 0.0
+            let total = (bottom-top)*width
+            for y in top..<bottom { for x in 0..<width {
+                let i = y*width+x
+                alpha += Double(rgba[i*4+3])/255
+                if rgba[i*4+3] < 32 { nearClear += 1 }
+                blue += Double(input[i*3])/255; green += Double(input[i*3+1])/255; red += Double(input[i*3+2])/255
+            }}
+            return ["band":name,"alphaMean":alpha/Double(total),"nearClearFraction":Double(nearClear)/Double(total),
+                    "sourceBlueMean":blue/Double(total),"sourceGreenMean":green/Double(total),"sourceRedMean":red/Double(total)]
+        }
+    }
     static func analyse(black: [UInt8], white: [UInt8], gray: [UInt8]) throws -> [String: Any] {
         guard black.count == width * height * 3, black.count == white.count, black.count == gray.count else { throw InvalidSample() }
         var bands = [[String: Any]]()

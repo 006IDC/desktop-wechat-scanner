@@ -28,6 +28,7 @@ final class DirectDisplayStream implements AutoCloseable {
     private final VirtualDisplay display;
     private final Surface originalSurface;
     private final Validator validator;
+    private final boolean realtimeRequested;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Object connections = new Object();
     private final CountDownLatch cleanupFinished = new CountDownLatch(1);
@@ -43,9 +44,10 @@ final class DirectDisplayStream implements AutoCloseable {
     private long downTime;
     private float lastX, lastY;
 
-    DirectDisplayStream(VirtualDisplay display, Surface originalSurface, int width, int height, Validator validator) throws Exception {
+    DirectDisplayStream(VirtualDisplay display, Surface originalSurface, int width, int height, boolean realtimeRequested, Validator validator) throws Exception {
         this.display = display; this.originalSurface = originalSurface;
         this.width = width; this.height = height; this.validator = validator;
+        this.realtimeRequested = realtimeRequested;
         validator.validate();
         displayId = display.getDisplay().getDisplayId();
         if (displayId <= Display.DEFAULT_DISPLAY || width <= 0 || height <= 0) throw new IOException("Invalid owned video display");
@@ -61,6 +63,15 @@ final class DirectDisplayStream implements AutoCloseable {
             format.setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000);
             format.setInteger(MediaFormat.KEY_FRAME_RATE, 60);
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+            if (realtimeRequested) {
+                // Public encoder hints. Vendors may ignore LATENCY; report the
+                // eventual output format instead of claiming it was enabled.
+                format.setInteger(MediaFormat.KEY_PRIORITY, 0);
+                format.setInteger(MediaFormat.KEY_LATENCY, 0);
+                // Keep a static UI's tail from waiting for later user input
+                // when a hardware encoder retains multiple frames internally.
+                format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 16_667L);
+            }
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             encoderSurface = codec.createInputSurface();
             codec.start();
@@ -130,6 +141,12 @@ final class DirectDisplayStream implements AutoCloseable {
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             while (!closed.get()) {
                 int index = codec.dequeueOutputBuffer(info, 100_000);
+                if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    MediaFormat actual = codec.getOutputFormat();
+                    int latency = actual.containsKey(MediaFormat.KEY_LATENCY) ? actual.getInteger(MediaFormat.KEY_LATENCY) : -1;
+                    System.out.println("QR_LIVE direct_codec_latency=" + latency);
+                    System.out.flush();
+                }
                 if (index < 0) continue;
                 try {
                     if (info.size <= 0) continue;

@@ -72,7 +72,7 @@ public final class LiveCameraServer {
     private static final String CAMERA_OWNER_PERMISSION = "android.permission.CAMERA_OPEN_CLOSE_LISTENER";
     private boolean independentLockRequested;
     private boolean desktopHomeRequested;
-    private boolean balancedDisplayRequested, displayBeforeCameraRequested;
+    private boolean balancedDisplayRequested, displayBeforeCameraRequested, mirrorOnlyRequested, realtimeVideoRequested;
     // Android 16 DisplayManager.VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS.
     private static final int DISPLAY_SYSTEM_DECORATIONS = 1 << 9;
 
@@ -148,32 +148,36 @@ public final class LiveCameraServer {
     static final class SessionFlags {
         final boolean independentLock;
         final boolean desktopHome;
-        final boolean balancedDisplay, displayBeforeCamera;
-        SessionFlags(boolean independentLock, boolean desktopHome, boolean balancedDisplay, boolean displayBeforeCamera) {
+        final boolean balancedDisplay, displayBeforeCamera, mirrorOnly, realtimeVideo;
+        SessionFlags(boolean independentLock, boolean desktopHome, boolean balancedDisplay, boolean displayBeforeCamera, boolean mirrorOnly, boolean realtimeVideo) {
             this.independentLock = independentLock;
             this.desktopHome = desktopHome;
             this.balancedDisplay = balancedDisplay;
             this.displayBeforeCamera = displayBeforeCamera;
+            this.mirrorOnly = mirrorOnly;
+            this.realtimeVideo = realtimeVideo;
         }
     }
 
     static SessionFlags parseSessionFlags(String[] args) {
-        if (args == null || args.length < 3 || args.length > 7 ||
+        if (args == null || args.length < 3 || args.length > 9 ||
                 !args[1].matches("006idc_scan_[0-9a-f]{8}") || !args[2].matches("[0-9a-f]{32}"))
-            throw new IllegalArgumentException("Expected associationId 006idc_scan_<8 hex> <32 hex token> [independent-lock] [desktop-home] [balanced-display] [display-before-camera]");
+            throw new IllegalArgumentException("Expected associationId 006idc_scan_<8 hex> <32 hex token> [independent-lock] [desktop-home] [balanced-display] [display-before-camera] [mirror-only] [realtime-video]");
         boolean independentLock = false;
         boolean desktopHome = false;
-        boolean balancedDisplay = false, displayBeforeCamera = false;
+        boolean balancedDisplay = false, displayBeforeCamera = false, mirrorOnly = false, realtimeVideo = false;
         for (int index = 3; index < args.length; index++) {
             if ("independent-lock".equals(args[index]) && !independentLock) independentLock = true;
             else if ("desktop-home".equals(args[index]) && !desktopHome) desktopHome = true;
             else if ("balanced-display".equals(args[index]) && !balancedDisplay) balancedDisplay = true;
             else if ("display-before-camera".equals(args[index]) && !displayBeforeCamera) displayBeforeCamera = true;
+            else if ("mirror-only".equals(args[index]) && !mirrorOnly) mirrorOnly = true;
+            else if ("realtime-video".equals(args[index]) && !realtimeVideo) realtimeVideo = true;
             else throw new IllegalArgumentException("Unsupported or duplicate virtual display flag");
         }
-        if ((balancedDisplay || displayBeforeCamera) && !desktopHome)
+        if ((balancedDisplay || displayBeforeCamera || mirrorOnly || realtimeVideo) && !desktopHome)
             throw new IllegalArgumentException("Research display flags require desktop-home");
-        return new SessionFlags(independentLock, desktopHome, balancedDisplay, displayBeforeCamera);
+        return new SessionFlags(independentLock, desktopHome, balancedDisplay, displayBeforeCamera, mirrorOnly, realtimeVideo);
     }
 
     static boolean requestedIndependentLock(String[] args) {
@@ -318,9 +322,11 @@ public final class LiveCameraServer {
         Class<?> paramsClass = Class.forName("android.companion.virtual.VirtualDeviceParams");
         Object builder = Class.forName(paramsClass.getName() + "$Builder").getConstructor().newInstance();
         call(builder, "setName", new Class[]{String.class}, "006IDC desktop scanner");
-        int cameraPolicy = paramsClass.getField("POLICY_TYPE_CAMERA").getInt(null);
-        int customPolicy = paramsClass.getField("DEVICE_POLICY_CUSTOM").getInt(null);
-        call(builder, "setDevicePolicy", new Class[]{int.class, int.class}, cameraPolicy, customPolicy);
+        if (!mirrorOnlyRequested) {
+            int cameraPolicy = paramsClass.getField("POLICY_TYPE_CAMERA").getInt(null);
+            int customPolicy = paramsClass.getField("DEVICE_POLICY_CUSTOM").getInt(null);
+            call(builder, "setDevicePolicy", new Class[]{int.class, int.class}, cameraPolicy, customPolicy);
+        }
         if (independentLockRequested) {
             // Official SystemApi; scope is this temporary virtual device only.
             int lockState = paramsClass.getField("LOCK_STATE_ALWAYS_UNLOCKED").getInt(null);
@@ -911,7 +917,7 @@ public final class LiveCameraServer {
         if (!verifyIndependentLock(target)) throw new IOException("Independent lock policy is not active");
         stopDirectStream(id);
         Surface original = target == display ? displayReader.getSurface() : appDisplays.get(id).reader.getSurface();
-        DirectDisplayStream stream = new DirectDisplayStream(target, original, displayWidth, displayHeight, () -> {
+        DirectDisplayStream stream = new DirectDisplayStream(target, original, displayWidth, displayHeight, realtimeVideoRequested, () -> {
             if (stopping || ownedDisplay(id) != target || !verifyIndependentLock(target))
                 throw new IOException("Direct display is no longer owned and independently unlocked");
         });
@@ -1057,6 +1063,7 @@ public final class LiveCameraServer {
             byte[] body = new byte[length];
             input.readFully(body);
             if (command == 1) {
+                if (mirrorOnlyRequested) { error(output, "Camera disabled for mirror-only research"); continue; }
                 if (length <= Long.BYTES) { error(output, "Frame needs an epoch and image"); continue; }
                 long epoch = new DataInputStream(new ByteArrayInputStream(body, 0, Long.BYTES)).readLong();
                 if (epoch < 0) { error(output, "Epoch must be nonnegative"); continue; }
@@ -1254,6 +1261,8 @@ public final class LiveCameraServer {
             live.desktopHomeRequested = flags.desktopHome;
             live.balancedDisplayRequested = flags.balancedDisplay;
             live.displayBeforeCameraRequested = flags.displayBeforeCamera;
+            live.mirrorOnlyRequested = flags.mirrorOnly;
+            live.realtimeVideoRequested = flags.realtimeVideo;
             int association = Integer.parseInt(args[0]);
             if (association <= 0) throw new IllegalArgumentException("Association ID must be positive");
             byte[] token = args[2].getBytes(StandardCharsets.US_ASCII);
@@ -1268,10 +1277,17 @@ public final class LiveCameraServer {
                 log("setup_phase", "owned_display");
                 live.createVirtualDisplay();
             }
-            log("setup_phase", "camera_policy");
-            live.grantSupportedCameras();
-            log("setup_phase", "virtual_camera");
-            live.createVirtualCamera();
+            if (!live.mirrorOnlyRequested) {
+                log("setup_phase", "camera_policy");
+                live.grantSupportedCameras();
+                log("setup_phase", "virtual_camera");
+                live.createVirtualCamera();
+            } else {
+                // Isolate the owned HOME/video path without contacting camera
+                // services or granting packages virtual-camera access.
+                live.ownerStatus = "mirror_only";
+                log("camera_mode", "disabled_research");
+            }
             if (!live.displayBeforeCameraRequested) {
                 log("setup_phase", "owned_display");
                 live.createVirtualDisplay();

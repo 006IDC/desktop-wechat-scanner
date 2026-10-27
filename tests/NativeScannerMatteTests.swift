@@ -44,6 +44,18 @@ import CoreImage
         let observedImage = CIImage(bitmapData: observed, bytesPerRow: 8, size: CGSize(width:2,height:3), format: .RGBA8, colorSpace: nil)
         try check(black: nativeImage, white: nativeImage, live: observedImage,
             expected: [0,0,0,0, 255,255,255,255, 204,51,26,255, 0,179,0,179, 0,0,0,179, 255,255,255,255], algorithm: .blueWithNativeColorBias)
+        // A moving cyan-tinted glow in one calibration observation must not
+        // become a stationary blue ghost in all subsequent native frames.
+        let observations = [color(0,0.4,0.3)] + Array(repeating:color(0,0,0),count:8)
+        let temporal = try NativeScannerMatte(black:observations[0],white:observations[0],
+            algorithm:.blueWithNativeColorBias,blueCalibration:observations)
+        let recovered = CIImage(cgImage:try temporal.render(black:color(0,0,1)),options:[.colorSpace:NSNull()])
+        var clear=[UInt8](repeating:0,count:4)
+        clear.withUnsafeMutableBytes {
+            CIContext(options:[.workingColorSpace:NSNull(),.outputColorSpace:NSNull()]).render(recovered,
+                toBitmap:$0.baseAddress!,rowBytes:4,bounds:recovered.extent,format:.RGBA8,colorSpace:nil)
+        }
+        precondition(clear.allSatisfy { $0 <= 2 })
         do {
             _ = try NativeScannerMatte(black: color(0,0,0), white: color(1,1,1).cropped(to: .zero))
             preconditionFailure("Mismatched calibration accepted")

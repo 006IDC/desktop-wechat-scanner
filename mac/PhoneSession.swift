@@ -144,6 +144,11 @@ final class ServerLog {
         condition.lock();defer {condition.unlock()}
         return (Int(fields["display_width"] ?? "") ?? 720,Int(fields["display_height"] ?? "") ?? 1280)
     }
+    func encoderLatencyFrames() -> Int? {
+        condition.lock(); defer { condition.unlock() }
+        guard let raw = fields["direct_codec_latency"], let value = Int(raw), (0...120).contains(value) else { return nil }
+        return value
+    }
     static func setupDescription(_ phase:String?) -> String? {
         switch phase {
         case "virtual_device": return "创建独立设备"
@@ -237,6 +242,8 @@ actor PhoneSession {
     private(set) var independentApplicationsWhenLocked=false
     private var cleaning=false
     private(set) var connectionStage = "idle"
+    private var diagnosticLog: ServerLog?
+    func encoderLatencyFrames() -> Int? { diagnosticLog?.encoderLatencyFrames() }
     init(resources: URL, adbURL: URL? = nil, serverSocket: String? = nil) {
         self.serverSocket = serverSocket
         self.adbURL = adbURL ?? resources.appendingPathComponent("adb")
@@ -255,7 +262,7 @@ actor PhoneSession {
         try JSONEncoder().encode(state).write(to: recoveryURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:recoveryURL.path)
     }
-    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, desktopHome: Bool = false, balancedDisplay: Bool = false, displayBeforeCamera: Bool = false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
+    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, desktopHome: Bool = false, balancedDisplay: Bool = false, displayBeforeCamera: Bool = false, mirrorOnly: Bool = false, realtimeVideo: Bool = false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
         guard server == nil else { throw ScanError("手机已经连接。") }
         do {
             connectionStage = "enumeration"
@@ -306,8 +313,9 @@ actor PhoneSession {
             _ = try adb(["push",jarURL.path,r.path+"/server.jar"])
             try Task.checkCancellation()
             let process=Process(), pipe=Pipe(), log=ServerLog()
+            diagnosticLog = log
             process.executableURL=adbURL
-            let lockArgument=(allowLockedApplications ? " independent-lock":"") + (desktopHome ? " desktop-home":"") + (balancedDisplay ? " balanced-display":"") + (displayBeforeCamera ? " display-before-camera":"")
+            let lockArgument=(allowLockedApplications ? " independent-lock":"") + (desktopHome ? " desktop-home":"") + (balancedDisplay ? " balanced-display":"") + (displayBeforeCamera ? " display-before-camera":"") + (mirrorOnly ? " mirror-only":"") + (realtimeVideo ? " realtime-video":"")
             process.arguments=(serverSocket.map { ["-L", $0] } ?? []) + ["-s",r.serial,"shell","CLASSPATH=\(r.path)/server.jar app_process / LiveCameraServer \(association) \(r.socketName) \(r.token)\(lockArgument)"]
             process.standardOutput=pipe;process.standardError=pipe
             pipe.fileHandleForReading.readabilityHandler = { handle in let data=handle.availableData; if !data.isEmpty {log.append(data)} else {log.finish()} }
@@ -814,6 +822,7 @@ actor PhoneSession {
 
     /// Synchronous inside this actor so connect/quit cannot enter cleanup twice.
     func disconnect() -> String {
+        diagnosticLog=nil
         independentApplicationsWhenLocked=false
         cleaning=true;defer {cleaning=false}
         if let state = recovery {

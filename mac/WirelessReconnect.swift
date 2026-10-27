@@ -60,6 +60,7 @@ final class BonjourADBDiscovery: NSObject, @preconcurrency NetServiceBrowserDele
     private var found = [String: ADBDiscoveredService]()
     private var discoveredServiceCount = 0
     private var searchFailed = false
+    private(set) var searchFailureCode: Int?
 
     func discover(seconds: TimeInterval = 2) async throws -> [ADBDiscoveredService] {
         let browser = NetServiceBrowser()
@@ -93,6 +94,7 @@ final class BonjourADBDiscovery: NSObject, @preconcurrency NetServiceBrowserDele
 
     func netServiceBrowser(_ browser: NetServiceBrowser, didNotSearch errorDict: [String: NSNumber]) {
         searchFailed = true
+        searchFailureCode = errorDict["NSNetServicesErrorCode"]?.intValue
     }
 
     func netServiceBrowser(_ browser: NetServiceBrowser, didRemove service: NetService, moreComing: Bool) {

@@ -122,6 +122,15 @@ import CoreVideo
         }
     }
     static func main() throws {
+        for title in ["微信", "微信(12)", "微信（3）", "微 信 (2)"] {
+            require(ScannerNavigationOCR.isWechatTitle(title), "Native unread-count title rejected")
+        }
+        for title in ["微信支付", "微信朋友", "微信()", "微信(1)消息", "其他"] {
+            require(!ScannerNavigationOCR.isWechatTitle(title), "Non-title text accepted")
+        }
+        let leftAligned = ScannerNavigationOCR.Text(value: "微信（2）", rect: CGRect(x: 30, y: 22, width: 90, height: 32))
+        require(try ScannerNavigationOCR.plusButton(in: toolbar(width: 1268,height: 2756,dark: false,top: .plus,bottom: .blank), homeWords: [leftAligned]) != nil,
+                "Left-aligned native unread title did not retain verified pixel matching")
         for (width, height) in [(720, 1280), (1268, 2756), (1000, 1700)] {
             try expectPlus(toolbar(width: width, height: height, dark: false,
                                    top: .blank, bottom: .plus), near: 108)

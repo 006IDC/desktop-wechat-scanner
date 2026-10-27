@@ -47,6 +47,11 @@ enum ScannerNavigationOCR {
         }
     }
 
+    static func isWechatTitle(_ value: String) -> Bool {
+        value.replacingOccurrences(of: " ", with: "").range(
+            of: #"^微信(?:[（(][0-9]{1,6}[）)])?$"#, options: .regularExpression) != nil
+    }
+
     /// Locate the actual circled plus beside an OCR-confirmed WeChat title.
     /// Its ring is circular in source pixels (not in 720×1280 coordinates).
     /// A missing/ambiguous icon returns nil; callers must not guess a toolbar row.
@@ -62,8 +67,8 @@ enum ScannerNavigationOCR {
         // The OCR may return duplicate boxes for one toolbar row. Merge close
         // Y values, but inspect both distinct rows before choosing the upper one.
         let titles = homeWords.filter {
-            $0.value.replacingOccurrences(of: " ", with: "") == "微信" &&
-            $0.rect.midY < 170 && (300...420).contains($0.rect.midX)
+            isWechatTitle($0.value) &&
+            $0.rect.midY < 170 && (20...500).contains($0.rect.midX)
         }.sorted { $0.rect.midY < $1.rect.midY }
         var rows = [CGFloat]()
         for title in titles where rows.allSatisfy({ abs($0 - title.rect.midY) > 12 }) {
