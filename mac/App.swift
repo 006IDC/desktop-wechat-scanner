@@ -78,6 +78,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         buildMenu();control.window?.delegate=self
+        if nativeScannerRequested {Task.detached(priority:.utility) {try? NativeScannerMatte.prewarm()}}
         let timer=Timer(timeInterval:1.0/60,target:self,selector:#selector(presentMirrorFrame),userInfo:nil,repeats:true)
         RunLoop.main.add(timer,forMode:.common);previewTimer=timer
         control.onConnect={ [weak self] in self?.connect() }
@@ -545,6 +546,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// alone decides what it means; no result or authorization is clicked here.
     private func returnLocalScanToApplication(retainImage:Bool) {
         guard connected,!stopping,localScanFrame != nil || nativeScannerOverlay != nil else{return}
+        nativeScannerOverlay?.noteEnd(retainImage ? .qrHandoff:.returnedToApplication)
         nativeScannerOverlay?.freeze();cameraWindow?.freezeNativeScanner()
         let previousOperation=operationTask;previousOperation?.cancel()
         busy=true;paused=true;cameraSuppressed=true
@@ -779,7 +781,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if localCameraMode,nativeScannerRequested,let targetDisplay {
                     let state=try await phone.cameraState()
                     if let scanner=state.scannerActivity(),scanner.displayId==targetDisplay {
-                        let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package)
+                        let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
+                            fastCalibration:CommandLine.arguments.contains("--native-fast-calibration"))
                         nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
                         status("准备原生扫码预览","正在校准手机应用自己的相机背景…")
                         try await overlay.prepare(phone:phone,epoch:generation)
@@ -823,6 +826,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 try Task.checkCancellation()
                 guard let app=apps.first(where:{$0.packageName==package}) else{throw ScanError("测试应用未安装。")}
                 var item:[String:Any]=["package":package,"qrRecognized":false]
+                var observedOverlay:NativeScannerOverlay?
                 do {
                     cameraSuppressed=true
                     try await performMainApplicationOpen(app)
@@ -837,7 +841,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         try Task.checkCancellation();try await Task.sleep(nanoseconds:100_000_000)
                     }
                     guard cameraActive,!busy,cameraPump != nil,cameraWindow === mainControl else{throw ScanError("应用内扫一扫未自动启用桌面相机。")}
-                    let nativeOverlay=nativeScannerOverlay
+                    let nativeOverlay=nativeScannerOverlay;observedOverlay=nativeOverlay
                     item["nativeScannerPreviewVisible"]=mainControl.nativeScannerVisible
                     if let nativeOverlay {item["nativeCalibration"]=nativeOverlay.calibrationTiming}
                     if nativeOverlay != nil,CommandLine.arguments.contains("--diagnostic-native-hold") {
@@ -902,6 +906,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if let check=performanceCheck {item.merge(check.finish()){_,new in new}}
                 performanceCheck=nil;cameraSuppressed=true
                 await clearCamera();await capture.setDiagnosticBoard(nil)
+                if let observedOverlay {
+                    item["nativePresentation"]=observedOverlay.statistics.snapshot()
+                    item["nativeTermination"]=observedOverlay.termination
+                }
                 applications.append(item)
                 // This is the same Home command as the ordinary toolbar.
                 home();try await Task.sleep(nanoseconds:500_000_000)
@@ -928,6 +936,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         func checkNavigation() throws {
             try Task.checkCancellation()
             guard connected,!stopping,mirrorGeneration==connectionGeneration else{throw CancellationError()}
+        }
+        if CommandLine.arguments.contains("--diagnostic-manual-navigation") {
+            evidence["navigationUsesCUA"]=true
+            let deadline=ProcessInfo.processInfo.systemUptime+90
+            while ProcessInfo.processInfo.systemUptime<deadline {
+                try checkNavigation()
+                let state=try await phone.cameraState();try checkNavigation()
+                if state.scannerActivity()?.package==package {return}
+                try await Task.sleep(nanoseconds:150_000_000)
+            }
+            throw ScanError("等待界面工具打开真实扫一扫超时；诊断未自动点击。")
         }
         var plusTapped=false,scanTapped=false,returnedFromResult=false
         var scanAttempts=0,lastScanTap=0.0
@@ -1082,6 +1101,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func followCameraState(_ state:PhoneCameraState) async {
         guard connected,!stopping,!busy else{return}
         if let overlay=nativeScannerOverlay,!overlay.matches(state) {
+            overlay.noteStateChange(state)
             _=await clearCamera()
             guard connected,!stopping,!Task.isCancelled else{return}
         }
@@ -1215,6 +1235,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func suspendHiddenCamera(){
         guard connected,!stopping,!busy,cameraActive else{return}
+        nativeScannerOverlay?.noteEnd(.windowHidden)
         let checking=performanceTask;checking?.cancel()
         busy=true;cameraSuppressed=true;cameraPump?.stop();refresh()
         operationTask=Task {
@@ -1262,6 +1283,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         if let error=snapshot.failure {
+            nativeScannerOverlay?.notePumpFailure(error)
             let checking=performanceTask;checking?.cancel()
             pump.stop();cameraPump=nil;cameraSuppressed=true;cameraLoop?.cancel()
             cameraActive=false;paused=true;busy=true;refresh()

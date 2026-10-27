@@ -19,6 +19,7 @@ import CoreImage
         _ = try renderer.render(black: live ?? black)
     }
     static func main() throws {
+        try NativeScannerMatte.prewarm()
         try check(black: color(0,0,0), white: color(1,1,1), expected: [0,0,0,0])
         try check(black: color(0,0,0), white: color(0,0,0), expected: [0,0,0,255])
         try check(black: color(0.18,0.18,0.18), white: color(0.53,0.53,0.53), expected: [46,46,46,166])
@@ -56,6 +57,17 @@ import CoreImage
                 toBitmap:$0.baseAddress!,rowBytes:4,bounds:recovered.extent,format:.RGBA8,colorSpace:nil)
         }
         precondition(clear.allSatisfy { $0 <= 2 })
+        // Shared immutable pipelines/context must not share mutable calibration.
+        let transparent=try NativeScannerMatte(black:color(0,0,0),white:color(1,1,1))
+        let opaque=try NativeScannerMatte(black:color(0,0,0),white:color(0,0,0))
+        _=try opaque.render(black:color(0,0,0))
+        let independent=CIImage(cgImage:try transparent.render(black:color(0,0,0)),options:[.colorSpace:NSNull()])
+        var alpha=[UInt8](repeating:255,count:4)
+        alpha.withUnsafeMutableBytes {
+            CIContext(options:[.workingColorSpace:NSNull(),.outputColorSpace:NSNull()]).render(independent,
+                toBitmap:$0.baseAddress!,rowBytes:4,bounds:independent.extent,format:.RGBA8,colorSpace:nil)
+        }
+        precondition(alpha.allSatisfy{$0<=2},"Shared GPU resources leaked another renderer's calibration")
         do {
             _ = try NativeScannerMatte(black: color(0,0,0), white: color(1,1,1).cropped(to: .zero))
             preconditionFailure("Mismatched calibration accepted")

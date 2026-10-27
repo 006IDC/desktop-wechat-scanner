@@ -16,13 +16,41 @@ import CoreVideo
     private var worker:Task<Void,Never>?
     private var identity:(Int,Int)?
     private let display:Int,package:String
+    private let fastCalibration:Bool
     let layer=CAMetalLayer()
     let statistics=NativeMattePresentationStats()
     private(set) var frozen=false
     private(set) var failure:String?
     private(set) var calibrationTiming=[String:Double]()
+    enum EndReason:String {case cleared,scannerStateChanged,windowHidden,pumpFailure,qrHandoff,returnedToApplication}
+    private(set) var termination=[String:Any]()
+    func noteEnd(_ reason:EndReason) {if termination.isEmpty {termination["reason"]=reason.rawValue}}
+    func noteStateChange(_ state:PhoneCameraState) {
+        guard termination.isEmpty else{return}
+        noteEnd(.scannerStateChanged)
+        termination["scannerStillVerified"]=state.scannerActivity() != nil
+        termination["sameGeneration"]=identity?.0==state.generation
+        termination["sameOwnerGeneration"]=identity?.1==state.ownerGeneration
+        termination["activeStreams"]=state.activeStreams
+    }
+    func notePumpFailure(_ error:Error) {
+        guard termination.isEmpty else{return}
+        noteEnd(.pumpFailure)
+        let value=error as NSError
+        termination["errorDomain"]=value.domain.hasPrefix("com.apple.") || value.domain=="NSPOSIXErrorDomain" ? value.domain:"application_error"
+        termination["errorCode"]=value.code
+        if let transient=error as? DesktopCaptureTransientError {
+            switch transient {
+            case .frameExpired:termination["transient"]=1
+            case .frameNotReady:termination["transient"]=2
+            case .encodingBusy:termination["transient"]=3
+            }
+        }
+    }
     private func recordFailure() {failure="原生扫码显示中断。"}
-    init(display:Int,package:String) {self.display=display;self.package=package}
+    init(display:Int,package:String,fastCalibration:Bool=false) {
+        self.display=display;self.package=package;self.fastCalibration=fastCalibration
+    }
     func receive(_ pixels:CVPixelBuffer) {frames.publish(pixels)}
     func matches(_ state:PhoneCameraState)->Bool {
         guard let scanner=state.scannerActivity(),scanner.displayId==display,scanner.package==package else{return false}
@@ -67,9 +95,10 @@ import CoreVideo
         let black=try await Task.detached {try Self.background(blue:false)}.value
         _=try await phone.frame(black,epoch:epoch)
         mark("blackAcknowledgedMilliseconds")
+        calibrationTiming["sampleSpacingMilliseconds"]=fastCalibration ? 40:80
         try await Task.sleep(nanoseconds:350_000_000)
         var samples=[CVPixelBuffer](),last=frames.latest().0
-        for _ in 0..<9 {
+        for index in 0..<9 {
             let deadline=ProcessInfo.processInfo.systemUptime+2
             while frames.latest().0<=last && ProcessInfo.processInfo.systemUptime<deadline {
                 try Task.checkCancellation();try await Task.sleep(nanoseconds:10_000_000)
@@ -78,7 +107,7 @@ import CoreVideo
             guard sample.2,sample.0>last,let pixels=sample.1 else{throw ScanError("原生扫码校准未收到新画面。")}
             try await requireCurrent(phone)
             samples.append(pixels);last=sample.0
-            try await Task.sleep(nanoseconds:80_000_000)
+            if index<8 {try await Task.sleep(nanoseconds:fastCalibration ? 40_000_000:80_000_000)}
         }
         mark("blackSamplesReadyMilliseconds")
         let renderer=try await Task.detached(priority:.userInitiated) {
@@ -133,5 +162,5 @@ import CoreVideo
     /// Keep the last original UI over the desktop while the real phone decides
     /// the QR result. No stale pointer input is accepted during this interval.
     func freeze() {frozen=true;frames.stop()}
-    func stop() async {freeze();await worker?.value;worker=nil}
+    func stop() async {noteEnd(.cleared);freeze();await worker?.value;worker=nil}
 }

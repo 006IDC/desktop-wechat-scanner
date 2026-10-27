@@ -68,21 +68,52 @@ final class NativeScannerMatte {
             out.write(float4(min(rgb,float3(a)),a),p);
         }
         """
+    /// Device, immutable pipelines and CIContext can be shared. Pixel textures
+    /// and command queues remain per renderer; calibration never reuses a phone image.
+    private struct Resources {
+        let device:MTLDevice,context:CIContext
+        let blackWhite:MTLComputePipelineState,blue:MTLComputePipelineState,median:MTLComputePipelineState
+        let composite:MTLComputePipelineState,blueComposite:MTLComputePipelineState
+        init() throws {
+            guard let device=MTLCreateSystemDefaultDevice() else{throw Unavailable()}
+            self.device=device
+            let library=try device.makeLibrary(source:NativeScannerMatte.source,options:nil)
+            func pipeline(_ name:String) throws -> MTLComputePipelineState {
+                guard let function=library.makeFunction(name:name) else{throw Unavailable()}
+                return try device.makeComputePipelineState(function:function)
+            }
+            blackWhite=try pipeline("calibrate");blue=try pipeline("blueCalibrate")
+            median=try pipeline("blueMedianCalibrate");composite=try pipeline("composite")
+            blueComposite=try pipeline("blueComposite")
+            context=CIContext(mtlDevice:device,options:[.workingColorSpace:NSNull(),
+                .outputColorSpace:NSNull(),.cacheIntermediates:false])
+            // Compile CI's solid-frame path without any screen/phone input.
+            let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba8Unorm,width:2,height:2,mipmapped:false)
+            descriptor.usage=[.shaderRead,.shaderWrite,.renderTarget]
+            guard let texture=device.makeTexture(descriptor:descriptor),let queue=device.makeCommandQueue(),
+                  let command=queue.makeCommandBuffer() else{throw Unavailable()}
+            context.render(CIImage(color:.black).cropped(to:CGRect(x:0,y:0,width:2,height:2)),
+                to:texture,commandBuffer:command,bounds:CGRect(x:0,y:0,width:2,height:2),colorSpace:CGColorSpaceCreateDeviceRGB())
+            command.commit();command.waitUntilCompleted()
+            guard command.status == .completed else{throw Unavailable()}
+        }
+    }
+    private static let resources:Result<Resources,Error>=Result {try Resources()}
+    /// Call on a background worker before a scanner opens. No camera/capture access.
+    static func prewarm() throws {_=try resources.get()}
     init(black: CIImage, white: CIImage, algorithm: Algorithm = .blackWhite, blueCalibration: [CIImage] = []) throws {
         guard black.extent == white.extent, black.extent.origin == .zero,
               !black.extent.isEmpty, black.extent.width <= 4096, black.extent.height <= 4096 else { throw Unavailable("dimensions") }
         guard blueCalibration.isEmpty || (algorithm == .blueWithNativeColorBias && blueCalibration.count == 9 &&
               blueCalibration.allSatisfy({ $0.extent == black.extent })) else { throw Unavailable("calibration_count") }
-        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { throw Unavailable() }
+        let resources=try Self.resources.get()
+        let device=resources.device
+        guard let queue=device.makeCommandQueue() else{throw Unavailable()}
         extent = black.extent
-        self.queue = queue
-        let library = try device.makeLibrary(source: Self.source, options: nil)
-        guard let calibrateFunction = library.makeFunction(name: algorithm == .blackWhite ? "calibrate" : blueCalibration.isEmpty ? "blueCalibrate" : "blueMedianCalibrate"),
-              let compositeFunction = library.makeFunction(name: algorithm == .blackWhite ? "composite" : "blueComposite") else { throw Unavailable() }
-        let calibrate = try device.makeComputePipelineState(function: calibrateFunction)
-        composite = try device.makeComputePipelineState(function: compositeFunction)
-        context = CIContext(mtlDevice: device, options: [.workingColorSpace: NSNull(),
-                    .outputColorSpace: NSNull(), .cacheIntermediates: false])
+        self.queue = queue;context=resources.context
+        let calibrate=algorithm == .blackWhite ? resources.blackWhite :
+            (blueCalibration.isEmpty ? resources.blue : resources.median)
+        composite=algorithm == .blackWhite ? resources.composite : resources.blueComposite
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
             width: Int(extent.width), height: Int(extent.height), mipmapped: false)
         descriptor.usage = [.shaderRead, .shaderWrite, .renderTarget]
@@ -90,15 +121,16 @@ final class NativeScannerMatte {
             width: Int(extent.width), height: Int(extent.height), mipmapped: false)
         calibrationDescriptor.usage = [.shaderRead, .shaderWrite]
         guard let input = device.makeTexture(descriptor: descriptor),
-              let whiteInput = device.makeTexture(descriptor: descriptor),
               let transmission = device.makeTexture(descriptor: calibrationDescriptor),
               let output = device.makeTexture(descriptor: descriptor),
               let command = queue.makeCommandBuffer() else { throw Unavailable() }
         self.input = input; self.transmission = transmission; self.output = output
-        context.render(black, to: input, commandBuffer: command, bounds: extent, colorSpace: CGColorSpaceCreateDeviceRGB())
-        context.render(white, to: whiteInput, commandBuffer: command, bounds: extent, colorSpace: CGColorSpaceCreateDeviceRGB())
         var retained = [MTLTexture]()
         if blueCalibration.isEmpty {
+            guard let whiteInput=device.makeTexture(descriptor:descriptor) else{throw Unavailable()}
+            retained.append(whiteInput)
+            context.render(black,to:input,commandBuffer:command,bounds:extent,colorSpace:CGColorSpaceCreateDeviceRGB())
+            context.render(white,to:whiteInput,commandBuffer:command,bounds:extent,colorSpace:CGColorSpaceCreateDeviceRGB())
             try Self.encode(command, pipeline: calibrate, a: input, b: whiteInput, output: transmission)
         } else {
             for image in blueCalibration {
