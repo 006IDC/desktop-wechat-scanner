@@ -20,6 +20,7 @@ import CoreVideo
     let statistics=NativeMattePresentationStats()
     private(set) var frozen=false
     private(set) var failure:String?
+    private(set) var calibrationTiming=[String:Double]()
     private func recordFailure() {failure="原生扫码显示中断。"}
     init(display:Int,package:String) {self.display=display;self.package=package}
     func receive(_ pixels:CVPixelBuffer) {frames.publish(pixels)}
@@ -57,12 +58,15 @@ import CoreVideo
         return count > 0 && delta/Double(count) > 100
     }
     func prepare(phone:PhoneSession,epoch:Int) async throws {
+        let began=ProcessInfo.processInfo.systemUptime
+        func mark(_ stage:String) {calibrationTiming[stage]=(ProcessInfo.processInfo.systemUptime-began)*1000}
         // scannerActivity() is the single authoritative allowlist for owner,
         // exact route and owned display. Unknown camera apps cannot calibrate.
         guard display > 0 else{throw ScanError("原生扫码不属于本次独立屏幕。")}
         try await requireCurrent(phone)
         let black=try await Task.detached {try Self.background(blue:false)}.value
         _=try await phone.frame(black,epoch:epoch)
+        mark("blackAcknowledgedMilliseconds")
         try await Task.sleep(nanoseconds:350_000_000)
         var samples=[CVPixelBuffer](),last=frames.latest().0
         for _ in 0..<9 {
@@ -76,15 +80,18 @@ import CoreVideo
             samples.append(pixels);last=sample.0
             try await Task.sleep(nanoseconds:80_000_000)
         }
+        mark("blackSamplesReadyMilliseconds")
         let renderer=try await Task.detached(priority:.userInitiated) {
             let images=samples.map {CIImage(cvPixelBuffer:$0)}
             return try NativeScannerMatte(black:images[0],white:images[0],
                 algorithm:.blueWithNativeColorBias,blueCalibration:images)
         }.value
+        mark("rendererReadyMilliseconds")
         samples.removeAll()
         try await requireCurrent(phone)
         let blue=try await Task.detached {try Self.background(blue:true)}.value
         _=try await phone.frame(blue,epoch:epoch)
+        mark("blueAcknowledgedMilliseconds")
         let deadline=ProcessInfo.processInfo.systemUptime+3
         var confirmed=false
         while ProcessInfo.processInfo.systemUptime<deadline {
@@ -93,6 +100,7 @@ import CoreVideo
             try await Task.sleep(nanoseconds:20_000_000)
         }
         guard confirmed else{throw ScanError("原生相机背景尚未确认，已停止透明预览。")}
+        mark("blueConfirmedMilliseconds")
         layer.device=renderer.metalDevice;layer.pixelFormat = .bgra8Unorm
         layer.framebufferOnly=false;layer.isOpaque=false;layer.maximumDrawableCount=2
         layer.allowsNextDrawableTimeout=true;layer.displaySyncEnabled=true

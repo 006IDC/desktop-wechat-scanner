@@ -839,6 +839,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     guard cameraActive,!busy,cameraPump != nil,cameraWindow === mainControl else{throw ScanError("应用内扫一扫未自动启用桌面相机。")}
                     let nativeOverlay=nativeScannerOverlay
                     item["nativeScannerPreviewVisible"]=mainControl.nativeScannerVisible
+                    if let nativeOverlay {item["nativeCalibration"]=nativeOverlay.calibrationTiming}
                     if nativeOverlay != nil,CommandLine.arguments.contains("--diagnostic-native-hold") {
                         // Bounded observation window for real CUA pointer dragging;
                         // only the synthetic board remains eligible for capture.
@@ -894,7 +895,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             }
                         }
                     }
-                    if let nativeOverlay {item["nativePresentation"]=nativeOverlay.statistics.snapshot()}
+                    if let nativeOverlay {
+                        item["nativePresentation"]=nativeOverlay.statistics.snapshot()
+                    }
                 } catch {item["failure"]=error.localizedDescription}
                 if let check=performanceCheck {item.merge(check.finish()){_,new in new}}
                 performanceCheck=nil;cameraSuppressed=true
