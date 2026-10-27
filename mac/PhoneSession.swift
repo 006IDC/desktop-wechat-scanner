@@ -235,6 +235,8 @@ struct CameraFrameReceipt {
 actor PhoneSession {
     /// Fixed diagnostic stages only; no device identity, app page or raw errors.
     private(set) var cleanupStage="notStarted"
+    private(set) var cleanupCameraStreamsBeforeSleep:Int?
+    private(set) var cleanupCameraClosureConfirmed=false
 
     private let adbURL: URL, jarURL: URL, recoveryURL: URL
     private let serverSocket: String?
@@ -826,6 +828,7 @@ actor PhoneSession {
     /// Synchronous inside this actor so connect/quit cannot enter cleanup twice.
     func disconnect() -> String {
         cleanupStage="validateRecord"
+        cleanupCameraStreamsBeforeSleep=nil;cleanupCameraClosureConfirmed=false
         diagnosticLog=nil
         independentApplicationsWhenLocked=false
         cleaning=true;defer {cleaning=false}
@@ -846,6 +849,8 @@ actor PhoneSession {
                         // No page navigation: the server sleeps its own retained
                         // VirtualDevice object, never a caller-supplied display ID.
                         // Cleanup deliberately continues after diagnostic cancellation.
+                        cleanupStage="readCameraBeforeSleep"
+                        cleanupCameraStreamsBeforeSleep=try PhoneCameraState.decode(channel.request(5)).activeStreams
                         cleanupStage="sleepOwnedDevice"
                         let cameraPresent=try channel.request(24)
                         guard cameraPresent==Data([0]) || cameraPresent==Data([1]) else {
@@ -854,6 +859,7 @@ actor PhoneSession {
                         if cameraPresent==Data([1]) {
                             cleanupStage="waitCameraClosure"
                             try OwnedCameraCleanup.quiesce(read:{try PhoneCameraState.decode(channel.request(5))})
+                            cleanupCameraClosureConfirmed=true
                         }
                     }
                     cleanupStage="restoreTasks"

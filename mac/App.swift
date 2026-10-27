@@ -813,6 +813,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func runDesktopDiagnostic() async {
         var report:[String:Any]=["test":"desktop-native-app-flow","physicalMouseDragMeasured":false]
         var applications=[[String:Any]]()
+        let activeExit=CommandLine.arguments.contains("--diagnostic-active-scanner-exit")
+        if activeExit {report["test"]="desktop-native-active-scanner-exit"}
         do {
             guard desktopMode,screenAccessGranted else{throw ScanError("通用桌面诊断尚未就绪。")}
             report["primaryLockedBefore"]=try await !phone.primaryUserUnlocked()
@@ -822,7 +824,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             report["applicationPickerVisible"]=applicationPickerVisible
             let apps=try await phone.applications()
-            for package in ["com.tencent.mm","com.eg.android.AlipayGphone"] {
+            for package in (activeExit ? ["com.tencent.mm"]:["com.tencent.mm","com.eg.android.AlipayGphone"]) {
                 try Task.checkCancellation()
                 guard let app=apps.first(where:{$0.packageName==package}) else{throw ScanError("测试应用未安装。")}
                 var item:[String:Any]=["package":package,"qrRecognized":false]
@@ -895,6 +897,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         item["localReopenPassed"]=true
                     }
                     if let frame=localScanFrame {check.bindLocalFrame(frame)}
+                    if activeExit {
+                        let state=try await phone.cameraState()
+                        item["activeScannerBeforeExit"]=nativeOverlay != nil && state.scannerActivity()?.package==package
+                        item["activeStreamCountBeforeExit"]=state.activeStreams
+                    } else {
                     let started=ProcessInfo.processInfo.systemUptime
                     check.start(at:started)
                     while ProcessInfo.processInfo.systemUptime-started<14 {
@@ -912,6 +919,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             }
                         }
                     }
+                    }
                     if let nativeOverlay {
                         item["nativePresentation"]=nativeOverlay.statistics.snapshot()
                     }
@@ -924,6 +932,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     item["nativeTermination"]=observedOverlay.termination
                 }
                 applications.append(item)
+                if activeExit {break} // Keep the real scanner open for owned-device teardown.
                 // This is the same Home command as the ordinary toolbar.
                 home();try await Task.sleep(nanoseconds:500_000_000)
             }
@@ -932,9 +941,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let check=performanceCheck {_=check.finish()};performanceCheck=nil
         cameraSuppressed=true;await clearCamera();await capture.setDiagnosticBoard(nil)
         report["applications"]=applications
-        let passed=applications.count==2 && applications.allSatisfy {
-            $0["automaticCameraStarted"] as? Bool == true && $0["qrRecognized"] as? Bool == true && $0["failure"] == nil
-        } && report["failure"] == nil
+        let passed:Bool
+        if activeExit {
+            passed=applications.count==1 && applications[0]["activeScannerBeforeExit"] as? Bool == true &&
+                applications[0]["failure"] == nil && report["failure"] == nil
+        } else {
+            passed=applications.count==2 && applications.allSatisfy {
+                $0["automaticCameraStarted"] as? Bool == true && $0["qrRecognized"] as? Bool == true && $0["failure"] == nil
+            } && report["failure"] == nil
+        }
         report["passed"]=passed
         if !passed {diagnosticExitStatus=1}
         report["screenPermission"]=screenAccessGranted
@@ -1580,7 +1595,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         dismissLocalScanFrame(restoring:true);localCameraMode=false
         nativeScannerOverlay?.freeze();cameraWindow?.freezeNativeScanner()
         endCameraActivity()
-        launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
+        launchDiagnosticGeneration+=1
+        let launchCheck=launchDiagnosticTask;launchCheck?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
         stopping=true;busy=true;paused=true;cameraActive=false;scanGeneration+=1;mirrorGeneration+=1;physicalMirror.frames.stop();scannerMirror.frames.stop()
         let chooser=connectionWindow;chooser?.close();connectionWindow=nil
@@ -1589,6 +1605,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refresh()
         if !preserveError {status("正在断开","正在结束手机镜像并清理临时连接…")}
         Task {
+            await launchCheck?.value
             await checking?.value
             await stopNativeScannerOverlay()
             let chooserClean=await chooser?.waitForCleanup() ?? true
@@ -1637,7 +1654,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         endCameraActivity()
         terminating=true
         nativeScannerOverlay?.freeze();cameraWindow?.freezeNativeScanner()
-        launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
+        launchDiagnosticGeneration+=1
+        let launchCheck=launchDiagnosticTask;launchCheck?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
         stopping=true;let chooser=connectionWindow;chooser?.close();connectionWindow=nil
         let previousCamera=cameraLoop;cameraLoop=nil
@@ -1646,6 +1664,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         physicalMirror.frames.stop();scannerMirror.frames.stop();previewTimer?.invalidate();previewTimer=nil
         status("正在退出","正在停止镜像并清理手机临时连接…")
         Task {
+            await launchCheck?.value
             await checking?.value
             await stopNativeScannerOverlay()
             let chooserClean=await chooser?.waitForCleanup() ?? true
@@ -1669,6 +1688,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if let data=try? Data(contentsOf:file),var report=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any] {
                     report["cleanupSucceeded"]=problem.isEmpty
                     report["cleanupStage"]=await phoneSession?.cleanupStage
+                    report["cleanupCameraStreamsBeforeSleep"]=await phoneSession?.cleanupCameraStreamsBeforeSleep
+                    report["cleanupCameraClosureConfirmed"]=await phoneSession?.cleanupCameraClosureConfirmed
                     if !problem.isEmpty {report["passed"]=false}
                     let writer=DiagnosticStateWriter(fileURL:file);writer.submit(report);await writer.flush()
                 }

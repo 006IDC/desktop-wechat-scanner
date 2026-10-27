@@ -270,3 +270,8 @@ GPU资源复用依据[Apple CIContext文档](https://developer.apple.com/documen
 9ebdca2完整双应用实验两者均未确认扫码入口，不能当作快校准/呈现通过；退出cleanupStage=complete，journal消失，三个系统服务健康。随后CUA直接观察在balanced-display下微信出现重复标题，点按未正常打开菜单，故从App候选连接参数中撤掉balanced-display，保留原有独立显示尺寸，仅继续试realtime-video。没有替换已安装版。此处先前“保留布局”仅是按比例缩放的设计意图，在该ROM上的实际回归否定了它的可用性，不能作为产品承诺。
 
 快模式进一步要求ACK后连续两帧中央暗候选再采样；统计名改为darkCandidateReadyMilliseconds。暗色启发式仍可能命中排队的旧暗帧，不能称上传黑图的端到端确认，须以真机背景/原生扫线/识别验收。主屏hold定位按CGMainDisplayID映射NSScreen后才移动本窗口，避免将任意枚举屏幕叫主屏。
+
+
+8e9f980微信已通过原生校准、测试码识别/返回：约1202ms校准，呈现p95=33.33ms、最大50ms、GPU p95=4.73ms，编码器报告latency=1帧（不是端到端输入延迟）；支付宝本轮自动入口未确认，整体passed=false。退出complete、journal清除、系统相机健康。此结果也不证明此前重复标题一定由分辨率单一因素导致，只能说明保留原尺寸候选的微信主流程已通过。
+
+退出取消边界：先取消并等待启动诊断结束，再停止镜像/手机会话，避免还在收尾的诊断与设备释放交错。`--diagnostic-active-scanner-exit`在显式桌面诊断下只打开微信，确认原生扫码层及认证scanner状态，不展示QR、不发送Home，随后走正常退出；用独立test名称/通过条件，不冒充双应用QR通过。cleanup另记录休眠前流数、是否完成双闭合及固定阶段，不输出owner包名/页面/设备标识。此模式待真机验证。
