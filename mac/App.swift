@@ -799,6 +799,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         guard connected,!stopping,generation==scanGeneration,nativeScannerOverlay === overlay else{throw CancellationError()}
                         guard activeRoute === nativeRoute,nativeRoute.incarnation==nativeIncarnation,
                               mirrorDisplay==targetDisplay,overlay.decodedFrameDelivery else{throw ScanError("扫码镜像路由已变化。")}
+                        if targetWindow === mainControl {applicationPickerVisible=false}
                         targetWindow.showNativeScanner(overlay)
                     } else {showLocalScanFrame(for:targetWindow)}
                 } else if localCameraMode {showLocalScanFrame(for:targetWindow)}
@@ -860,7 +861,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     item["nativeDecodedFrameDelivery"]=nativeOverlay?.decodedFrameDelivery ?? false
                     item["nativePresentationClock"]=nativeOverlay?.presentationClock ?? "none"
                     item["nativeDisplaySyncEnabled"]=nativeOverlay?.displaySyncEnabled
-                    if let nativeOverlay {item["nativeCalibration"]=nativeOverlay.calibrationTiming}
+                    if let nativeOverlay {
+                        item["nativeCalibration"]=nativeOverlay.calibrationTiming
+                        item["nativeSurfaceBeforeAttachment"]=mainControl.nativeSurfaceBeforeAttachment
+                    }
                     if CommandLine.arguments.contains("--diagnostic-main-actor-pause") {
                         guard let nativeOverlay else{throw ScanError("主线程隔离测试需要原生预览。")}
                         // Wait for measured display readiness rather than
@@ -875,6 +879,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
                         item["displayReadinessWaitMilliseconds"]=(ProcessInfo.processInfo.systemUptime-readyBegan)*1000
                         item["windowVisibleBeforePause"]=mainControl.window?.isVisible ?? false
+                        item["nativeSurfaceBeforePause"]=mainControl.nativeSurfaceDiagnostic
                         item["windowHasVisibleRegionBeforePause"]=mainControl.window?.occlusionState.contains(.visible) ?? false
                         if let window=mainControl.window {
                             item["windowFrameBeforePause"]=[window.frame.minX,window.frame.minY,window.frame.width,window.frame.height]

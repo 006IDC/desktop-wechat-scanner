@@ -42,7 +42,10 @@ import CoreVideo
         precondition(events==[0,1],"Calibration failed to release the active touch")
         phone.mouseDown(with:down);phone.mouseUp(with:up)
         precondition(events==[0,1],"Calibration accepted input through a stale frame")
+        ui.showApplicationPicker([],onOpen:{_ in},onDetach:{_,_ in})
+        precondition(phone.isHidden,"Picker did not hide the ordinary phone view")
         ui.showNativeScanner(overlay)
+        precondition(!phone.isHidden && !phone.isHiddenOrHasHiddenAncestor,"Picker hid the verified native scanner")
         ui.setLocalScanPreview(false) // The ordinary status refresh must not reveal an obsolete frame.
         ui.setPhonePixelBuffer(fresh) // An attached native layer still owns presentation.
         let obsolete=phone.layer?.sublayers?.filter { ["phone.still-frame","phone.video"].contains($0.name ?? "") } ?? []

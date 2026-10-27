@@ -109,6 +109,15 @@ private final class PhonePreviewView: NSView {
     var nativeScannerFrames:((CVPixelBuffer)->Bool)?
     var nativeScannerResize:((CGSize)->Void)?
     private var nativeScannerLayer:CAMetalLayer?
+    var nativeSurfaceDiagnostic:[String:Any] {
+        ["phoneHidden":isHidden,"hiddenAncestor":isHiddenOrHasHiddenAncestor,
+         "visibleWidth":visibleRect.width,"visibleHeight":visibleRect.height,
+         "phoneWidth":bounds.width,"phoneHeight":bounds.height,
+         "metalAttached":nativeScannerLayer?.superlayer != nil,
+         "metalHidden":nativeScannerLayer?.isHidden ?? false,
+         "drawableWidth":nativeScannerLayer?.drawableSize.width ?? 0,
+         "drawableHeight":nativeScannerLayer?.drawableSize.height ?? 0]
+    }
     var interactionEnabled=true {didSet {if !interactionEnabled {cancelTouch()}}}
     private let frameLayer = CALayer()
     private let videoLayer = AVSampleBufferDisplayLayer()
@@ -523,6 +532,8 @@ final class ControlWindowController: NSWindowController {
     private var desktopOverlayRestore: (NSWindow.Level, NSWindow.CollectionBehavior)?
     var nativeScannerVisible:Bool {background.nativeScannerPreview}
     var nativeTitleDragRequests:Int {background.nativeTitleDragRequests}
+    var nativeSurfaceDiagnostic:[String:Any] {holder.phone.nativeSurfaceDiagnostic}
+    private(set) var nativeSurfaceBeforeAttachment=[String:Any]()
 
     var desktopCaptureRect: CGRect {
         guard let window, holder.phone.window === window,
@@ -827,6 +838,10 @@ final class ControlWindowController: NSWindowController {
     }
     func showNativeScanner(_ overlay:NativeScannerOverlay) {
         guard let window else{return}
+        nativeSurfaceBeforeAttachment=nativeSurfaceDiagnostic
+        // A verified scanner owns this surface. A previous HOME picker must
+        // not keep the phone view hidden while its Metal layer keeps rendering.
+        hideApplicationPicker();holder.phone.isHidden=false
         window.styleMask.insert(.fullSizeContentView);window.titlebarAppearsTransparent=true
         window.isOpaque=false;window.backgroundColor = .clear
         background.nativeScannerPreview=true
