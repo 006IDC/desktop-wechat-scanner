@@ -298,3 +298,9 @@ USB重新接入后，生产恢复逻辑清理旧journal成功，三个系统服�
 8b0f600修复同值localScanPreview状态刷新清空尚未完成触摸的问题：同值不改变触摸，真正模式变化才发送UP并释放。组件回归覆盖down→同值刷新→up，以及实际view树hitTest命中PhonePreview。AppKit hitTest参数属于receiver的superview坐标（[Apple文档](https://developer.apple.com/documentation/appkit/nsview/hittest(_:))）；不能套用UIKit坐标约定。此修复不等于已定位全部卡顿。另在恢复原尺寸后仍观察到微信重复标题，因此此前balanced-display与该现象的关联不能表述为唯一根因。
 
 随后纯合成输入探针复用真实ControlWindowController，工具重建会话后收到down/up、localEvents=2，触点坐标与合成圆点一致。产品诊断仍未收到事件，进一步查明自检棋盘在扫码启动前已固定floating-1，而主镜像尚为normal；其遮挡会拦截坐标点击，单窗口截图却排除了棋盘。当前修复仅涉及诊断：初始棋盘与镜像同级并order below，随后按镜像normal/floating变化同步层级，停止扫码时退回normal；缓存层级避免60Hz重复排序。组件回归验证normal→floating→normal，实际view树命中与同值刷新触摸均通过；含NSScreen的层级测试需在可访问WindowServer的环境运行。此前“坐标点击未交付”不能解释成所有普通AppKit输入或真实手机控制故障；修正后的手动真机验收另记。
+
+0c5bd8d修正后的CUA手动双应用链路整轮passed=true：微信3组、支付宝4组实际PhonePreview down/up成对送达，命中自有预览；均从应用内入口启用原生层，识别测试纯文本并返回。两段校准约809/648ms，呈现p95约33.33/16.67ms；支付宝出现一次约667ms间隔，不能称零卡顿。该轮曾出现非测试页面，已退出且未同意其位置请求，未保存该页面/正文。
+
+同一0c5bd8d无并行CUA截图对照：微信/支付宝识别、返回、清理均成功，校准约756/1027ms，呈现p95均16.67ms，最大33.33/100ms（支付宝长间隔位于约6秒的测试码交接末段）。仍不能由工具并行与否直接断言因果。随后60秒微信原生hold的p95约16.67ms、最大83.33ms；退出前认证确认scanner=true、stream=1，关断确认及生产清理均成功，journal消失，三项系统服务健康。CUA的down/drag/up、标题命中、performDrag请求均到达，但WindowServer实际位移仍为0；物理拖动和参考视频同等手感尚未验收，未替换已安装build41或发布Release。
+
+后续原生计时新增受限数值：首次drawable提交后的源帧到达间隔、nextDrawable等待，与已有GPU/实际呈现间隔分别统计；过滤无效值，每类最多7200样本，不存像素。合成计时测试验证校准期排除、阶段分离和采样上限。用于区分源帧、可绘制缓冲区与屏幕呈现停顿，不能把GPU耗时当成鼠标端到端响应。

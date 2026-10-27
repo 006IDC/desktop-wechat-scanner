@@ -55,6 +55,7 @@ import CoreVideo
     /// Show genuine black-background frames during calibration, so opening the
     /// Android scanner keeps its own animation. Hide only the blue-key phase.
     func receive(_ pixels:CVPixelBuffer)->Bool {
+        if !frozen {statistics.received(at:ProcessInfo.processInfo.systemUptime)}
         frames.publish(pixels);return hidesCalibrationFrames || frozen
     }
     func matches(_ state:PhoneCameraState)->Bool {

@@ -176,7 +176,10 @@ final class NativeScannerMatte {
     /// Call serially on the render worker, including calibration/readback probes.
     func present(black: CIImage, layer: CAMetalLayer, stats: NativeMattePresentationStats) throws -> Bool {
         guard black.extent == extent else { throw Unavailable("dimensions") }
-        guard let drawable=layer.nextDrawable() else { return false }
+        let drawableBegan=ProcessInfo.processInfo.systemUptime
+        let nextDrawable=layer.nextDrawable()
+        stats.drawableWait(milliseconds:(ProcessInfo.processInfo.systemUptime-drawableBegan)*1000)
+        guard let drawable=nextDrawable else { return false }
         guard let command=queue.makeCommandBuffer() else { throw Unavailable() }
         context.render(black,to:input,commandBuffer:command,bounds:extent,colorSpace:CGColorSpaceCreateDeviceRGB())
         try Self.encode(command,pipeline:composite,a:input,b:transmission,output:output)
@@ -197,6 +200,19 @@ final class NativeMattePresentationStats: @unchecked Sendable {
     private var submittedCount=0,completedCount=0,failedCount=0,presentedCount=0,presentationCallbacks=0,lastPresentation:Double?
     private var intervals=[Double](),gpu=[Double](),longIntervals=[[Double]]()
     private var firstPresentation:Double?
+    private var receivedCount=0,lastReceived:Double?
+    private var receiveIntervals=[Double](),drawableWaits=[Double]()
+    /// Arrival at the native view, distinct from GPU completion/presentation.
+    /// Exclude calibration before the first actual drawable submission.
+    func received(at time:Double) {lock.withLock {
+        guard submittedCount>0,time.isFinite,time>0 else{return}
+        receivedCount+=1
+        if let last=lastReceived,time>last,receiveIntervals.count<7200 {receiveIntervals.append((time-last)*1000)}
+        lastReceived=max(lastReceived ?? time,time)
+    }}
+    func drawableWait(milliseconds:Double) {lock.withLock {
+        if milliseconds.isFinite,milliseconds>=0,drawableWaits.count<7200 {drawableWaits.append(milliseconds)}
+    }}
     func submitted() {lock.withLock {submittedCount += 1}}
     func completed(ok:Bool,gpuMilliseconds:Double) { lock.withLock {
         completedCount += 1;if !ok {failedCount += 1}
@@ -214,8 +230,13 @@ final class NativeMattePresentationStats: @unchecked Sendable {
         lastPresentation=max(lastPresentation ?? time,time)
     } }
     func snapshot() -> [String:Any] { lock.withLock {
-        let sorted=intervals.sorted(),g=gpu.sorted()
+        let sorted=intervals.sorted(),g=gpu.sorted(),received=receiveIntervals.sorted(),waits=drawableWaits.sorted()
+        func p95(_ values:[Double])->Double {values.isEmpty ? -1:values[Int(Double(values.count-1)*0.95)]}
         return ["submitted":submittedCount,"completed":completedCount,"failed":failedCount,"presented":presentedCount,
+            "receivedFrames":receivedCount,"receiveIntervalSamples":received.count,
+            "receiveIntervalP95Milliseconds":p95(received),"receiveIntervalMaxMilliseconds":received.last ?? -1,
+            "drawableWaitSamples":waits.count,"drawableWaitP95Milliseconds":p95(waits),
+            "drawableWaitMaxMilliseconds":waits.last ?? -1,
             "pendingGPU":max(0,submittedCount-completedCount),
             "pendingPresentationCallbacks":max(0,submittedCount-presentationCallbacks),
             "presentationCallbacks":presentationCallbacks,

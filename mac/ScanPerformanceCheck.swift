@@ -74,6 +74,7 @@ import CoreImage.CIFilterBuiltins
         center=NSPoint(x:board.frame.midX-window.frame.width/2,
                        y:board.frame.midY-176)
         window.setFrameOrigin(center)
+        synchronizeStacking()
     }
 
     /// Called by the same common-mode presentation tick as the product camera.
