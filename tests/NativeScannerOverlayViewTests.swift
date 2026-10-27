@@ -30,6 +30,9 @@ import AppKit
         phone.mouseDown(with:down);phone.mouseUp(with:up)
         precondition(events==[0,1],"Calibration accepted input through a stale frame")
         ui.showNativeScanner(overlay)
+        ui.setLocalScanPreview(false) // The ordinary status refresh must not reveal an obsolete frame.
+        let obsolete=phone.layer?.sublayers?.filter { ["phone.still-frame","phone.video"].contains($0.name ?? "") } ?? []
+        precondition(obsolete.count==2 && obsolete.allSatisfy(\.isHidden),"Status refresh exposed an old mirror underneath native alpha")
         precondition(ui.nativeScannerVisible && !window.isOpaque && window.styleMask.contains(.fullSizeContentView))
         phone.mouseDown(with:down)
         ui.freezeNativeScanner()

@@ -57,8 +57,9 @@ import CoreVideo
         return count > 0 && delta/Double(count) > 100
     }
     func prepare(phone:PhoneSession,epoch:Int) async throws {
-        // Initially support the native layout exercised by the real USB probe.
-        guard display > 0,package=="com.tencent.mm" else{throw ScanError("当前原生透明预览尚未验证此应用。")}
+        // scannerActivity() is the single authoritative allowlist for owner,
+        // exact route and owned display. Unknown camera apps cannot calibrate.
+        guard display > 0 else{throw ScanError("原生扫码不属于本次独立屏幕。")}
         try await requireCurrent(phone)
         let black=try await Task.detached {try Self.background(blue:false)}.value
         _=try await phone.frame(black,epoch:epoch)

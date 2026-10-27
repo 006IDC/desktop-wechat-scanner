@@ -778,7 +778,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 localCameraMode=desktopMode
                 if localCameraMode,nativeScannerRequested,let targetDisplay {
                     let state=try await phone.cameraState()
-                    if let scanner=state.scannerActivity(),scanner.displayId==targetDisplay,scanner.package=="com.tencent.mm" {
+                    if let scanner=state.scannerActivity(),scanner.displayId==targetDisplay {
                         let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package)
                         nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
                         status("准备原生扫码预览","正在校准手机应用自己的相机背景…")
@@ -843,7 +843,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         // Bounded observation window for real CUA pointer dragging;
                         // only the synthetic board remains eligible for capture.
                         item["interactivePreviewHoldSeconds"]=60
-                        try await Task.sleep(nanoseconds:60_000_000_000)
+                        let initial=mainControl.window?.frame.origin ?? .zero
+                        let until=ProcessInfo.processInfo.systemUptime+60
+                        var maximumDisplacement=0.0
+                        while ProcessInfo.processInfo.systemUptime<until {
+                            try Task.checkCancellation()
+                            if let origin=mainControl.window?.frame.origin {
+                                maximumDisplacement=max(maximumDisplacement,hypot(origin.x-initial.x,origin.y-initial.y))
+                            }
+                            try await Task.sleep(nanoseconds:50_000_000)
+                        }
+                        item["observedHoldWindowDisplacementPoints"]=maximumDisplacement
                         guard cameraActive,!busy,nativeScannerOverlay === nativeOverlay else {
                             throw ScanError("原生预览在观察期间已结束，诊断不继续点击。")
                         }

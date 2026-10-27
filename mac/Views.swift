@@ -116,8 +116,8 @@ private final class PhonePreviewView: NSView {
             touchStart = nil; touchStartLocation = nil
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            frameLayer.isHidden = mirrorFrame == nil
-            videoLayer.isHidden = mirrorPixels == nil
+            frameLayer.isHidden = nativeScannerLayer != nil || mirrorFrame == nil
+            videoLayer.isHidden = nativeScannerLayer != nil || mirrorPixels == nil
             updateLayerMasks()
             CATransaction.commit()
             needsDisplay = true
@@ -136,6 +136,7 @@ private final class PhonePreviewView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        frameLayer.name="phone.still-frame";videoLayer.name="phone.video"
         frameLayer.contentsGravity = .resizeAspect
         frameLayer.minificationFilter = .linear
         frameLayer.magnificationFilter = .linear
