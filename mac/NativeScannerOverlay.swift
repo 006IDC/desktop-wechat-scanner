@@ -68,13 +68,7 @@ import CoreVideo
         if identity == nil {identity=(state.generation,state.ownerGeneration)}
     }
     private nonisolated static func background(blue:Bool) throws -> Data {
-        let image=CIImage(color:CIColor(red:0,green:0,blue:blue ? 1:0))
-            .cropped(to:CGRect(x:0,y:0,width:720,height:1280))
-        guard let space=CGColorSpace(name:CGColorSpace.sRGB),
-              let data=CIContext().pngRepresentation(of:image,format:.RGBA8,colorSpace:space) else {
-            throw ScanError("无法生成原生相机校准帧。")
-        }
-        return data
+        try NativeCalibrationImages.image(blue:blue)
     }
     private nonisolated static func isBlue(_ pixels:CVPixelBuffer)->Bool {
         guard CVPixelBufferGetPixelFormatType(pixels)==kCVPixelFormatType_32BGRA,

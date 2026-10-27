@@ -78,7 +78,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification:Notification) {
         buildMenu();control.window?.delegate=self
-        if nativeScannerRequested {Task.detached(priority:.utility) {try? NativeScannerMatte.prewarm()}}
+        if nativeScannerRequested {Task.detached(priority:.utility) {
+            try? NativeScannerMatte.prewarm();try? NativeCalibrationImages.prewarm()
+        }}
         let timer=Timer(timeInterval:1.0/60,target:self,selector:#selector(presentMirrorFrame),userInfo:nil,repeats:true)
         RunLoop.main.add(timer,forMode:.common);previewTimer=timer
         control.onConnect={ [weak self] in self?.connect() }
