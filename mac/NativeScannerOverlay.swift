@@ -28,6 +28,7 @@ import QuartzCore
     private var identity:(Int,Int)?
     private let display:Int,package:String
     private let fastCalibration:Bool
+    let displaySyncEnabled:Bool
     let layer=CAMetalLayer()
     let statistics=NativeMattePresentationStats()
     private(set) var frozen=false
@@ -64,8 +65,9 @@ import QuartzCore
         }
     }
     private func recordFailure() {renderFailure="原生扫码显示中断。"}
-    init(display:Int,package:String,fastCalibration:Bool=false) {
+    init(display:Int,package:String,fastCalibration:Bool=false,displaySyncEnabled:Bool=true) {
         self.display=display;self.package=package;self.fastCalibration=fastCalibration
+        self.displaySyncEnabled=displaySyncEnabled
     }
     /// Show genuine black-background frames during calibration, so opening the
     /// Android scanner keeps its own animation. Hide only the blue-key phase.
@@ -183,7 +185,7 @@ import QuartzCore
         mark("blueConfirmedMilliseconds")
         layer.device=renderer.metalDevice;layer.pixelFormat = .bgra8Unorm
         layer.framebufferOnly=false;layer.isOpaque=false;layer.maximumDrawableCount=2
-        layer.allowsNextDrawableTimeout=true;layer.displaySyncEnabled=true
+        layer.allowsNextDrawableTimeout=true;layer.displaySyncEnabled=displaySyncEnabled
         let input=frames,statistics=statistics
         var lastRenderedRevision=0 // Only the dedicated render run loop accesses this.
         let driver=NativeMetalDisplayDriver(layer:layer,active:{input.latest().2},render:{drawable in

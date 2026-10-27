@@ -787,7 +787,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let state=try await phone.cameraState()
                     if let scanner=state.scannerActivity(),scanner.displayId==targetDisplay {
                         let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
-                            fastCalibration:CommandLine.arguments.contains("--native-fast-calibration"))
+                            fastCalibration:CommandLine.arguments.contains("--native-fast-calibration"),
+                            displaySyncEnabled:!CommandLine.arguments.contains("--native-unsynced-presentation"))
                         guard mirrorDisplay==targetDisplay else{throw ScanError("扫码镜像路由已变化。")}
                         let nativeRoute=activeRoute,nativeIncarnation=nativeRoute.incarnation
                         try overlay.observeDecodedFrames(in:nativeRoute.frames,generation:nativeIncarnation)
@@ -858,6 +859,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     item["nativeScannerPreviewVisible"]=mainControl.nativeScannerVisible
                     item["nativeDecodedFrameDelivery"]=nativeOverlay?.decodedFrameDelivery ?? false
                     item["nativePresentationClock"]=nativeOverlay?.presentationClock ?? "none"
+                    item["nativeDisplaySyncEnabled"]=nativeOverlay?.displaySyncEnabled
                     if let nativeOverlay {item["nativeCalibration"]=nativeOverlay.calibrationTiming}
                     if CommandLine.arguments.contains("--diagnostic-main-actor-pause") {
                         guard let nativeOverlay else{throw ScanError("主线程隔离测试需要原生预览。")}
