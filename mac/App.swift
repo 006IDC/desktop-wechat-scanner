@@ -953,6 +953,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     check.start(at:started)
                     while ProcessInfo.processInfo.systemUptime-started<14 {
                         try Task.checkCancellation();try await Task.sleep(nanoseconds:200_000_000)
+                        if nativeOverlay?.termination["reason"] as? String == "pumpFailure" {
+                            throw ScanError("原生预览已因采集或相机会话错误停止，本轮不继续切换应用。")
+                        }
                         if check.qrVisible,let pixels=latestPhoneFrame {
                             let found=try await Task.detached {
                                 try ScannerNavigationOCR.recognize(pixels).contains {
@@ -973,12 +976,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 } catch {item["failure"]=error.localizedDescription}
                 if let check=performanceCheck {item.merge(check.finish()){_,new in new}}
                 performanceCheck=nil;cameraSuppressed=true
-                await clearCamera();await capture.setDiagnosticBoard(nil)
+                let cameraCleared=await clearCamera();await capture.setDiagnosticBoard(nil)
+                item["cameraFrameClearAcknowledged"]=cameraCleared
                 if let observedOverlay {
                     item["nativePresentation"]=observedOverlay.statistics.snapshot()
                     item["nativeTermination"]=observedOverlay.termination
                 }
                 applications.append(item)
+                guard cameraCleared else {throw ScanError("手机未确认清除旧相机画面，已停止后续应用测试。")}
+                guard observedOverlay?.termination["reason"] as? String != "pumpFailure" else {
+                    throw ScanError("预览发生采集或相机会话错误，已停止后续应用测试。")
+                }
                 if activeExit {break} // Keep the real scanner open for owned-device teardown.
                 // This is the same Home command as the ordinary toolbar.
                 home();try await Task.sleep(nanoseconds:500_000_000)
@@ -1249,7 +1257,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let generation=mirrorGeneration
         busy=true;status("正在打开 \(app.name)","应用在手机运行，画面保留在当前窗口。")
         defer {if connected,!stopping,mirrorGeneration==generation {busy=false;refresh()}}
-        await clearCamera()
+        guard await clearCamera() else {throw ScanError("手机未确认清除旧相机画面，暂不打开其他应用。")}
         try Task.checkCancellation()
         guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
         guard let display=await phone.scannerDisplay()?.id else{throw ScanError("手机桌面尚未准备好。")}
