@@ -938,7 +938,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard connected,!stopping,mirrorGeneration==connectionGeneration else{throw CancellationError()}
         }
         if CommandLine.arguments.contains("--diagnostic-manual-navigation") {
-            evidence["navigationUsesCUA"]=true
+            evidence["manualNavigationRequested"]=true
+            evidence["automaticNavigationDisabled"]=true
             let deadline=ProcessInfo.processInfo.systemUptime+90
             while ProcessInfo.processInfo.systemUptime<deadline {
                 try checkNavigation()
