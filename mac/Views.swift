@@ -60,6 +60,7 @@ private func button(_ title: String, tooltip: String) -> NSButton {
 private final class PhoneWindowBackgroundView: NSView {
     weak var preview: PhonePreviewView?
     var localScanPreview = false { didSet { needsDisplay = true } }
+    var nativeScannerPreview = false {didSet {needsDisplay=true}}
     var aperture = ScanPreviewAperture.standard { didSet { needsDisplay = true } }
     override var isOpaque: Bool { false }
 
@@ -70,8 +71,8 @@ private final class PhoneWindowBackgroundView: NSView {
         let background = NSBezierPath(rect: bounds)
         if let preview, preview.window === window,
            let localOpening = ScanPreviewAperture.visibleOpening(in: preview.imageArea,
-                                                                  normalized: aperture,
-                                                                  enabled: localScanPreview) {
+                                                                  normalized: nativeScannerPreview ? CGRect(x:0,y:0,width:1,height:1) : aperture,
+                                                                  enabled: localScanPreview || nativeScannerPreview) {
             let opening = convert(localOpening, from: preview)
             if opening.width > 0, opening.height > 0 {
                 background.append(NSBezierPath(roundedRect: opening, xRadius: 12, yRadius: 12))
@@ -90,6 +91,9 @@ private final class PhoneWindowBackgroundView: NSView {
 
 /// Emits 0…1 coordinates from the actual image area, with a top-left origin.
 private final class PhonePreviewView: NSView {
+    var nativeScannerFrames:((CVPixelBuffer)->Void)?
+    private var nativeScannerLayer:CAMetalLayer?
+    var interactionEnabled=true {didSet {if !interactionEnabled {cancelTouch()}}}
     private let frameLayer = CALayer()
     private let videoLayer = AVSampleBufferDisplayLayer()
     private let frameMask = CAShapeLayer()
@@ -124,6 +128,7 @@ private final class PhonePreviewView: NSView {
     var onSwipe: ((Double, Double, Double, Double) -> Void)?
     private var touchStart: NSPoint?
     private var touchStartLocation: NSPoint?
+    private var lastTouchPoint:NSPoint?
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -172,6 +177,7 @@ private final class PhonePreviewView: NSView {
 
     func setPixelBuffer(_ pixels: CVPixelBuffer?) {
         guard let pixels else { setFrame(nil); return }
+        if let nativeScannerFrames {nativeScannerFrames(pixels);return}
         let hadFrame = hasFrame
         mirrorFrame = nil
         mirrorPixels = pixels
@@ -232,6 +238,12 @@ private final class PhonePreviewView: NSView {
         CATransaction.setDisableActions(true)
         frameLayer.frame = bounds
         videoLayer.frame = bounds
+        if let nativeScannerLayer {
+            nativeScannerLayer.frame=imageRect
+            nativeScannerLayer.contentsScale=window?.backingScaleFactor ?? 2
+            nativeScannerLayer.drawableSize=CGSize(width:imageRect.width*nativeScannerLayer.contentsScale,
+                height:imageRect.height*nativeScannerLayer.contentsScale)
+        }
         updateLayerMasks()
         CATransaction.commit()
     }
@@ -255,9 +267,16 @@ private final class PhonePreviewView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self,name:NSWindow.didResignKeyNotification,object:nil)
+        if let window {NotificationCenter.default.addObserver(self,selector:#selector(windowResigned),name:NSWindow.didResignKeyNotification,object:window)}
         updateContentsScale()
         needsLayout = true
     }
+    override func viewWillMove(toWindow newWindow:NSWindow?) {
+        if newWindow !== window {cancelTouch()}
+        super.viewWillMove(toWindow:newWindow)
+    }
+    @objc private func windowResigned(_ notification:Notification) {cancelTouch()}
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
@@ -283,6 +302,11 @@ private final class PhonePreviewView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        if nativeScannerLayer != nil {
+            NSColor.black.setFill();bounds.fill(using:.copy)
+            NSColor.clear.setFill();imageRect.fill(using:.copy)
+            return
+        }
         if localScanPreview {
             NSColor.black.setFill()
             bounds.fill(using: .copy)
@@ -319,23 +343,25 @@ private final class PhonePreviewView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard hasFrame else { return }
+        guard hasFrame,interactionEnabled else { return }
         let location = convert(event.locationInWindow, from: nil)
         guard imageRect.contains(location) else { return }
         touchStart = normalized(location)
+        lastTouchPoint=touchStart
         touchStartLocation = location
         if let start=touchStart { onTouch?(0,Double(start.x),Double(start.y)) }
     }
 
     override func mouseDragged(with event:NSEvent) {
-        guard touchStart != nil,onTouch != nil else{return}
+        guard interactionEnabled,touchStart != nil,onTouch != nil else{return}
         let point=normalized(convert(event.locationInWindow,from:nil))
+        lastTouchPoint=point
         onTouch?(2,Double(point.x),Double(point.y))
     }
 
     override func mouseUp(with event: NSEvent) {
         guard let start = touchStart, let location = touchStartLocation else { return }
-        defer { touchStart = nil; touchStartLocation = nil }
+        defer { touchStart = nil; touchStartLocation = nil;lastTouchPoint=nil }
         let finishLocation = convert(event.locationInWindow, from: nil)
         let end = normalized(finishLocation)
         if let onTouch { onTouch(1,Double(end.x),Double(end.y));return }
@@ -347,10 +373,22 @@ private final class PhonePreviewView: NSView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard hasFrame else { return }
+        guard hasFrame,interactionEnabled else { return }
         let amount = min(0.40, max(-0.40, event.scrollingDeltaY * 0.006))
         guard abs(amount) > 0.02 else { return }
         onSwipe?(0.5, 0.5 - Double(amount), 0.5, 0.5 + Double(amount))
+    }
+
+    private func cancelTouch() {
+        if touchStart != nil,let point=lastTouchPoint {onTouch?(1,Double(point.x),Double(point.y))}
+        touchStart=nil;touchStartLocation=nil;lastTouchPoint=nil
+    }
+    func setNativeScannerLayer(_ value:CAMetalLayer?) {
+        cancelTouch();nativeScannerLayer?.removeFromSuperlayer();nativeScannerLayer=value
+        if let value {layer?.addSublayer(value)}
+        frameLayer.isHidden=value != nil || mirrorFrame == nil
+        videoLayer.isHidden=value != nil || mirrorPixels == nil
+        updateLayerFrames();needsDisplay=true
     }
 
     override func accessibilityPerformPress() -> Bool {
@@ -453,6 +491,7 @@ final class ControlWindowController: NSWindowController {
     private var desktopOverlayAllowed = true
     private var isStandalone = false
     private var desktopOverlayRestore: (NSWindow.Level, NSWindow.CollectionBehavior)?
+    var nativeScannerVisible:Bool {background.nativeScannerPreview}
 
     var desktopCaptureRect: CGRect {
         guard let window, holder.phone.window === window,
@@ -746,6 +785,27 @@ final class ControlWindowController: NSWindowController {
         if let pixels {
             updatePhoneSize(NSSize(width: CVPixelBufferGetWidth(pixels), height: CVPixelBufferGetHeight(pixels)))
         }
+    }
+
+    func prepareNativeScanner(_ overlay:NativeScannerOverlay) {
+        holder.phone.interactionEnabled=false
+        holder.phone.nativeScannerFrames={ [weak overlay] in overlay?.receive($0) }
+    }
+    func showNativeScanner(_ overlay:NativeScannerOverlay) {
+        guard let window else{return}
+        window.styleMask.insert(.fullSizeContentView);window.titlebarAppearsTransparent=true
+        window.isOpaque=false;window.backgroundColor = .clear
+        background.nativeScannerPreview=true
+        holder.phone.setNativeScannerLayer(overlay.layer)
+        holder.phone.interactionEnabled=true
+        setScannerFloating(true)
+    }
+    func freezeNativeScanner() {holder.phone.interactionEnabled=false}
+    func endNativeScanner() {
+        holder.phone.nativeScannerFrames=nil;holder.phone.setNativeScannerLayer(nil)
+        holder.phone.interactionEnabled=true;background.nativeScannerPreview=false
+        window?.styleMask.remove(.fullSizeContentView);window?.titlebarAppearsTransparent=false
+        window?.isOpaque=true;window?.backgroundColor = .windowBackgroundColor
     }
 
     private func updatePhoneSize(_ size: NSSize) {

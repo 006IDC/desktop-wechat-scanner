@@ -46,6 +46,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var localScanFrame:ScanFrameController?
     private var localScanRect:CGRect?
     private var localCameraMode=false
+    private let nativeScannerRequested=CommandLine.arguments.contains("--native-camera-preview")
+    private var nativeScannerOverlay:NativeScannerOverlay?
     private var nextCameraDiagnostic=0.0
     private var connectionTask:Task<Void,Never>?, operationTask:Task<Void,Never>?, loop:Task<Void,Never>?, cameraLoop:Task<Void,Never>?
     private var currentStatus="未连接", currentDetail="点击连接，选择 USB 手机或设置无线连接。"
@@ -125,19 +127,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 $0.bundleIdentifier==Bundle.main.bundleIdentifier && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
             }
             guard others.isEmpty else{throw ScanError("请先退出另一个扫码实例，诊断不共享正在运行的手机会话。")}
-            guard let remembered=WirelessReconnectStore().load() else{throw ScanError("没有已选择的无线手机，诊断不自动配对新设备。")}
             guard let resources=Bundle.main.resourceURL else{throw ScanError("随包资源不可用。")}
             let adb=try await ADBConfiguration.validateAsync(resources.appendingPathComponent("adb/bin/adb"))
             try check()
-            let owned=try await ADBManagedServer.start(adbURL:adb)
-            do {try check()} catch {await owned.stop();throw error}
-            let services=(try? await BonjourADBDiscovery().discover(seconds:3)) ?? []
-            let endpoint=remembered.preferredEndpoint(in:services)
-            wirelessServer=owned;adbServerSocket=owned.socket;wirelessEndpoint=endpoint;adbURL=adb
-            let manager=ADBConnectionManager(adbURL:adb,serverSocket:owned.socket)
-            try await manager.connect(endpoint:endpoint);try check()
-            let devices=try await manager.devices();try check()
-            guard let device=devices.first(where:{$0.authorization == .authorized && $0.serial==endpoint}) else{throw ScanError("此前配对的手机当前不可连接。")}
+            let device:ADBDevice
+            if CommandLine.arguments.contains("--diagnostic-usb") {
+                let devices=try await ADBConnectionManager(adbURL:adb).devices();try check()
+                let authorized=devices.filter {$0.transport == .usb && $0.authorization == .authorized}
+                guard authorized.count==1 else{throw ScanError("USB诊断要求唯一已授权手机。")}
+                device=authorized[0];adbURL=adb
+            } else {
+                guard let remembered=WirelessReconnectStore().load() else{throw ScanError("没有已选择的无线手机，诊断不自动配对新设备。")}
+                let owned=try await ADBManagedServer.start(adbURL:adb)
+                do {try check()} catch {await owned.stop();throw error}
+                let services=(try? await BonjourADBDiscovery().discover(seconds:3)) ?? []
+                let endpoint=remembered.preferredEndpoint(in:services)
+                wirelessServer=owned;adbServerSocket=owned.socket;wirelessEndpoint=endpoint;adbURL=adb
+                let manager=ADBConnectionManager(adbURL:adb,serverSocket:owned.socket)
+                try await manager.connect(endpoint:endpoint);try check()
+                let devices=try await manager.devices();try check()
+                guard let selected=devices.first(where:{$0.authorization == .authorized && $0.serial==endpoint}) else{throw ScanError("此前配对的手机当前不可连接。")}
+                device=selected
+            }
             let desktopDiagnostic=CommandLine.arguments.contains("--run-desktop-diagnostic")
             connectDevice(device,adb:adb,allowLockedApplications:UserDefaults.standard.bool(forKey:"allowsLockedApplications.v1"),diagnostic:!desktopDiagnostic)
             await connectionTask?.value;try check()
@@ -533,7 +544,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// A QR presence check is only a handoff trigger. The native application
     /// alone decides what it means; no result or authorization is clicked here.
     private func returnLocalScanToApplication(retainImage:Bool) {
-        guard connected,!stopping,localScanFrame != nil else{return}
+        guard connected,!stopping,localScanFrame != nil || nativeScannerOverlay != nil else{return}
+        nativeScannerOverlay?.freeze();cameraWindow?.freezeNativeScanner()
         let previousOperation=operationTask;previousOperation?.cancel()
         busy=true;paused=true;cameraSuppressed=true
         let previous=cameraLoop;cameraLoop=nil;previous?.cancel()
@@ -546,8 +558,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             await previous?.value;await capture.stop()
             guard connected,!stopping,!Task.isCancelled,scanGeneration==generation else{return}
             if !retainImage {
+                await stopNativeScannerOverlay()
                 do {try await phone.clear(epoch:generation,requireConnection:true)}
                 catch {localScanClearFailed();return}
+            } else if let overlay=nativeScannerOverlay {
+                let deadline=ProcessInfo.processInfo.systemUptime+3
+                while connected,!stopping,!Task.isCancelled,scanGeneration==generation,
+                      ProcessInfo.processInfo.systemUptime<deadline {
+                    if let state=try? await phone.cameraState(),!overlay.matches(state) {break}
+                    try? await Task.sleep(nanoseconds:50_000_000)
+                }
+                await stopNativeScannerOverlay()
             }
             guard connected,!stopping,!Task.isCancelled,scanGeneration==generation else{return}
             busy=false;cameraFPS=0
@@ -599,6 +620,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         endCameraActivity()
         let previousCamera=cameraLoop;cameraLoop=nil
         paused=true;cameraActive=false;scanGeneration+=1;cameraPump?.stop();cameraPump=nil;previousCamera?.cancel();cameraFPS=0;refresh()
+        await stopNativeScannerOverlay()
         await capture.stop()
         await previousCamera?.value
         let confirmed:Bool
@@ -607,6 +629,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil
         if clearingLocal,!confirmed {localScanClearFailed()}
         return confirmed
+    }
+    private func stopNativeScannerOverlay() async {
+        guard let overlay=nativeScannerOverlay else{return}
+        let window=cameraWindow
+        nativeScannerOverlay=nil;overlay.freeze();window?.freezeNativeScanner()
+        await overlay.stop();window?.endNativeScanner()
     }
     private func showApplications(){
         guard connected,!stopping else{return}
@@ -746,13 +774,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 targetWindow.onPause={ [weak self] in self?.togglePause() }
                 targetWindow.onPermissionSettings={ [weak self] in self?.permissionSettings() }
                 targetWindow.onRelaunch={ [weak self] in self?.relaunch() }
-                cameraActive=true;paused=false;busy=false
+                cameraActive=true;paused=false
                 localCameraMode=desktopMode
-                if localCameraMode {showLocalScanFrame(for:targetWindow)}
+                if localCameraMode,nativeScannerRequested,let targetDisplay {
+                    let state=try await phone.cameraState()
+                    if let scanner=state.scannerActivity(),scanner.displayId==targetDisplay,scanner.package=="com.tencent.mm" {
+                        let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package)
+                        nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
+                        status("准备原生扫码预览","正在校准手机应用自己的相机背景…")
+                        try await overlay.prepare(phone:phone,epoch:generation)
+                        try Task.checkCancellation()
+                        guard connected,!stopping,generation==scanGeneration,nativeScannerOverlay === overlay else{throw CancellationError()}
+                        targetWindow.showNativeScanner(overlay)
+                    } else {showLocalScanFrame(for:targetWindow)}
+                } else if localCameraMode {showLocalScanFrame(for:targetWindow)}
+                busy=false
                 startCameraLoop()
-                status(localCameraMode ? "拖动扫码框":"拖动窗口扫码",localCameraMode ? "透明框直接显示桌面；停稳后送入手机，结果在原应用中显示。":"拖动窗口对准二维码，由真实手机应用识别。")
+                status(nativeScannerOverlay != nil ? "原生扫一扫" : (localCameraMode ? "拖动扫码框":"拖动窗口扫码"),nativeScannerOverlay != nil ? "拖动窗口对准二维码；原生手机控件和识别结果保持在此窗口。" : (localCameraMode ? "透明框直接显示桌面；停稳后送入手机，结果在原应用中显示。":"拖动窗口对准二维码，由真实手机应用识别。"))
             } catch {
                 guard !stopping && connected else{return}
+                if nativeScannerOverlay != nil {_=await clearCamera()}
                 busy=false;cameraSuppressed=true
                 status("桌面相机未开启",error.localizedDescription)
                 if await capture.permissionBlocked {
@@ -791,11 +832,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     await capture.setDiagnosticBoard(CGWindowID(check.board.windowNumber))
                     cameraSuppressed=false
                     try await navigateDiagnosticScanner(package:package,evidence:&item)
-                    let deadline=ProcessInfo.processInfo.systemUptime+8
-                    while !cameraActive && ProcessInfo.processInfo.systemUptime<deadline {
+                    let deadline=ProcessInfo.processInfo.systemUptime+12
+                    while (!cameraActive || busy || cameraPump==nil) && ProcessInfo.processInfo.systemUptime<deadline {
                         try Task.checkCancellation();try await Task.sleep(nanoseconds:100_000_000)
                     }
-                    guard cameraActive,cameraWindow === mainControl else{throw ScanError("应用内扫一扫未自动启用桌面相机。")}
+                    guard cameraActive,!busy,cameraPump != nil,cameraWindow === mainControl else{throw ScanError("应用内扫一扫未自动启用桌面相机。")}
+                    let nativeOverlay=nativeScannerOverlay
+                    item["nativeScannerPreviewVisible"]=mainControl.nativeScannerVisible
                     item["automaticCameraStarted"]=true
                     item["localFrameVisible"]=localScanFrame?.window?.isVisible == true
                     if localScanFrame != nil {
@@ -832,6 +875,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             }
                         }
                     }
+                    if let nativeOverlay {item["nativePresentation"]=nativeOverlay.statistics.snapshot()}
                 } catch {item["failure"]=error.localizedDescription}
                 if let check=performanceCheck {item.merge(check.finish()){_,new in new}}
                 performanceCheck=nil;cameraSuppressed=true
@@ -996,6 +1040,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func followCameraState(_ state:PhoneCameraState) async {
         guard connected,!stopping,!busy else{return}
+        if let overlay=nativeScannerOverlay,!overlay.matches(state) {
+            _=await clearCamera()
+            guard connected,!stopping,!Task.isCancelled else{return}
+        }
         let mainDisplay=await phone.scannerDisplay()?.id
         if let mainDisplay {try? await followDesktopHome(state,display:mainDisplay)}
         let windows=detachedApplications?.cameraWindows() ?? []
@@ -1137,12 +1185,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func updateCameraTick(){
         guard let pump=cameraPump,cameraActive,!paused else{return}
-        let visible=localCameraMode ? localScanFrame?.window?.isVisible == true :
+        let visible=localCameraMode && nativeScannerOverlay == nil ? localScanFrame?.window?.isVisible == true :
             (captureControl.window?.isVisible == true && captureControl.window?.isMiniaturized == false)
         guard visible else {
             suspendHiddenCamera();return
         }
         let tick=ProcessInfo.processInfo.systemUptime
+        if let failure=nativeScannerOverlay?.failure {pump.fail(ScanError(failure))}
         if let previous=cameraTickAt {
             let gap=(tick-previous)*1000
             cameraTickGaps.append(gap)
@@ -1451,6 +1500,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func disconnect(preserveError:Bool=false){
         guard !stopping else{return}
         dismissLocalScanFrame(restoring:true);localCameraMode=false
+        nativeScannerOverlay?.freeze();cameraWindow?.freezeNativeScanner()
         endCameraActivity()
         launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
@@ -1462,6 +1512,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !preserveError {status("正在断开","正在结束手机镜像并清理临时连接…")}
         Task {
             await checking?.value
+            await stopNativeScannerOverlay()
             let chooserClean=await chooser?.waitForCleanup() ?? true
             await capture.stop();await previousCamera?.value
             await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
@@ -1507,6 +1558,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         dismissLocalScanFrame(restoring:false);localCameraMode=false
         endCameraActivity()
         terminating=true
+        nativeScannerOverlay?.freeze();cameraWindow?.freezeNativeScanner()
         launchDiagnosticGeneration+=1;launchDiagnosticTask?.cancel();launchDiagnosticTask=nil
         let checking=performanceTask;checking?.cancel()
         stopping=true;let chooser=connectionWindow;chooser?.close();connectionWindow=nil
@@ -1517,6 +1569,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         status("正在退出","正在停止镜像并清理手机临时连接…")
         Task {
             await checking?.value
+            await stopNativeScannerOverlay()
             let chooserClean=await chooser?.waitForCleanup() ?? true
             await capture.stop();await previousCamera?.value
             await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()

@@ -177,16 +177,16 @@ build 41 的生产路径使用既有 `ScanFrameController`，而不是对手机�
 
 早期黑/白/灰探针在微信、支付宝均完成纯色采样，但移动扫描线造成帧间不一致：一次中段灰色预测 p95 误差约10.2% / 19.8%，另一次约9.0% / 21.8%。全区均值更小，不能掩盖条带错误。早期渲染探针对1268×2756图像记录到 p95 约9.94 / 11.53ms，每段3秒181帧；这是早期研究程序的内存渲染耗时，不是当前源码验收、屏幕实际帧率或输入到显示延迟。早期采样曾用三帧median、渲染器却取最后一帧；现探针改为用同一张选定原始帧分析及校准，旧报告不能作为修正后实现的验证。
 
-GPU合成与预览研究代码位于 `tests/`；服务端几何计算和实验开关位于 `src/`，只由显式研究参数启用。`NativeScannerMatte.swift` 使用公开 Metal 运行时编译和 Core Image，提供黑白校准以及单帧蓝色背景加静态原生颜色偏置两种实验。所有按钮、文字和扫动线取自真实手机帧，没有重画 Android 控件。蓝色实验在合成输入中验证了灰色、静态任意彩色前景、动态绿色/黑色前景、半透明边缘及非对称图像方向；它依赖静态颜色偏置及动态前景颜色条件，新彩色动画、布局变化和完整真实界面尚未证明等价，不能默认启用。窗口呈现在 common-mode timer 中从单槽取最新图，GPU初始化、校准和连续render均放入worker；首次初始化耗时另计，尚无真机预览验收。
+GPU渲染器和显式集成候选位于 `mac/NativeScannerMatte.swift` / `mac/NativeScannerOverlay.swift`，独立实验窗口与真机探针位于 `tests/`；服务端几何计算和实验开关位于 `src/`，只由显式研究参数启用。`NativeScannerMatte.swift` 使用公开 Metal 运行时编译和 Core Image，提供黑白校准以及单帧蓝色背景加静态原生颜色偏置两种实验。所有按钮、文字和扫动线取自真实手机帧，没有重画 Android 控件。蓝色实验在合成输入中验证了灰色、静态任意彩色前景、动态绿色/黑色前景、半透明边缘及非对称图像方向；它依赖静态颜色偏置及动态前景颜色条件，新彩色动画、布局变化和完整真实界面尚未证明等价，不能默认启用。早期CGImage预览以 common-mode timer 取单槽最新图，GPU初始化、校准和连续render均放入worker；新的Metal路径直接提交drawable，首次初始化耗时另计。后续真实预览结果见下方续记，不能等同于完整产品验收。
 
 编译合成测试：
 
 ```sh
-swiftc -swift-version 5 -warnings-as-errors -O -target arm64-apple-macos14.4 -parse-as-library -module-cache-path .local/swift-cache tests/NativeScannerMatte.swift tests/NativeScannerMatteTests.swift -o .local/native-matte-tests
+swiftc -swift-version 5 -warnings-as-errors -O -target arm64-apple-macos14.4 -parse-as-library -module-cache-path .local/swift-cache mac/NativeScannerMatte.swift tests/NativeScannerMatteTests.swift -o .local/native-matte-tests
 .local/native-matte-tests
 ```
 
-`NativeScannerMatteExperiment.swift` 是显式真机探针，编译时加入除main外的mac源码、研究renderer、`NativeScannerMatteProbe.swift` 和 `NativeMattePreview.swift`。CLI 仅在 `--run-device-test --resources <Resources>` 时连接已保存并配对的手机；显式 `--usb-probe` 改为选择唯一已授权 USB 手机，不同时使用无线服务。默认做合成纯文本单帧识别控制实验，`--native-matte-probe` 做黑白灰分离试验，`--show-native-chroma` 只对微信显示最长90秒的原生像素透明预览，正常结束后才交接纯文本合成码并确认原生结果。研究 Bundle 无参数打开只显示说明及“开始 USB 实验”，点击前不连接手机；需确认此前已经启用独立锁屏应用。该预览用于拖动/外观研究，不转发鼠标点击、不采集桌面、不请求录屏权限、不保存手机图片；关闭窗口或请求退出会先收束实验、恢复任务，并取消后续测试码交接。预览完成永远不会自动写 `passed=true`，也不构成视频同等效果认证。其他应用/相机归属变化会停止当前预览。
+`NativeScannerMatteExperiment.swift` 是显式真机探针，编译时加入除main外的mac源码、`NativeScannerMatteProbe.swift` 和 `NativeMattePreview.swift`。CLI 仅在 `--run-device-test --resources <Resources>` 时连接已保存并配对的手机；显式 `--usb-probe` 改为选择唯一已授权 USB 手机，不同时使用无线服务。默认做合成纯文本单帧识别控制实验，`--native-matte-probe` 做黑白灰分离试验，`--show-native-chroma` 只对微信显示最长90秒的原生像素透明预览，正常结束后才交接纯文本合成码并确认原生结果。研究 Bundle 无参数打开只显示说明及“开始 USB 实验”，点击前不连接手机；需确认此前已经启用独立锁屏应用。该预览用于拖动/外观研究，不转发鼠标点击、不采集桌面、不请求录屏权限、不保存手机图片；关闭窗口或请求退出会先收束实验、恢复任务，并取消后续测试码交接。预览完成永远不会自动写 `passed=true`，也不构成视频同等效果认证。其他应用/相机归属变化会停止当前预览。
 
 另观察到独立直连镜像原来按手机完整1268×2756编码，而普通scrcpy路径已有max_size=1600。`DesktopDisplayGeometry` 提供1600长边上限及同比密度的纯计算候选（上述输入为736×1600，像素减少约66.3%，逻辑dp近似不变）。`balanced-display` 和 `display-before-camera` 仅为明确传入的研究开关，要求desktop-home；默认尺寸及初始化顺序保持build 41行为。可在研究探针分别加 `--balanced-display` / `--display-before-camera` 复现实验；新的服务jar必须与Mac源码一起构建。尺寸/密度、方向、偶数边界和参数隔离的合成测试通过，实际手机响应改善尚未验证。
 
@@ -212,4 +212,13 @@ USB 接入后只读检查发现手机无线调试开关实际返回关闭，服�
 每轮正常完成后，测试码仍由真实微信识别；已成功观察多次，交接到观测约1.7–2.0秒，手机任务和连接清理成功。预览提前关闭不会继续投码。真实桌面内容捕获、二维码交接后的控件/结果切换、连续物理鼠标拖动和完整默认产品流程仍待验收；研究程序与安装版build41/TCC保持隔离。
 
 
-后续90秒USB全尺寸对照关闭coverage读回探针，等待尾部GPU及呈现回调收束：submitted/completed/callbacks均5399，pending均0，实际非零时间戳呈现5397次，间隔p95约16.67ms、最大约33.33ms，未出现超过50ms间隔；GPU p95约8.43ms、最大约11.35ms，解码失败0。该轮与首轮的差别除coverage开关外还包含统计收束和不同运行时刻，故支持“该轮没有长停顿”，不能据单次对照断言所有长停顿均由coverage造成。九帧校准/原生透明层已形成可用研究路径，仍未证明真实桌面与输入过渡的完整体验。该轮导航约16.9秒，其中OCR单次约14.59秒，前台查询约56.9ms、状态查询约6.3ms；已明确观察器本身会造成测试启动耗时，不能把这段时间归为手机点按响应。测试纯文本二维码识别观测约1.72秒，任务与会话清理成功。
+后续90秒USB全尺寸对照关闭coverage读回探针，等待尾部GPU及呈现回调收束：submitted/completed/callbacks均5399，pending均0，实际非零时间戳呈现5397次，间隔p95约16.67ms、最大约33.33ms，未出现超过50ms间隔；GPU p95约8.43ms、最大约11.35ms，解码失败0。该轮与首轮的差别除coverage开关外还包含统计收束和不同运行时刻，故支持“该轮可用时间戳序列中没有长间隔”（另2个回调无可用呈现时间戳），不能据单次对照断言所有长停顿均由coverage造成。九帧校准/原生透明层已形成可用研究路径，仍未证明真实桌面与输入过渡的完整体验。该轮导航约16.9秒，其中OCR单次约14.59秒，前台查询约56.9ms、状态查询约6.3ms；已明确观察器本身会造成测试启动耗时，不能把这段时间归为手机点按响应。测试纯文本二维码识别观测约1.72秒，任务与会话清理成功。
+
+
+#### 同一手机窗口的显式集成候选（尚未真机验收）
+
+`--native-camera-preview` 仅对desktop-home模式下、所有者/精确扫码Activity均已确认的微信启用；不改变默认流程，支付宝继续原先路径。用户仍在真实应用中进入扫一扫，没有另造扫码按钮或Android控件。校准期间保留旧的真实帧并禁用画面点击，九个新黑底观测用于静态颜色中位数，确认蓝底已返回后在原窗口安装透明Metal层；窗口背景对整个手机画面开孔，标题栏保留不透明原生背景。离开精确scanner或所有者/流代数变化时撤销此层。
+
+桌面捕获复用既有权限、窗口ROI及二维码存在门控，只在停稳、当前选择未变化且服务端扫码身份仍有效时上传原图。上传确认后先冻结原生透明层并禁用其点击，等相机所有者变化或最多3秒，再恢复完整普通镜像；具体结果仍由手机决定，不自动点确认。暂停、退出、隐藏窗口和连接清理会停止worker并等待其有界收束。组件测试覆盖校准/交接/失焦时结束按下状态、阻止旧画面输入、完整区域透明与标题栏恢复；它不证明真实鼠标或扫码结果过渡已通过。
+
+`--diagnostic-usb` 只在显式诊断入口选择唯一已授权USB手机，不创建无线连接，不重新配对；诊断仍要求预先存在的录屏授权，预检失败即退出。该候选的真实桌面采集、二维码交接、渐变/颜色、暂停恢复及真实窗口拖动正在验证；不能用9a5d39e的独立研究数据声称新集成已经完成。
