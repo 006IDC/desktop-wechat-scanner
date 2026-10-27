@@ -15,8 +15,11 @@ import CoreVideo
         func stop() {lock.withLock {active=false;pixels=nil}}
     }
     private let frames=Frames()
-    private var decodedBinding:(mailbox:MirrorVideoMailbox,id:UUID)?
-    var decodedFrameDelivery:Bool {decodedBinding != nil}
+    private var decodedBinding:(mailbox:MirrorVideoMailbox,id:UUID,generation:Int)?
+    var decodedFrameDelivery:Bool {
+        guard let binding=decodedBinding else{return false}
+        return binding.mailbox.hasDecodedFrameObserver(binding.id,generation:binding.generation)
+    }
     private var worker:Task<Void,Never>?
     private var identity:(Int,Int)?
     private let display:Int,package:String
@@ -25,7 +28,11 @@ import CoreVideo
     let statistics=NativeMattePresentationStats()
     private(set) var frozen=false
     private var hidesCalibrationFrames=false
-    private(set) var failure:String?
+    private var renderFailure:String?
+    var failure:String? {
+        if decodedBinding != nil,!decodedFrameDelivery {return "原生视频会话已变化。"}
+        return renderFailure
+    }
     private(set) var calibrationTiming=[String:Double]()
     enum EndReason:String {case cleared,scannerStateChanged,windowHidden,pumpFailure,qrHandoff,returnedToApplication,pausedByControl}
     private(set) var termination=[String:Any]()
@@ -52,7 +59,7 @@ import CoreVideo
             }
         }
     }
-    private func recordFailure() {failure="原生扫码显示中断。"}
+    private func recordFailure() {renderFailure="原生扫码显示中断。"}
     init(display:Int,package:String,fastCalibration:Bool=false) {
         self.display=display;self.package=package;self.fastCalibration=fastCalibration
     }
@@ -67,10 +74,10 @@ import CoreVideo
     func observeDecodedFrames(in mailbox:MirrorVideoMailbox,generation:Int) throws {
         guard decodedBinding == nil,!frozen else{throw ScanError("原生视频已绑定或停止。")}
         let input=frames,statistics=statistics
-        guard let id=mailbox.observeDecodedFrames(generation:generation,receive:{pixels in
+        guard let id=mailbox.observeDecodedFrames(generation:generation,onInvalidated:{input.stop()},receive:{pixels in
             if input.publish(pixels) {statistics.received(at:ProcessInfo.processInfo.systemUptime)}
         }) else{throw ScanError("原生视频会话已变化。")}
-        decodedBinding=(mailbox,id)
+        decodedBinding=(mailbox,id,generation)
     }
     func matches(_ state:PhoneCameraState)->Bool {
         guard let scanner=state.scannerActivity(),scanner.displayId==display,scanner.package==package else{return false}
@@ -78,6 +85,7 @@ import CoreVideo
     }
     private func requireCurrent(_ phone:PhoneSession) async throws {
         try Task.checkCancellation()
+        if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("原生视频会话已变化。")}
         let state=try await phone.cameraState()
         guard matches(state) else{throw ScanError("原生扫码状态已变化，已停止校准。")}
         if identity == nil {identity=(state.generation,state.ownerGeneration)}

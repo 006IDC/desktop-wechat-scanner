@@ -789,12 +789,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
                             fastCalibration:CommandLine.arguments.contains("--native-fast-calibration"))
                         guard mirrorDisplay==targetDisplay else{throw ScanError("扫码镜像路由已变化。")}
-                        try overlay.observeDecodedFrames(in:activeRoute.frames,generation:activeRoute.incarnation)
+                        let nativeRoute=activeRoute,nativeIncarnation=nativeRoute.incarnation
+                        try overlay.observeDecodedFrames(in:nativeRoute.frames,generation:nativeIncarnation)
                         nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
                         status("准备原生扫码预览","正在校准手机应用自己的相机背景…")
                         try await overlay.prepare(phone:phone,epoch:generation)
                         try Task.checkCancellation()
                         guard connected,!stopping,generation==scanGeneration,nativeScannerOverlay === overlay else{throw CancellationError()}
+                        guard activeRoute === nativeRoute,nativeRoute.incarnation==nativeIncarnation,
+                              mirrorDisplay==targetDisplay,overlay.decodedFrameDelivery else{throw ScanError("扫码镜像路由已变化。")}
                         targetWindow.showNativeScanner(overlay)
                     } else {showLocalScanFrame(for:targetWindow)}
                 } else if localCameraMode {showLocalScanFrame(for:targetWindow)}

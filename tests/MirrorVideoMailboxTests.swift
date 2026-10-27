@@ -99,11 +99,18 @@ import Dispatch
         mailbox.removeDecodedFrameObserver(replacement);mailbox.publish(last,generation:9)
         require(observed.takeLatest()==nil,"Detached observer received a new frame")
         require(mailbox.observeDecodedFrames(generation:8,receive:{_ in fatalError("Stale binding ran")})==nil,"Stale stream accepted an observer")
-        _=mailbox.observeDecodedFrames(generation:9) {pixels in observed.publish(pixels,generation:1)}
+        let invalidated=DispatchSemaphore(value:0)
+        _=mailbox.observeDecodedFrames(generation:9,onInvalidated:{
+            _=mailbox.takeLatest();invalidated.signal()
+        }) {pixels in observed.publish(pixels,generation:1)}
         mailbox.reset(generation:10);mailbox.publish(first,generation:10)
+        require(invalidated.wait(timeout:.now()+1) == .success,"Reset failed to invalidate outside the source lock")
         require(observed.takeLatest()==nil,"Reset retained the old stream observer")
-        _=mailbox.observeDecodedFrames(generation:10) {pixels in observed.publish(pixels,generation:1)}
+        _=mailbox.observeDecodedFrames(generation:10,onInvalidated:{
+            _=mailbox.takeLatest();invalidated.signal()
+        }) {pixels in observed.publish(pixels,generation:1)}
         mailbox.stop();mailbox.publish(first,generation:10)
+        require(invalidated.wait(timeout:.now()+1) == .success,"Stop failed to invalidate the old input")
         require(observed.takeLatest()==nil,"Stop retained an observer")
         print("PASS CVPixelBuffer latest-only mailbox, generation isolation, concurrency")
     }

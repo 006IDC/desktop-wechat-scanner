@@ -14,11 +14,13 @@ final class MirrorVideoMailbox: @unchecked Sendable {
     private var generation=0
     private var active=false
     private var pending:Frame?
-    private var decodedObserver:(id:UUID,receive:@Sendable (CVPixelBuffer)->Void)?
+    private var decodedObserver:(id:UUID,receive:@Sendable (CVPixelBuffer)->Void,invalidate:@Sendable ()->Void)?
 
     func reset(generation:Int) {
-        lock.lock();defer{lock.unlock()}
+        lock.lock()
+        let invalidate=decodedObserver?.invalidate
         self.generation=generation;active=true;pending=nil;decodedObserver=nil
+        lock.unlock();invalidate?()
     }
 
     func publish(_ pixelBuffer:CVPixelBuffer,generation:Int) {
@@ -35,10 +37,17 @@ final class MirrorVideoMailbox: @unchecked Sendable {
 
     /// One direct decoded-frame consumer, independent of the AppKit timer.
     /// It must be bounded/nonblocking and fence its own in-flight callbacks.
-    func observeDecodedFrames(generation:Int,receive:@escaping @Sendable (CVPixelBuffer)->Void)->UUID? {
+    func observeDecodedFrames(generation:Int,onInvalidated:@escaping @Sendable ()->Void={},
+                              receive:@escaping @Sendable (CVPixelBuffer)->Void)->UUID? {
+        lock.lock()
+        guard active,self.generation==generation else{lock.unlock();return nil}
+        let invalidate=decodedObserver?.invalidate
+        let id=UUID();decodedObserver=(id,receive,onInvalidated)
+        lock.unlock();invalidate?();return id
+    }
+    func hasDecodedFrameObserver(_ id:UUID,generation:Int)->Bool {
         lock.lock();defer{lock.unlock()}
-        guard active,self.generation==generation else{return nil}
-        let id=UUID();decodedObserver=(id,receive);return id
+        return active && self.generation==generation && decodedObserver?.id==id
     }
     func removeDecodedFrameObserver(_ id:UUID) {
         lock.lock();defer{lock.unlock()}
@@ -52,7 +61,9 @@ final class MirrorVideoMailbox: @unchecked Sendable {
     }
 
     func stop() {
-        lock.lock();defer{lock.unlock()}
+        lock.lock()
+        let invalidate=decodedObserver?.invalidate
         active=false;pending=nil;decodedObserver=nil
+        lock.unlock();invalidate?()
     }
 }

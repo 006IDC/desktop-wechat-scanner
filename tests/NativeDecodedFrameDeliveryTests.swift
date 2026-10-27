@@ -34,7 +34,21 @@ import Dispatch
         let stale=NativeScannerOverlay(display:1,package:"com.tencent.mm")
         do {try stale.observeDecodedFrames(in:mailbox,generation:6);fatalError("Stale incarnation bound native input")}
         catch is ScanError {}
+        let resetting=NativeScannerOverlay(display:1,package:"com.tencent.mm")
+        try resetting.observeDecodedFrames(in:mailbox,generation:7);resetting.statistics.submitted()
+        mailbox.publish(pixels,generation:7)
+        mailbox.reset(generation:8)
+        precondition(!resetting.decodedFrameDelivery && resetting.failure != nil,"Reset left a seemingly healthy native overlay")
+        mailbox.publish(pixels,generation:8);_=resetting.receive(pixels)
+        precondition(resetting.statistics.snapshot()["receivedFrames"] as? Int == 1,"Reset revived the old native input slot")
+        let stopping=NativeScannerOverlay(display:1,package:"com.tencent.mm")
+        try stopping.observeDecodedFrames(in:mailbox,generation:8);stopping.statistics.submitted()
+        resetting.freeze()
+        mailbox.publish(pixels,generation:8)
+        precondition(stopping.statistics.snapshot()["receivedFrames"] as? Int == 1,"Reset overlay cleanup removed the new stream")
         mailbox.stop()
+        precondition(!stopping.decodedFrameDelivery && stopping.failure != nil,"Stop left the native overlay healthy")
+        stopping.freeze()
         print("PASS native decoded delivery while MainActor is blocked; no double publish; replacement/freeze/epoch isolation. Synthetic only.")
     }
 }
