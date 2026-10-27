@@ -233,6 +233,9 @@ struct CameraFrameReceipt {
 }
 
 actor PhoneSession {
+    /// Fixed diagnostic stages only; no device identity, app page or raw errors.
+    private(set) var cleanupStage="notStarted"
+
     private let adbURL: URL, jarURL: URL, recoveryURL: URL
     private let serverSocket: String?
     private var recovery: Recovery?
@@ -822,16 +825,20 @@ actor PhoneSession {
 
     /// Synchronous inside this actor so connect/quit cannot enter cleanup twice.
     func disconnect() -> String {
+        cleanupStage="validateRecord"
         diagnosticLog=nil
         independentApplicationsWhenLocked=false
         cleaning=true;defer {cleaning=false}
         if let state = recovery {
             do {
                 guard state.valid else { throw ScanError("连接恢复记录无效。") }
+                cleanupStage="verifyOwner"
                 let owner = try shell("if test -d \(state.path); then cat \(state.path)/owner; else printf absent; fi")
                 guard owner == state.token || owner == "absent" else { throw ScanError("手机会话标记不匹配。") }
+                cleanupStage="verifyDevice"
                 let owned=try ownedDevice(state)
                 if owned != nil {
+                    cleanupStage="verifyAssociation"
                     guard try associationPresent(state) else {
                         throw ScanError("本次虚拟设备的关联记录缺失，已保留会话。")
                     }
@@ -839,19 +846,23 @@ actor PhoneSession {
                         // No page navigation: the server sleeps its own retained
                         // VirtualDevice object, never a caller-supplied display ID.
                         // Cleanup deliberately continues after diagnostic cancellation.
+                        cleanupStage="sleepOwnedDevice"
                         let cameraPresent=try channel.request(24)
                         guard cameraPresent==Data([0]) || cameraPresent==Data([1]) else {
                             throw ScanError("手机未确认本次独立设备的休眠请求。")
                         }
                         if cameraPresent==Data([1]) {
+                            cleanupStage="waitCameraClosure"
                             try OwnedCameraCleanup.quiesce(read:{try PhoneCameraState.decode(channel.request(5))})
                         }
                     }
+                    cleanupStage="restoreTasks"
                     for display in state.appDisplays ?? [] { try restoreTasks(on: display.id) }
                     if let display = state.display { try restoreTasks(on: display) }
                 }
             } catch { return "应用任务恢复失败，已保留连接与临时屏幕：" + error.localizedDescription }
         }
+        cleanupStage="closeOwnedTransport"
         if let channel {_ = try? channel.request(9);channel.close()}
         channel=nil
         if let server,server.isRunning {
@@ -861,9 +872,11 @@ actor PhoneSession {
         guard var state=recovery else {
             serverPipe?.fileHandleForReading.readabilityHandler=nil
             serverPipe=nil;server=nil;displayID=nil
+            cleanupStage="complete"
             return ""
         }
         guard state.valid else {return "连接恢复记录无效，已停止自动清理。"}
+        cleanupStage="recoverOwnedResources"
         do {
             // A mismatched owner marker makes both the directory and phone
             // association unsafe to touch, even if the old journal is valid.
@@ -910,6 +923,7 @@ actor PhoneSession {
             serverPipe=nil;server=nil;displayID=nil
             try FileManager.default.removeItem(at:recoveryURL)
             recovery=nil
+            cleanupStage="complete"
             return ""
         } catch {
             return "清理未完成；请连接同一手机后再次点连接："+error.localizedDescription

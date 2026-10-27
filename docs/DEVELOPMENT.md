@@ -258,3 +258,10 @@ GPU资源复用依据[Apple CIContext文档](https://developer.apple.com/documen
 原生实验退出保护候选：测试取消后曾出现 virtual_camera 持续超时且 media.camera 服务缺失，单独退出本次精确匹配的远端进程后 virtualdevice 恢复，但相机服务仍未恢复；这些是实测现象，尚不能认定小米 ROM 内部死锁原因。旧会话的自有资源与恢复记录已通过生产清理逻辑清掉。
 
 新增认证命令24仅使用服务端持有的 VirtualDevice 对象调用 goToSleep，不接受display ID，不注入Back或关闭应用页面。客户端先核对会话owner、虚拟设备和association；服务端确认独立显示休眠并核对主屏电源未变，再由客户端连续两次确认已知相机owner为空且流数为0、generation稳定，才恢复任务与释放设备。未配置相机的mirror-only实验明确返回无相机；不支持、未知或超时则保留会话。该退出顺序依据[AOSP VirtualDeviceImpl](https://android.googlesource.com/platform/frameworks/base/+/HEAD/services/companion/java/com/android/server/companion/virtual/VirtualDeviceImpl.java)中作用于本设备可信非mirror显示的休眠能力；不把AOSP当作此小米ROM的根因证据。合成测试覆盖活动相机、未知owner、状态变化与读取失败；真机缓解效果尚未确认。此前检查后发送ADB Back的草案因页面变化竞态已弃用，从未纳入已安装包。
+
+
+退出顺序进一步缩小：b05541b双应用原生识别/返回都通过，但总体验收因cleanupSucceeded=false未通过；微信/支付宝校准1045/1261ms，呈现p95均33.33ms，支付宝最大116.67ms。随后无第三方应用、无镜像、无录屏的单独实验也失败在wait_owned_displays_off，证明这一失败无需扫码页即可复现，不能归为支付宝关闭相机慢。改为先有界停止本次directStreams，再仅对保留的VirtualDisplay对象setSurface(null)，然后休眠并继续原检查，无应用实验清理成功、journal消失、三个系统服务仍健康。依据[VirtualDisplay.setSurface官方说明](https://developer.android.com/reference/android/hardware/display/VirtualDisplay#setSurface(android.view.Surface))，分离Surface类似关屏、暂停buffer输出；不假设API返回就等于STATE_OFF，仍实际验证OFF、主屏未变和相机闭合。该结果还不证明活跃扫码退出已稳定。
+
+后续显式原生性能候选：连接启用已有balanced-display（最长1600像素、同比缩放dpi保留dp布局）与realtime-video编码提示；不改变物理手机的分辨率/密度，厂商是否接受latency提示以编码器回报为准。快速校准不再固定等350ms，改为认证黑帧ACK后等待新的中心暗底帧，再收齐九个新观察；暗底只是准备度探针，不能替代确切扫码路由、owner和generation检查。合成测试拒绝白/蓝/灰底和过小帧，容许外围原生白控件及薄绿色扫码线。保守80ms模式保持原逻辑。`--diagnostic-primary-screen`仅与显式60秒hold联用，将本程序窗口移到主显示器测试CUA；不操作其他窗口，不改变显示设置。
+
+`OwnedDeviceShutdownIntegration --run-device-test <resources> <adb>` 是显式USB生命周期试验，仅创建本次独立设备，不打开第三方应用、不采集画面；输出固定阶段、流数和owner闭合布尔值。`OwnedCameraCleanupTests`与`NativeCalibrationReadinessTests`为合成测试，不能当作真机验收。

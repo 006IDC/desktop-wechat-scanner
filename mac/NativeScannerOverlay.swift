@@ -101,9 +101,28 @@ import CoreVideo
         _=try await phone.frame(black,epoch:epoch)
         mark("blackAcknowledgedMilliseconds")
         calibrationTiming["sampleSpacingMilliseconds"]=fastCalibration ? 40:80
-        try await Task.sleep(nanoseconds:350_000_000)
         var samples=[CVPixelBuffer](),last=frames.latest().0
-        for index in 0..<9 {
+        if fastCalibration {
+            let deadline=ProcessInfo.processInfo.systemUptime+2
+            while ProcessInfo.processInfo.systemUptime<deadline {
+                try Task.checkCancellation()
+                let sample=frames.latest()
+                guard sample.2 else{throw CancellationError()}
+                if sample.0>last,let pixels=sample.1,NativeCalibrationReadiness.blackVisible(pixels) {
+                    try await requireCurrent(phone)
+                    samples.append(pixels);last=sample.0
+                    mark("blackConfirmedMilliseconds")
+                    break
+                }
+                try await Task.sleep(nanoseconds:10_000_000)
+            }
+            guard !samples.isEmpty else{throw ScanError("原生相机黑底尚未确认，已停止校准。")}
+            try await Task.sleep(nanoseconds:40_000_000)
+        } else {
+            try await Task.sleep(nanoseconds:350_000_000)
+            last=frames.latest().0
+        }
+        for index in samples.count..<9 {
             let deadline=ProcessInfo.processInfo.systemUptime+2
             while frames.latest().0<=last && ProcessInfo.processInfo.systemUptime<deadline {
                 try Task.checkCancellation();try await Task.sleep(nanoseconds:10_000_000)

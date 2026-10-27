@@ -1009,25 +1009,45 @@ public final class LiveCameraServer {
         requestPaint();
     }
 
+    private String sleepFailureStage = "not_requested";
+
     private byte[] prepareOwnedDeviceShutdown() throws Exception {
         // Bound to the authenticated session's retained object, with no display
         // ID supplied by the caller. This does not navigate or finish app pages.
+        sleepFailureStage = "verify_device";
         final Object owned = device;
-        if (stopping || owned == null || deviceId <= 0 ||
+        if (stopping || owned == null || deviceId <= 0 || display == null ||
+                display.getDisplay() == null || !display.getDisplay().isValid() ||
                 (Integer) call(owned, "getDeviceId", new Class[]{}) != deviceId)
             throw new IOException("Owned virtual device is unavailable");
         final int primaryBefore = primaryDisplayState();
+        // A virtual display can remain logically ON while it still has an
+        // output Surface on this ROM. Drain owned encoders before detaching
+        // only our retained displays; no display is released or task finished.
+        sleepFailureStage = "stop_owned_streams";
+        for (Integer id : new HashSet<>(directStreams.keySet())) stopDirectStream(id);
+        sleepFailureStage = "detach_owned_surfaces";
+        if (display != null) display.setSurface(null);
+        for (AppDisplay app : appDisplays.values()) app.display.setSurface(null);
+        sleepFailureStage = "sleep_api";
         call(owned, "goToSleep", new Class[]{});
+        sleepFailureStage = "wait_owned_displays_off";
         final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         boolean off;
         do {
-            off = display == null || display.getDisplay().getState() == Display.STATE_OFF;
-            for (AppDisplay app : appDisplays.values())
+            if (display.getDisplay() == null || !display.getDisplay().isValid())
+                throw new IOException("Owned display became invalid");
+            off = display.getDisplay().getState() == Display.STATE_OFF;
+            for (AppDisplay app : appDisplays.values()) {
+                if (app.display.getDisplay() == null || !app.display.getDisplay().isValid())
+                    throw new IOException("Owned app display became invalid");
                 off &= app.display.getDisplay().getState() == Display.STATE_OFF;
+            }
             if (off) break;
             Thread.sleep(50);
         } while (System.nanoTime() < deadline);
         if (!off) throw new IOException("Owned displays did not sleep");
+        sleepFailureStage = "verify_primary_unchanged";
         if (primaryDisplayState() != primaryBefore)
             throw new IOException("Primary display changed during owned device shutdown preparation");
         // This ACK only accepts sleep; the client separately waits for camera
@@ -1175,7 +1195,7 @@ public final class LiveCameraServer {
             } else if (command == 24) {
                 if (length != 0) { error(output, "Shutdown preparation must be empty"); continue; }
                 try { reply(output, true, prepareOwnedDeviceShutdown()); }
-                catch (Exception failure) { error(output, "Owned device sleep not confirmed"); }
+                catch (Exception failure) { error(output, "Owned device sleep not confirmed: " + sleepFailureStage); }
             } else if (command == 9) {
                 if (length != 0) { error(output, "Stop request must be empty"); continue; }
                 reply(output, true, new byte[0]);

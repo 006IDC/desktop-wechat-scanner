@@ -352,7 +352,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 adbServerSocket=device.serverSocket
                 wirelessEndpoint=device.transport == .wireless ? (try? ADBEndpoint(device.serial).value):nil
                 adbURL=selected;phoneSession=PhoneSession(resources:Bundle.main.resourceURL!,adbURL:selected,serverSocket:adbServerSocket)
-                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial,allowLockedApplications:allowLockedApplications,desktopHome:!diagnostic){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
+                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial,allowLockedApplications:allowLockedApplications,desktopHome:!diagnostic,balancedDisplay:nativeScannerRequested && !diagnostic,realtimeVideo:nativeScannerRequested && !diagnostic){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
                 try Task.checkCancellation();connected=true;mode = .phone;mirrorGeneration+=1
                 independentApplicationsWhenLocked=await phone.independentApplicationsWhenLocked
                 primaryLocked=independentApplicationsWhenLocked ? !(try await phone.primaryUserUnlocked()) : false
@@ -850,6 +850,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         item["interactivePreviewHoldSeconds"]=60
                         let input=mainControl.window.map {OwnWindowInputDiagnostic(window:$0)}
                         defer {_=input?.finish()}
+                        if CommandLine.arguments.contains("--diagnostic-primary-screen"),
+                           let screen=NSScreen.screens.first,let window=mainControl.window {
+                            let area=screen.visibleFrame,size=window.frame.size
+                            window.setFrameOrigin(NSPoint(x:area.midX-size.width/2,y:area.midY-size.height/2))
+                        }
                         let initial=mainControl.window?.frame.origin ?? .zero
                         let initialDragRequests=mainControl.nativeTitleDragRequests
                         let until=ProcessInfo.processInfo.systemUptime+60
@@ -869,6 +874,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
                     }
                     item["automaticCameraStarted"]=true
+                    item["encoderReportedLatencyFrames"]=await phone.encoderLatencyFrames()
                     item["localFrameVisible"]=localScanFrame?.window?.isVisible == true
                     if localScanFrame != nil {
                         toggleLocalScanPause();await operationTask?.value
@@ -1660,6 +1666,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     .appendingPathComponent("006IDC/DesktopWeChatScanner/desktop-performance-last.json")
                 if let data=try? Data(contentsOf:file),var report=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any] {
                     report["cleanupSucceeded"]=problem.isEmpty
+                    report["cleanupStage"]=await phoneSession?.cleanupStage
                     if !problem.isEmpty {report["passed"]=false}
                     let writer=DiagnosticStateWriter(fileURL:file);writer.submit(report);await writer.flush()
                 }
