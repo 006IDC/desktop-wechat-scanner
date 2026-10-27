@@ -83,6 +83,28 @@ import Dispatch
             for _ in 0..<500 {mailbox.publish(last,generation:8)}
         }
         require(mailbox.takeLatest()==nil,"Concurrent publishers revived stopped mailbox")
+        mailbox.reset(generation:9)
+        let observed=MirrorVideoMailbox()
+        observed.reset(generation:1)
+        let oldObserver=mailbox.observeDecodedFrames(generation:9) {pixels in
+            // Re-entering the source is safe: callbacks cannot hold its lock.
+            _=mailbox.takeLatest();observed.publish(pixels,generation:1)
+        }!
+        mailbox.publish(last,generation:9)
+        require(observed.takeLatest()?.pixelBuffer === last,"Decoded frames waited for the UI consumer")
+        let replacement=mailbox.observeDecodedFrames(generation:9) {pixels in observed.publish(pixels,generation:1)}!
+        mailbox.removeDecodedFrameObserver(oldObserver)
+        mailbox.publish(first,generation:9)
+        require(observed.takeLatest()?.pixelBuffer === first,"Old detach erased a newer observer")
+        mailbox.removeDecodedFrameObserver(replacement);mailbox.publish(last,generation:9)
+        require(observed.takeLatest()==nil,"Detached observer received a new frame")
+        require(mailbox.observeDecodedFrames(generation:8,receive:{_ in fatalError("Stale binding ran")})==nil,"Stale stream accepted an observer")
+        _=mailbox.observeDecodedFrames(generation:9) {pixels in observed.publish(pixels,generation:1)}
+        mailbox.reset(generation:10);mailbox.publish(first,generation:10)
+        require(observed.takeLatest()==nil,"Reset retained the old stream observer")
+        _=mailbox.observeDecodedFrames(generation:10) {pixels in observed.publish(pixels,generation:1)}
+        mailbox.stop();mailbox.publish(first,generation:10)
+        require(observed.takeLatest()==nil,"Stop retained an observer")
         print("PASS CVPixelBuffer latest-only mailbox, generation isolation, concurrency")
     }
 }

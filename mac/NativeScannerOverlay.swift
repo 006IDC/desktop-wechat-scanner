@@ -8,11 +8,15 @@ import CoreVideo
     private final class Frames: @unchecked Sendable {
         private let lock=NSLock()
         private var revision=0,pixels:CVPixelBuffer?,active=true
-        func publish(_ value:CVPixelBuffer) {lock.withLock {if active {revision += 1;pixels=value}}}
+        @discardableResult func publish(_ value:CVPixelBuffer)->Bool {lock.withLock {
+            guard active else{return false};revision += 1;pixels=value;return true
+        }}
         func latest()->(Int,CVPixelBuffer?,Bool) {lock.withLock {(revision,pixels,active)}}
         func stop() {lock.withLock {active=false;pixels=nil}}
     }
     private let frames=Frames()
+    private var decodedBinding:(mailbox:MirrorVideoMailbox,id:UUID)?
+    var decodedFrameDelivery:Bool {decodedBinding != nil}
     private var worker:Task<Void,Never>?
     private var identity:(Int,Int)?
     private let display:Int,package:String
@@ -55,8 +59,18 @@ import CoreVideo
     /// Show genuine black-background frames during calibration, so opening the
     /// Android scanner keeps its own animation. Hide only the blue-key phase.
     func receive(_ pixels:CVPixelBuffer)->Bool {
-        if !frozen {statistics.received(at:ProcessInfo.processInfo.systemUptime)}
-        frames.publish(pixels);return hidesCalibrationFrames || frozen
+        if decodedBinding == nil,frames.publish(pixels) {statistics.received(at:ProcessInfo.processInfo.systemUptime)}
+        return hidesCalibrationFrames || frozen
+    }
+    /// Bind only after the caller verified the exact mirror display/incarnation.
+    /// Capture the thread-safe frame slot, never this MainActor UI object.
+    func observeDecodedFrames(in mailbox:MirrorVideoMailbox,generation:Int) throws {
+        guard decodedBinding == nil,!frozen else{throw ScanError("原生视频已绑定或停止。")}
+        let input=frames,statistics=statistics
+        guard let id=mailbox.observeDecodedFrames(generation:generation,receive:{pixels in
+            if input.publish(pixels) {statistics.received(at:ProcessInfo.processInfo.systemUptime)}
+        }) else{throw ScanError("原生视频会话已变化。")}
+        decodedBinding=(mailbox,id)
     }
     func matches(_ state:PhoneCameraState)->Bool {
         guard let scanner=state.scannerActivity(),scanner.displayId==display,scanner.package==package else{return false}
@@ -186,6 +200,9 @@ import CoreVideo
     }
     /// Keep the last original UI over the desktop while the real phone decides
     /// the QR result. No stale pointer input is accepted during this interval.
-    func freeze() {frozen=true;frames.stop()}
+    func freeze() {
+        frozen=true;frames.stop()
+        if let binding=decodedBinding {binding.mailbox.removeDecodedFrameObserver(binding.id);decodedBinding=nil}
+    }
     func stop() async {noteEnd(.cleared);freeze();await worker?.value;worker=nil}
 }

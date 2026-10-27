@@ -788,6 +788,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if let scanner=state.scannerActivity(),scanner.displayId==targetDisplay {
                         let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
                             fastCalibration:CommandLine.arguments.contains("--native-fast-calibration"))
+                        guard mirrorDisplay==targetDisplay else{throw ScanError("扫码镜像路由已变化。")}
+                        try overlay.observeDecodedFrames(in:activeRoute.frames,generation:activeRoute.incarnation)
                         nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
                         status("准备原生扫码预览","正在校准手机应用自己的相机背景…")
                         try await overlay.prepare(phone:phone,epoch:generation)
@@ -850,7 +852,31 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     guard cameraActive,!busy,cameraPump != nil,cameraWindow === mainControl else{throw ScanError("应用内扫一扫未自动启用桌面相机。")}
                     let nativeOverlay=nativeScannerOverlay;observedOverlay=nativeOverlay
                     item["nativeScannerPreviewVisible"]=mainControl.nativeScannerVisible
+                    item["nativeDecodedFrameDelivery"]=nativeOverlay?.decodedFrameDelivery ?? false
                     if let nativeOverlay {item["nativeCalibration"]=nativeOverlay.calibrationTiming}
+                    if CommandLine.arguments.contains("--diagnostic-main-actor-pause") {
+                        guard let nativeOverlay else{throw ScanError("主线程隔离测试需要原生预览。")}
+                        // Explicit fault injection in this synthetic-board test
+                        // only. Give AppKit time to commit the attached layer;
+                        // decoded input and GPU presentation must then proceed
+                        // while this app's MainActor cannot service its timer.
+                        try await Task.sleep(nanoseconds:1_000_000_000)
+                        try Task.checkCancellation()
+                        guard nativeScannerOverlay === nativeOverlay,cameraActive else{throw ScanError("主线程隔离测试的原生预览已变化。")}
+                        let before=nativeOverlay.statistics.snapshot()
+                        func pauseOwnMainThread() {Thread.sleep(forTimeInterval:0.25)}
+                        let began=ProcessInfo.processInfo.systemUptime
+                        pauseOwnMainThread()
+                        let elapsed=(ProcessInfo.processInfo.systemUptime-began)*1000
+                        let after=nativeOverlay.statistics.snapshot()
+                        let received=(after["receivedFrames"] as? Int ?? 0)-(before["receivedFrames"] as? Int ?? 0)
+                        let presented=(after["presented"] as? Int ?? 0)-(before["presented"] as? Int ?? 0)
+                        item["mainActorPauseMilliseconds"]=elapsed
+                        item["decodedFramesDuringMainActorPause"]=received
+                        item["presentedFramesDuringMainActorPause"]=presented
+                        item["mainActorPauseBypassed"]=received>0 && presented>0
+                        guard received>0,presented>0 else{throw ScanError("主线程暂停期间未确认新帧持续呈现。")}
+                    }
                     if nativeOverlay != nil,CommandLine.arguments.contains("--diagnostic-native-hold") {
                         // Bounded observation window for real CUA pointer dragging;
                         // only the synthetic board remains eligible for capture.
