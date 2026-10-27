@@ -8,10 +8,12 @@ import CoreVideo
     private final class Frames: @unchecked Sendable {
         private let lock=NSLock()
         private var revision=0,pixels:CVPixelBuffer?,active=true
+        private var receivedAt=0.0
         @discardableResult func publish(_ value:CVPixelBuffer)->Bool {lock.withLock {
-            guard active else{return false};revision += 1;pixels=value;return true
+            guard active else{return false};revision += 1;pixels=value
+            receivedAt=ProcessInfo.processInfo.systemUptime;return true
         }}
-        func latest()->(Int,CVPixelBuffer?,Bool) {lock.withLock {(revision,pixels,active)}}
+        func latest()->(Int,CVPixelBuffer?,Bool,Double) {lock.withLock {(revision,pixels,active,receivedAt)}}
         func stop() {lock.withLock {active=false;pixels=nil}}
     }
     private let frames=Frames()
@@ -186,7 +188,8 @@ import CoreVideo
         let driver=NativeMetalDisplayDriver(layer:layer,active:{input.latest().2},render:{drawable in
             let sample=input.latest()
             guard sample.2,sample.0 != lastRenderedRevision,let pixels=sample.1 else{return}
-            _=try renderer.present(black:CIImage(cvPixelBuffer:pixels),drawable:drawable,stats:statistics)
+            _=try renderer.present(black:CIImage(cvPixelBuffer:pixels),drawable:drawable,stats:statistics,
+                                   sourceReceivedAt:sample.3)
             lastRenderedRevision=sample.0
         },failure:{ [weak self] in Task { @MainActor in self?.recordFailure() } })
         displayDriver=driver

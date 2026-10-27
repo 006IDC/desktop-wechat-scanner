@@ -16,6 +16,17 @@ import Foundation
   for i in 0..<10000 {stats.received(at:3+Double(i)*0.016);stats.drawableWait(milliseconds:1)}
   let bounded=stats.snapshot()
   precondition(bounded["receiveIntervalSamples"] as? Int == 7200 && bounded["drawableWaitSamples"] as? Int == 7200)
+  let age=NativeMattePresentationStats()
+  age.presented(at:0,sourceReceivedAt:1)
+  age.presented(at:2,sourceReceivedAt:.nan)
+  age.presented(at:2,sourceReceivedAt:3)
+  age.presented(at:2.034,sourceReceivedAt:2)
+  var ages=age.snapshot()
+  precondition(ages["decodedToPresentationSamples"] as? Int == 1)
+  precondition(abs((ages["decodedToPresentationP95Milliseconds"] as! Double)-34)<0.0001)
+  precondition(ages["discardedPresentationCallbacks"] as? Int == 1)
+  for i in 0..<10000 {age.presented(at:4+Double(i),sourceReceivedAt:3.99+Double(i))}
+  ages=age.snapshot();precondition(ages["decodedToPresentationSamples"] as? Int == 7200)
   print("PASS native timing: calibration excluded, arrival/drawable/GPU clocks separated, invalid values rejected, bounded samples. Synthetic only.")
  }
 }

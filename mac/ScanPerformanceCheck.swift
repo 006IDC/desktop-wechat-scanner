@@ -30,13 +30,24 @@ import CoreImage.CIFilterBuiltins
     private(set) var movedPoints: CGFloat = 0
     private let reduceMotion: Bool
 
-    init(scanner: ControlWindowController) throws {
-        guard let window = scanner.window, let screen = window.screen ?? NSScreen.main else {
+    init(scanner: ControlWindowController,onPrimaryScreen:Bool=false) throws {
+        let primary=NSScreen.screens.first {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value==CGMainDisplayID()
+        }
+        guard let window = scanner.window,
+              let screen = onPrimaryScreen ? primary : (window.screen ?? NSScreen.main) else {
             throw ScanError("扫码窗口尚未就绪。")
         }
         self.scanner = window; originalOrigin = window.frame.origin
         reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let visible = screen.visibleFrame
+        if onPrimaryScreen {
+            // Select one display before creating the board and capture target.
+            // Moving only the scanner during a hold leaves the synthetic-only
+            // source on another display and invalidates the comparison.
+            window.setFrameOrigin(NSPoint(x:visible.midX-window.frame.width/2,
+                                          y:max(visible.minY,visible.midY-window.frame.height/2)))
+        }
         let size = NSSize(width: min(820, visible.width), height: min(800, visible.height))
         let frame = NSRect(x: visible.midX-size.width/2, y: visible.midY-size.height/2,
                            width: size.width, height: size.height)

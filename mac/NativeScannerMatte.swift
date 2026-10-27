@@ -183,7 +183,8 @@ final class NativeScannerMatte {
         return try present(black:black,drawable:drawable,stats:stats)
     }
     /// CAMetalDisplayLink already supplies its drawable; never acquire another.
-    func present(black:CIImage,drawable:CAMetalDrawable,stats:NativeMattePresentationStats) throws -> Bool {
+    func present(black:CIImage,drawable:CAMetalDrawable,stats:NativeMattePresentationStats,
+                 sourceReceivedAt:Double?=nil) throws -> Bool {
         guard black.extent==extent else{throw Unavailable("dimensions")}
         guard let command=queue.makeCommandBuffer() else { throw Unavailable() }
         context.render(black,to:input,commandBuffer:command,bounds:extent,colorSpace:CGColorSpaceCreateDeviceRGB())
@@ -192,7 +193,7 @@ final class NativeScannerMatte {
         let bounds=CGRect(x:0,y:0,width:drawable.texture.width,height:drawable.texture.height)
         let scaled=image.transformed(by:CGAffineTransform(scaleX:bounds.width/extent.width,y:bounds.height/extent.height))
         context.render(scaled,to:drawable.texture,commandBuffer:command,bounds:bounds,colorSpace:CGColorSpaceCreateDeviceRGB())
-        drawable.addPresentedHandler { drawable in stats.presented(at:drawable.presentedTime) }
+        drawable.addPresentedHandler { drawable in stats.presented(at:drawable.presentedTime,sourceReceivedAt:sourceReceivedAt) }
         command.addCompletedHandler { buffer in stats.completed(ok:buffer.status == .completed,
             gpuMilliseconds:max(0,buffer.gpuEndTime-buffer.gpuStartTime)*1000) }
         stats.submitted();command.present(drawable);command.commit()
@@ -207,6 +208,7 @@ final class NativeMattePresentationStats: @unchecked Sendable {
     private var firstPresentation:Double?
     private var receivedCount=0,lastReceived:Double?
     private var receiveIntervals=[Double](),drawableWaits=[Double]()
+    private var decodedToPresentation=[Double]()
     /// Arrival at the native view, distinct from GPU completion/presentation.
     /// Exclude calibration before the first actual drawable submission.
     func received(at time:Double) {lock.withLock {
@@ -223,10 +225,16 @@ final class NativeMattePresentationStats: @unchecked Sendable {
         completedCount += 1;if !ok {failedCount += 1}
         if gpu.count < 7200 && gpuMilliseconds.isFinite {gpu.append(gpuMilliseconds)}
     } }
-    func presented(at time:Double) { lock.withLock {
+    func presented(at time:Double,sourceReceivedAt:Double?=nil) { lock.withLock {
         presentationCallbacks += 1
         guard time.isFinite,time > 0 else {return}
         presentedCount += 1
+        // Mac decoded-frame arrival to actual drawable timestamp only. This
+        // excludes Android capture/transport/decode and physical pointer input.
+        if let sourceReceivedAt,sourceReceivedAt.isFinite,sourceReceivedAt>0,
+           time>=sourceReceivedAt,decodedToPresentation.count<7200 {
+            decodedToPresentation.append((time-sourceReceivedAt)*1000)
+        }
         if firstPresentation == nil {firstPresentation=time}
         if let last=lastPresentation,time > last,intervals.count < 7200 {
             let interval=(time-last)*1000;intervals.append(interval)
@@ -236,6 +244,7 @@ final class NativeMattePresentationStats: @unchecked Sendable {
     } }
     func snapshot() -> [String:Any] { lock.withLock {
         let sorted=intervals.sorted(),g=gpu.sorted(),received=receiveIntervals.sorted(),waits=drawableWaits.sorted()
+        let age=decodedToPresentation.sorted()
         func p95(_ values:[Double])->Double {values.isEmpty ? -1:values[Int(Double(values.count-1)*0.95)]}
         return ["submitted":submittedCount,"completed":completedCount,"failed":failedCount,"presented":presentedCount,
             "receivedFrames":receivedCount,"receiveIntervalSamples":received.count,
@@ -245,6 +254,10 @@ final class NativeMattePresentationStats: @unchecked Sendable {
             "pendingGPU":max(0,submittedCount-completedCount),
             "pendingPresentationCallbacks":max(0,submittedCount-presentationCallbacks),
             "presentationCallbacks":presentationCallbacks,
+            "discardedPresentationCallbacks":max(0,presentationCallbacks-presentedCount),
+            "decodedToPresentationSamples":age.count,
+            "decodedToPresentationP95Milliseconds":p95(age),
+            "decodedToPresentationMaxMilliseconds":age.last ?? -1,
             "complete":submittedCount == completedCount && submittedCount == presentationCallbacks,
             "presentationIntervalP95Milliseconds":sorted.isEmpty ? -1 : sorted[Int(Double(sorted.count-1)*0.95)],
             "presentationIntervalMaxMilliseconds":sorted.last ?? -1,

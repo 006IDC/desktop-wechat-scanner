@@ -844,7 +844,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     try await performMainApplicationOpen(app)
                     try Task.checkCancellation()
                     guard connected,!busy,!stopping else{throw ScanError("测试应用未打开。")}
-                    let check=try ScanPerformanceCheck(scanner:mainControl);performanceCheck=check
+                    let check=try ScanPerformanceCheck(scanner:mainControl,
+                        onPrimaryScreen:CommandLine.arguments.contains("--diagnostic-primary-screen"));performanceCheck=check
                     await capture.setDiagnosticBoard(CGWindowID(check.board.windowNumber))
                     cameraSuppressed=false
                     try await navigateDiagnosticScanner(package:package,evidence:&item)
@@ -905,13 +906,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         item["interactivePreviewHoldSeconds"]=60
                         let input=mainControl.window.map {OwnWindowInputDiagnostic(window:$0)}
                         defer {_=input?.finish()}
-                        if CommandLine.arguments.contains("--diagnostic-primary-screen"),
-                           let screen=NSScreen.screens.first(where:{
-                               ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value==CGMainDisplayID()
-                           }),let window=mainControl.window {
-                            let area=screen.visibleFrame,size=window.frame.size
-                            window.setFrameOrigin(NSPoint(x:area.midX-size.width/2,y:area.midY-size.height/2))
-                        }
                         let initial=mainControl.window?.frame.origin ?? .zero
                         let initialDragRequests=mainControl.nativeTitleDragRequests
                         let until=ProcessInfo.processInfo.systemUptime+60

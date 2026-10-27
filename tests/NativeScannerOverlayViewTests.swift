@@ -69,6 +69,15 @@ import CoreVideo
         window.level = .normal;check.tick(at:0)
         precondition(check.board.level == .normal,"Diagnostic board stayed above the mirror after scanner exit")
         _=check.finish()
+        let original=window.frame.origin
+        let primaryCheck=try! ScanPerformanceCheck(scanner:ui,onPrimaryScreen:true)
+        let primary=NSScreen.screens.first {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value==CGMainDisplayID()
+        }!
+        precondition(!primary.frame.intersection(primaryCheck.board.frame).isEmpty,"Board missed the selected display")
+        precondition(window.screen==primary,"Scanner and synthetic board selected different displays")
+        _=primaryCheck.finish()
+        precondition(window.frame.origin==original,"Diagnostic did not restore the original position")
         print("PASS native overlay: full-window transparency and titlebar restoration; calibration/handoff release and reject touches; native input recovers. No phone, capture or OS input.")
     }
 }
