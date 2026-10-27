@@ -911,6 +911,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     private func navigateDiagnosticScanner(package:String,evidence:inout [String:Any]) async throws {
+        let connectionGeneration=mirrorGeneration
+        func checkNavigation() throws {
+            try Task.checkCancellation()
+            guard connected,!stopping,mirrorGeneration==connectionGeneration else{throw CancellationError()}
+        }
         var plusTapped=false,scanTapped=false,returnedFromResult=false
         var scanAttempts=0,lastScanTap=0.0
         var observedHomeLabels=Set<String>()
@@ -927,8 +932,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let deadline=ProcessInfo.processInfo.systemUptime+30
         try await Task.sleep(nanoseconds:500_000_000)
         while ProcessInfo.processInfo.systemUptime<deadline {
-            try Task.checkCancellation()
+            try checkNavigation()
             let state=try await phone.cameraState()
+            try checkNavigation()
             stateSamples+=1
             if let scanner=state.scannerActivity(),scanner.component.hasPrefix(package+"/") {return}
             guard let display=await phone.scannerDisplay()?.id,
@@ -960,15 +966,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                     return (nil,false,false,labels)
                 }.value
+                try checkNavigation()
+                guard ProcessInfo.processInfo.systemUptime<deadline else{break}
                 observedHomeLabels.formUnion(point.3)
-                if point.2,!returnedFromResult {scannerMirror.session.key(4);returnedFromResult=true}
+                if point.2,!returnedFromResult {
+                    try checkNavigation();scannerMirror.session.key(4);returnedFromResult=true
+                }
                 else if let target=point.0,!(point.1 && plusTapped) {
                     let current=try await phone.cameraState()
+                    try checkNavigation()
                     guard current.scannerActivity()==nil,
                           current.activities.first(where:{$0.displayId==display})?.component == state.activities.first(where:{$0.displayId==display})?.component else {
                         continue
                     }
-                    scannerMirror.session.tap(x:target.x,y:target.y)
+                    try checkNavigation();scannerMirror.session.tap(x:target.x,y:target.y)
                     if point.1 {plusTapped=true}else{scanTapped=true;scanAttempts+=1;lastScanTap=ProcessInfo.processInfo.systemUptime}
                     try await Task.sleep(nanoseconds:400_000_000)
                 }
