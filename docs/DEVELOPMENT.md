@@ -253,3 +253,8 @@ GPU资源复用依据[Apple CIContext文档](https://developer.apple.com/documen
 进一步系统窗口几何对照：同一候选透明窗口和断开后的普通不透明窗口，经CUA drag前后WindowServer主窗口边界均未变。因此上一段“透明标题区域未交给AppKit导致不动”只是待验证推断，不能定性为唯一程序根因；817c818虽证明performDrag请求2次，仍没有实际位移。当前使用公开原生拖动方式，不以额外手写拖动绕过工具限制。局部输入诊断补充mouseDown/mouseUp时的自有WindowServer边界及最多8个drag坐标，以区分系统位置与AppKit缓存；不读取其他窗口标题或图像。
 
 打开扫描的后续候选：黑底校准阶段继续显示真实Android新帧并保持输入禁用，仅在送蓝底前短暂冻结普通镜像，确认后由原生透明层接管；不再从准备开始冻结旧微信首页。原生层已挂载时始终阻止旧视频恢复。空白标题背景允许首击，手机控件仍按自身事件处理。组件回归检查黑底阶段视频继续显示、原生层挂载后旧视频保持隐藏与既有touch释放。尚未将此过渡宣称为真机通过。
+
+
+原生实验退出保护候选：测试取消后曾出现 virtual_camera 持续超时且 media.camera 服务缺失，单独退出本次精确匹配的远端进程后 virtualdevice 恢复，但相机服务仍未恢复；这些是实测现象，尚不能认定小米 ROM 内部死锁原因。旧会话的自有资源与恢复记录已通过生产清理逻辑清掉。
+
+新增认证命令24仅使用服务端持有的 VirtualDevice 对象调用 goToSleep，不接受display ID，不注入Back或关闭应用页面。客户端先核对会话owner、虚拟设备和association；服务端确认独立显示休眠并核对主屏电源未变，再由客户端连续两次确认已知相机owner为空且流数为0、generation稳定，才恢复任务与释放设备。未配置相机的mirror-only实验明确返回无相机；不支持、未知或超时则保留会话。该退出顺序依据[AOSP VirtualDeviceImpl](https://android.googlesource.com/platform/frameworks/base/+/HEAD/services/companion/java/com/android/server/companion/virtual/VirtualDeviceImpl.java)中作用于本设备可信非mirror显示的休眠能力；不把AOSP当作此小米ROM的根因证据。合成测试覆盖活动相机、未知owner、状态变化与读取失败；真机缓解效果尚未确认。此前检查后发送ADB Back的草案因页面变化竞态已弃用，从未纳入已安装包。

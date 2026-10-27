@@ -1009,6 +1009,32 @@ public final class LiveCameraServer {
         requestPaint();
     }
 
+    private byte[] prepareOwnedDeviceShutdown() throws Exception {
+        // Bound to the authenticated session's retained object, with no display
+        // ID supplied by the caller. This does not navigate or finish app pages.
+        final Object owned = device;
+        if (stopping || owned == null || deviceId <= 0 ||
+                (Integer) call(owned, "getDeviceId", new Class[]{}) != deviceId)
+            throw new IOException("Owned virtual device is unavailable");
+        final int primaryBefore = primaryDisplayState();
+        call(owned, "goToSleep", new Class[]{});
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        boolean off;
+        do {
+            off = display == null || display.getDisplay().getState() == Display.STATE_OFF;
+            for (AppDisplay app : appDisplays.values())
+                off &= app.display.getDisplay().getState() == Display.STATE_OFF;
+            if (off) break;
+            Thread.sleep(50);
+        } while (System.nanoTime() < deadline);
+        if (!off) throw new IOException("Owned displays did not sleep");
+        if (primaryDisplayState() != primaryBefore)
+            throw new IOException("Primary display changed during owned device shutdown preparation");
+        // This ACK only accepts sleep; the client separately waits for camera
+        // callbacks to report no streams and a known, closed owner twice.
+        return new byte[]{(byte) (camera == null ? 0 : 1)};
+    }
+
     private byte[] liveState() throws Exception {
         JSONObject state = new JSONObject().put("version", 1).put("desktopHome", desktopHomeRequested);
         JSONArray activities = new JSONArray();
@@ -1146,6 +1172,10 @@ public final class LiveCameraServer {
                     if (command == 20) reply(output, true, startDirectStream(id));
                     else { stopDirectStream(id); reply(output, true, new byte[0]); }
                 } catch (Exception failure) { error(output, "Direct stream operation failed: " + failure.getClass().getSimpleName()); }
+            } else if (command == 24) {
+                if (length != 0) { error(output, "Shutdown preparation must be empty"); continue; }
+                try { reply(output, true, prepareOwnedDeviceShutdown()); }
+                catch (Exception failure) { error(output, "Owned device sleep not confirmed"); }
             } else if (command == 9) {
                 if (length != 0) { error(output, "Stop request must be empty"); continue; }
                 reply(output, true, new byte[0]);

@@ -830,7 +830,23 @@ actor PhoneSession {
                 guard state.valid else { throw ScanError("连接恢复记录无效。") }
                 let owner = try shell("if test -d \(state.path); then cat \(state.path)/owner; else printf absent; fi")
                 guard owner == state.token || owner == "absent" else { throw ScanError("手机会话标记不匹配。") }
-                if try ownedDevice(state) != nil {
+                let owned=try ownedDevice(state)
+                if owned != nil {
+                    guard try associationPresent(state) else {
+                        throw ScanError("本次虚拟设备的关联记录缺失，已保留会话。")
+                    }
+                    if let channel {
+                        // No page navigation: the server sleeps its own retained
+                        // VirtualDevice object, never a caller-supplied display ID.
+                        // Cleanup deliberately continues after diagnostic cancellation.
+                        let cameraPresent=try channel.request(24)
+                        guard cameraPresent==Data([0]) || cameraPresent==Data([1]) else {
+                            throw ScanError("手机未确认本次独立设备的休眠请求。")
+                        }
+                        if cameraPresent==Data([1]) {
+                            try OwnedCameraCleanup.quiesce(read:{try PhoneCameraState.decode(channel.request(5))})
+                        }
+                    }
                     for display in state.appDisplays ?? [] { try restoreTasks(on: display.id) }
                     if let display = state.display { try restoreTasks(on: display) }
                 }
