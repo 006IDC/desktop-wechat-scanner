@@ -128,7 +128,8 @@ private final class PhonePreviewView: NSView {
     }
     var localScanPreview = false {
         didSet {
-            touchStart = nil; touchStartLocation = nil
+            guard oldValue != localScanPreview else {return}
+            cancelTouch()
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             frameLayer.isHidden = nativeScannerLayer != nil || mirrorFrame == nil
@@ -144,6 +145,10 @@ private final class PhonePreviewView: NSView {
     private var touchStart: NSPoint?
     private var touchStartLocation: NSPoint?
     private var lastTouchPoint:NSPoint?
+    var inputDiagnosticEnabled=false
+    private var diagnosticDown=0,diagnosticAcceptedDown=0,diagnosticUp=0,diagnosticCompletedUp=0
+    var inputDiagnostic:[String:Int] { ["down":diagnosticDown,"acceptedDown":diagnosticAcceptedDown,
+        "up":diagnosticUp,"completedUp":diagnosticCompletedUp] }
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -362,9 +367,11 @@ private final class PhonePreviewView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        if inputDiagnosticEnabled {diagnosticDown+=1}
         guard hasFrame,interactionEnabled else { return }
         let location = convert(event.locationInWindow, from: nil)
         guard imageRect.contains(location) else { return }
+        if inputDiagnosticEnabled {diagnosticAcceptedDown+=1}
         touchStart = normalized(location)
         lastTouchPoint=touchStart
         touchStartLocation = location
@@ -379,7 +386,9 @@ private final class PhonePreviewView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if inputDiagnosticEnabled {diagnosticUp+=1}
         guard let start = touchStart, let location = touchStartLocation else { return }
+        if inputDiagnosticEnabled {diagnosticCompletedUp+=1}
         defer { touchStart = nil; touchStartLocation = nil;lastTouchPoint=nil }
         let finishLocation = convert(event.locationInWindow, from: nil)
         let end = normalized(finishLocation)
@@ -779,6 +788,9 @@ final class ControlWindowController: NSWindowController {
         holder.phone.localScanPreview = false
         background.localScanPreview = false
     }
+
+    func enablePhoneInputDiagnostic(_ enabled:Bool) {holder.phone.inputDiagnosticEnabled=enabled}
+    var phoneInputDiagnostic:[String:Int] {holder.phone.inputDiagnostic}
 
     /// Retained for older callers; the local aperture is no longer shown.
     func setLocalScanAperture(_ normalizedRect: CGRect) {

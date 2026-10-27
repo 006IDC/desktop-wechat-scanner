@@ -296,6 +296,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         value["localCameraMode"]=localCameraMode
         value["desktopMode"]=desktopMode
         value["applicationPickerVisible"]=applicationPickerVisible
+        if CommandLine.arguments.contains("--diagnostic-manual-navigation") {
+            value["manualPhoneInput"]=mainControl.phoneInputDiagnostic
+        }
         value["mirrorRelativeBacklogP95Milliseconds"]=mirrorStats.relativeBacklogP95Milliseconds
         value["mirrorRelativeBacklogMaxMilliseconds"]=mirrorStats.relativeBacklogMaxMilliseconds
         value["mirrorDecodeP95Milliseconds"]=mirrorStats.decodeP95Milliseconds
@@ -970,6 +973,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if CommandLine.arguments.contains("--diagnostic-manual-navigation") {
             evidence["manualNavigationRequested"]=true
             evidence["automaticNavigationDisabled"]=true
+            let input=mainControl.window.map {OwnWindowInputDiagnostic(window:$0)}
+            mainControl.enablePhoneInputDiagnostic(true)
+            let before=mainControl.phoneInputDiagnostic
+            defer {
+                evidence["manualOwnWindowInput"]=input?.finish()
+                evidence["manualPhoneInput"]=mainControl.phoneInputDiagnostic // Counters only; no Android UI content.
+                evidence["manualPhoneInputBefore"]=before
+                mainControl.enablePhoneInputDiagnostic(false)
+            }
             let deadline=ProcessInfo.processInfo.systemUptime+90
             while ProcessInfo.processInfo.systemUptime<deadline {
                 try checkNavigation()

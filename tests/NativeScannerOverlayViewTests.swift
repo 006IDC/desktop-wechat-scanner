@@ -24,6 +24,11 @@ import CoreVideo
             windowNumber:window.windowNumber,context:nil,eventNumber:2,clickCount:1,pressure:0)!
         phone.mouseDown(with:down)
         precondition(events==[0],"Synthetic component touch did not start")
+        ui.setLocalScanPreview(false)
+        phone.mouseUp(with:up)
+        precondition(events==[0,1],"A same-mode status refresh lost the touch release")
+        events.removeAll()
+        phone.mouseDown(with:down)
         let overlay=NativeScannerOverlay(display:7,package:"com.tencent.mm")
         let originalLevel=window.level,originalBehavior=window.collectionBehavior
         ui.prepareNativeScanner(overlay)
