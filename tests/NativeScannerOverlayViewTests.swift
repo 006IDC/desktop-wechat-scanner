@@ -32,7 +32,7 @@ import CoreVideo
         events.removeAll()
         phone.mouseDown(with:down)
         let overlay=NativeScannerOverlay(display:7,package:"com.tencent.mm")
-        let originalLevel=window.level,originalBehavior=window.collectionBehavior
+        let originalLevel=window.level,originalBehavior=window.collectionBehavior,originalStyle=window.styleMask
         ui.prepareNativeScanner(overlay)
         var fresh:CVPixelBuffer?
         precondition(CVPixelBufferCreate(kCFAllocatorDefault,720,1280,kCVPixelFormatType_32BGRA,nil,&fresh)==kCVReturnSuccess)
@@ -44,13 +44,18 @@ import CoreVideo
         precondition(events==[0,1],"Calibration accepted input through a stale frame")
         ui.showApplicationPicker([],onOpen:{_ in},onDetach:{_,_ in})
         precondition(phone.isHidden,"Picker did not hide the ordinary phone view")
+        root.layoutSubtreeIfNeeded()
+        let originalWindowFrame=window.frame,originalPhoneFrame=phone.frame
         ui.showNativeScanner(overlay)
+        root.layoutSubtreeIfNeeded()
+        precondition(window.frame==originalWindowFrame && phone.frame==originalPhoneFrame,"Scanner mode changed the native content geometry")
         precondition(!phone.isHidden && !phone.isHiddenOrHasHiddenAncestor,"Picker hid the verified native scanner")
         ui.setLocalScanPreview(false) // The ordinary status refresh must not reveal an obsolete frame.
         ui.setPhonePixelBuffer(fresh) // An attached native layer still owns presentation.
         let obsolete=phone.layer?.sublayers?.filter { ["phone.still-frame","phone.video"].contains($0.name ?? "") } ?? []
         precondition(obsolete.count==2 && obsolete.allSatisfy(\.isHidden),"Status refresh exposed an old mirror underneath native alpha")
-        precondition(ui.nativeScannerVisible && !window.isOpaque && window.styleMask.contains(.fullSizeContentView))
+        precondition(ui.nativeScannerVisible && !window.isOpaque && window.styleMask==originalStyle)
+        precondition(!window.titlebarAppearsTransparent,"Native AppKit title surface was replaced")
         phone.mouseDown(with:down)
         ui.freezeNativeScanner()
         precondition(events==[0,1,0,1],"QR handoff did not release the touch")

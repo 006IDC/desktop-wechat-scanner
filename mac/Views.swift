@@ -61,22 +61,11 @@ private final class PhoneWindowBackgroundView: NSView {
     weak var preview: PhonePreviewView?
     var localScanPreview = false { didSet { needsDisplay = true } }
     var nativeScannerPreview = false {didSet {needsDisplay=true}}
-    private(set) var nativeTitleDragRequests=0
     var aperture = ScanPreviewAperture.standard { didSet { needsDisplay = true } }
     override var isOpaque: Bool { false }
 
     override func acceptsFirstMouse(for event:NSEvent?)->Bool {
         nativeScannerPreview || super.acceptsFirstMouse(for:event)
-    }
-    override func mouseDown(with event:NSEvent) {
-        // Full-size transparent content covers AppKit's title surface. Route
-        // only its empty title band through the native window-server drag;
-        // phone pixels, toolbar controls and the ordinary window stay unchanged.
-        if nativeScannerPreview,let window,event.type == .leftMouseDown,
-           event.locationInWindow.y >= window.contentLayoutRect.maxY {
-            nativeTitleDragRequests+=1
-            window.performDrag(with:event)
-        } else {super.mouseDown(with:event)}
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -531,7 +520,6 @@ final class ControlWindowController: NSWindowController {
     private var isStandalone = false
     private var desktopOverlayRestore: (NSWindow.Level, NSWindow.CollectionBehavior)?
     var nativeScannerVisible:Bool {background.nativeScannerPreview}
-    var nativeTitleDragRequests:Int {background.nativeTitleDragRequests}
     var nativeSurfaceDiagnostic:[String:Any] {holder.phone.nativeSurfaceDiagnostic}
     private(set) var nativeSurfaceBeforeAttachment=[String:Any]()
 
@@ -842,7 +830,9 @@ final class ControlWindowController: NSWindowController {
         // A verified scanner owns this surface. A previous HOME picker must
         // not keep the phone view hidden while its Metal layer keeps rendering.
         hideApplicationPicker();holder.phone.isHidden=false
-        window.styleMask.insert(.fullSizeContentView);window.titlebarAppearsTransparent=true
+        // Retain AppKit's normal title bar and content layout. Changing to
+        // full-size content here moved the phone surface by a title-bar height.
+        window.titlebarAppearsTransparent=false
         window.isOpaque=false;window.backgroundColor = .clear
         background.nativeScannerPreview=true
         holder.phone.nativeScannerResize={ [weak overlay] in overlay?.requestDrawableSize($0) }
@@ -856,7 +846,7 @@ final class ControlWindowController: NSWindowController {
         setScannerFloating(false)
         holder.phone.nativeScannerFrames=nil;holder.phone.nativeScannerResize=nil;holder.phone.setNativeScannerLayer(nil)
         holder.phone.interactionEnabled=true;background.nativeScannerPreview=false
-        window?.styleMask.remove(.fullSizeContentView);window?.titlebarAppearsTransparent=false
+        window?.titlebarAppearsTransparent=false
         window?.isOpaque=true;window?.backgroundColor = .windowBackgroundColor
     }
 

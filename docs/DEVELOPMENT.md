@@ -336,3 +336,7 @@ e48dcc7以有效呈现时间为就绪条件，记录窗口可见区域和屏幕�
 7a80792手动入口长观察仍未通过：原生层约13秒后随scannerStateChanged结束（owner/stream代次变化、activeStreams=0），不能将设定的60秒写成持续60秒有效呈现。清理、相机闭合确认及journal删除成功，三系统服务健康；不知页面变化由何触发。9ff4156因此新增实际观察秒数及AppKit可见/遮挡/最小化独立计数（非互斥，不能相加推导时长），提前结束即退出观察，并仅记录owned display是否仍有activity、是否仍为同应用的布尔值。
 
 9ff4156随后一轮在准备阶段未确认有效呈现：window visible-region、screen intersection均true，但160次GPU完成的呈现时间均不可用；诊断未执行暂停或长hold，正常清理、journal消失、服务健康。同一时段CUA对自有空闲候选报SCStream -3811，重建工具会话未恢复；不连手机的纯色同driver对照仍有468次非零呈现、CA帧龄p95约50.03ms。因此不能简单归因录屏授权、全局锁屏或手机服务。继续补数值化phone view/ancestor隐藏、visibleRect、layer挂载及drawable尺寸；进入已认证native scanner时强制隐藏旧HOME picker并恢复phone view。组件覆盖picker隐藏→native恢复且不会露出旧视频层；此修正尚不能证明前述零呈现的根因。
+
+fcf865f定向双应用复验通过：微信/支付宝均识别、返回、清除ACK和退出清理，journal消失、三服务健康。CA帧龄p95约62.23/64.83ms、呈现间隔p95约16.67/33.33ms、最大约52.35/133.33ms。挂层前phoneHidden/hiddenAncestor均false，所以这一轮不能证明之前零呈现来自picker，也不能将通过归因为强制显示修正。数值快照同时观察到两应用挂层前phone预览约327.12×711pt、随后约312.40×679pt，进入阶段几何变化仍在。
+
+后续取消native模式对fullSizeContentView样式的进入/退出切换，保留原生AppKit标题栏与内容布局，移除配套的自定义标题拖动转发；只对手机图像区域做透明合成。组件断言picker恢复、进入前后NSWindow frame和phone frame完全一致、标准titlebar样式保留、退出后旧视频/输入状态恢复，已通过；真机前后几何和手感仍须复验，不把32pt观测直接归为唯一根因。
