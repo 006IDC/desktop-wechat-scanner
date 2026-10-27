@@ -104,15 +104,20 @@ import CoreVideo
         var samples=[CVPixelBuffer](),last=frames.latest().0
         if fastCalibration {
             let deadline=ProcessInfo.processInfo.systemUptime+2
+            var observed=last,consecutiveDark=0
             while ProcessInfo.processInfo.systemUptime<deadline {
                 try Task.checkCancellation()
                 let sample=frames.latest()
                 guard sample.2 else{throw CancellationError()}
-                if sample.0>last,let pixels=sample.1,NativeCalibrationReadiness.blackVisible(pixels) {
-                    try await requireCurrent(phone)
-                    samples.append(pixels);last=sample.0
-                    mark("blackConfirmedMilliseconds")
-                    break
+                if sample.0>observed,let pixels=sample.1 {
+                    observed=sample.0
+                    consecutiveDark=NativeCalibrationReadiness.blackVisible(pixels) ? consecutiveDark+1:0
+                    if consecutiveDark>=2 {
+                        try await requireCurrent(phone)
+                        samples.append(pixels);last=sample.0
+                        mark("darkCandidateReadyMilliseconds")
+                        break
+                    }
                 }
                 try await Task.sleep(nanoseconds:10_000_000)
             }

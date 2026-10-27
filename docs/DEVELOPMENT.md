@@ -265,3 +265,8 @@ GPU资源复用依据[Apple CIContext文档](https://developer.apple.com/documen
 后续显式原生性能候选：连接启用已有balanced-display（最长1600像素、同比缩放dpi保留dp布局）与realtime-video编码提示；不改变物理手机的分辨率/密度，厂商是否接受latency提示以编码器回报为准。快速校准不再固定等350ms，改为认证黑帧ACK后等待新的中心暗底帧，再收齐九个新观察；暗底只是准备度探针，不能替代确切扫码路由、owner和generation检查。合成测试拒绝白/蓝/灰底和过小帧，容许外围原生白控件及薄绿色扫码线。保守80ms模式保持原逻辑。`--diagnostic-primary-screen`仅与显式60秒hold联用，将本程序窗口移到主显示器测试CUA；不操作其他窗口，不改变显示设置。
 
 `OwnedDeviceShutdownIntegration --run-device-test <resources> <adb>` 是显式USB生命周期试验，仅创建本次独立设备，不打开第三方应用、不采集画面；输出固定阶段、流数和owner闭合布尔值。`OwnedCameraCleanupTests`与`NativeCalibrationReadinessTests`为合成测试，不能当作真机验收。
+
+
+9ebdca2完整双应用实验两者均未确认扫码入口，不能当作快校准/呈现通过；退出cleanupStage=complete，journal消失，三个系统服务健康。随后CUA直接观察在balanced-display下微信出现重复标题，点按未正常打开菜单，故从App候选连接参数中撤掉balanced-display，保留原有独立显示尺寸，仅继续试realtime-video。没有替换已安装版。此处先前“保留布局”仅是按比例缩放的设计意图，在该ROM上的实际回归否定了它的可用性，不能作为产品承诺。
+
+快模式进一步要求ACK后连续两帧中央暗候选再采样；统计名改为darkCandidateReadyMilliseconds。暗色启发式仍可能命中排队的旧暗帧，不能称上传黑图的端到端确认，须以真机背景/原生扫线/识别验收。主屏hold定位按CGMainDisplayID映射NSScreen后才移动本窗口，避免将任意枚举屏幕叫主屏。

@@ -352,7 +352,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 adbServerSocket=device.serverSocket
                 wirelessEndpoint=device.transport == .wireless ? (try? ADBEndpoint(device.serial).value):nil
                 adbURL=selected;phoneSession=PhoneSession(resources:Bundle.main.resourceURL!,adbURL:selected,serverSocket:adbServerSocket)
-                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial,allowLockedApplications:allowLockedApplications,desktopHome:!diagnostic,balancedDisplay:nativeScannerRequested && !diagnostic,realtimeVideo:nativeScannerRequested && !diagnostic){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
+                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial,allowLockedApplications:allowLockedApplications,desktopHome:!diagnostic,realtimeVideo:nativeScannerRequested && !diagnostic){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
                 try Task.checkCancellation();connected=true;mode = .phone;mirrorGeneration+=1
                 independentApplicationsWhenLocked=await phone.independentApplicationsWhenLocked
                 primaryLocked=independentApplicationsWhenLocked ? !(try await phone.primaryUserUnlocked()) : false
@@ -851,7 +851,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let input=mainControl.window.map {OwnWindowInputDiagnostic(window:$0)}
                         defer {_=input?.finish()}
                         if CommandLine.arguments.contains("--diagnostic-primary-screen"),
-                           let screen=NSScreen.screens.first,let window=mainControl.window {
+                           let screen=NSScreen.screens.first(where:{
+                               ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value==CGMainDisplayID()
+                           }),let window=mainControl.window {
                             let area=screen.visibleFrame,size=window.frame.size
                             window.setFrameOrigin(NSPoint(x:area.midX-size.width/2,y:area.midY-size.height/2))
                         }
