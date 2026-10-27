@@ -848,6 +848,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         // Bounded observation window for real CUA pointer dragging;
                         // only the synthetic board remains eligible for capture.
                         item["interactivePreviewHoldSeconds"]=60
+                        let input=mainControl.window.map {OwnWindowInputDiagnostic(window:$0)}
+                        defer {_=input?.finish()}
                         let initial=mainControl.window?.frame.origin ?? .zero
                         let until=ProcessInfo.processInfo.systemUptime+60
                         var maximumDisplacement=0.0
@@ -859,6 +861,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             try await Task.sleep(nanoseconds:50_000_000)
                         }
                         item["observedHoldWindowDisplacementPoints"]=maximumDisplacement
+                        item["observedOwnWindowInput"]=input?.finish()
                         guard cameraActive,!busy,nativeScannerOverlay === nativeOverlay else {
                             throw ScanError("原生预览在观察期间已结束，诊断不继续点击。")
                         }
@@ -1510,6 +1513,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if localScanFrame != nil {toggleLocalScanPause();return}
         guard connected,!busy,cameraActive,let window=cameraWindow,let display=cameraDisplay else{return}
         if !paused {
+            nativeScannerOverlay?.noteEnd(.pausedByControl)
             let checking=performanceTask;checking?.cancel()
             cameraSuppressed=true;busy=true;refresh()
             operationTask=Task {

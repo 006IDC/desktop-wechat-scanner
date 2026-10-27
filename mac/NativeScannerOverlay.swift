@@ -22,7 +22,7 @@ import CoreVideo
     private(set) var frozen=false
     private(set) var failure:String?
     private(set) var calibrationTiming=[String:Double]()
-    enum EndReason:String {case cleared,scannerStateChanged,windowHidden,pumpFailure,qrHandoff,returnedToApplication}
+    enum EndReason:String {case cleared,scannerStateChanged,windowHidden,pumpFailure,qrHandoff,returnedToApplication,pausedByControl}
     private(set) var termination=[String:Any]()
     func noteEnd(_ reason:EndReason) {if termination.isEmpty {termination["reason"]=reason.rawValue}}
     func noteStateChange(_ state:PhoneCameraState) {
