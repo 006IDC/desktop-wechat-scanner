@@ -262,7 +262,7 @@ GPU资源复用依据[Apple CIContext文档](https://developer.apple.com/documen
 
 退出顺序进一步缩小：b05541b双应用原生识别/返回都通过，但总体验收因cleanupSucceeded=false未通过；微信/支付宝校准1045/1261ms，呈现p95均33.33ms，支付宝最大116.67ms。随后无第三方应用、无镜像、无录屏的单独实验也失败在wait_owned_displays_off，证明这一失败无需扫码页即可复现，不能归为支付宝关闭相机慢。改为先有界停止本次directStreams，再仅对保留的VirtualDisplay对象setSurface(null)，然后休眠并继续原检查，无应用实验清理成功、journal消失、三个系统服务仍健康。依据[VirtualDisplay.setSurface官方说明](https://developer.android.com/reference/android/hardware/display/VirtualDisplay#setSurface(android.view.Surface))，分离Surface类似关屏、暂停buffer输出；不假设API返回就等于STATE_OFF，仍实际验证OFF、主屏未变和相机闭合。该结果还不证明活跃扫码退出已稳定。
 
-后续显式原生性能候选：连接启用已有balanced-display（最长1600像素、同比缩放dpi保留dp布局）与realtime-video编码提示；不改变物理手机的分辨率/密度，厂商是否接受latency提示以编码器回报为准。快速校准不再固定等350ms，改为认证黑帧ACK后等待新的中心暗底帧，再收齐九个新观察；暗底只是准备度探针，不能替代确切扫码路由、owner和generation检查。合成测试拒绝白/蓝/灰底和过小帧，容许外围原生白控件及薄绿色扫码线。保守80ms模式保持原逻辑。`--diagnostic-primary-screen`仅与显式60秒hold联用，将本程序窗口移到主显示器测试CUA；不操作其他窗口，不改变显示设置。
+后续显式原生性能候选：连接启用已有balanced-display（最长1600像素、同比缩放dpi保留dp布局）与realtime-video编码提示；不改变物理手机的分辨率/密度，厂商是否接受latency提示以编码器回报为准。快速校准不再固定等350ms，改为认证黑帧ACK后等待新的中心暗底帧，再收齐九个新观察；暗底只是准备度探针，不能替代确切扫码路由、owner和generation检查。合成测试拒绝白/蓝/灰底和过小帧，容许外围原生白控件及薄绿色扫码线。保守80ms模式保持原逻辑。`--diagnostic-primary-screen`在显式桌面诊断创建棋盘和捕获目标之前，将本程序scanner与board选择到同一主显示器，结束恢复scanner原位置；可与hold联用，不操作其他窗口，不改变显示设置。
 
 `OwnedDeviceShutdownIntegration --run-device-test <resources> <adb>` 是显式USB生命周期试验，仅创建本次独立设备，不打开第三方应用、不采集画面；输出固定阶段、流数和owner闭合布尔值。`OwnedCameraCleanupTests`与`NativeCalibrationReadinessTests`为合成测试，不能当作真机验收。
 
@@ -321,6 +321,8 @@ e48dcc7以有效呈现时间为就绪条件，记录窗口可见区域和屏幕�
 
 6c0c22c长时间观察未通过：微信约64秒内3482次非零呈现，p95约16.67ms但最大约566.66ms，多个较长间隔仍存在；CUA标题down/drag/up与performDrag均送达，实际位移为0，不能据此判断真实鼠标手感。随后发生frameExpired并停预览，未识别测试码；支付宝入口未确认。退出停在waitCameraClosure（activeStreams=1），journal保留。生产恢复只读核验后仍报告virtual_device_unavailable，virtualdevice/virtual_camera/media.camera均持续约2秒超时。仅自有服务进程的诊断栈入口要求root，未提权、未停止系统服务。已停止新建真机相机会话，需正常恢复手机后先核对旧会话清理。
 
-该轮额外发现诊断自身把scanner在hold时移到主屏、board却留在原副屏；后续将屏幕选择提前至board/捕获目标创建之前，并以组件回归验证两者同屏及结束位置还原。因此该轮不能当作有效多屏扫码/交接对照，也尚无证据将手机服务阻塞归因为此几何错误。新增Mac解码槽收到帧至非零drawable呈现时间的有界数值统计（p95/max，最多7200样本，拒绝无效/负时间），以及零呈现时间回调计数；不采集像素、不包含Android抓取/网络/解码或物理输入，不能称端到端延迟。新计时与多屏修正的真机结果尚未取得。
+该轮额外发现诊断自身把scanner在hold时移到主屏、board却留在原副屏；后续将屏幕选择提前至board/捕获目标创建之前，并以组件回归验证两者同屏及结束位置还原。因此该轮不能当作有效多屏扫码/交接对照，也尚无证据将手机服务阻塞归因为此几何错误。新增Mac解码槽收到帧至非零drawable呈现时间的有界数值统计（p95/max，最多7200样本，拒绝无效/负时间），以及无效呈现时间回调计数；不采集像素、不包含Android抓取/网络/解码或物理输入，不能称端到端延迟。新计时与多屏修正的真机结果尚未取得。
 
 后续同时修正错误后的继续操作：普通应用打开在旧相机清除ACK失败时不再发起新launch；诊断若观察到原生pumpFailure，立即结束该轮观察，清理后也不再切换下一应用，并记录cameraFrameClearAcknowledged。此门槛只确认旧图像清除命令响应，不等价于相机关闭或系统服务恢复；真实关闭仍按OwnedCameraCleanup和恢复journal核验。新失败门槛尚未在已阻塞的手机上验证。
+
+机主重启并解锁后，生产恢复清理成功、旧journal消失。虚拟相机服务经既有help入口预热后正常；097985f在同一主屏完成微信/支付宝真实扫码与返回、清除ACK和退出清理，三项系统服务仍健康。两应用校准约743/727ms；约250ms主线程暂停期间仍呈现13/11帧。微信呈现间隔p95约16.67ms、最大50ms；支付宝p95约33.33ms、最大66.67ms。新帧龄暂记约81ms，但该版采样端使用systemUptime，不能仅凭该轮认定跨时钟延迟：本机静态对照与CACurrentMediaTime相差不足0.001ms，仍统一改用CACurrentMediaTime后再验证，避免睡眠语义等变化。实际物理拖动和长时间稳定性仍未通过，不将先前系统服务超时视为已解决。

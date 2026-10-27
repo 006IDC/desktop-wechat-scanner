@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import CoreVideo
+import QuartzCore
 
 /// Opt-in native-camera presentation. The product owns capture/epoch/cleanup;
 /// this object only calibrates the verified scanner and renders original pixels.
@@ -11,7 +12,7 @@ import CoreVideo
         private var receivedAt=0.0
         @discardableResult func publish(_ value:CVPixelBuffer)->Bool {lock.withLock {
             guard active else{return false};revision += 1;pixels=value
-            receivedAt=ProcessInfo.processInfo.systemUptime;return true
+            receivedAt=CACurrentMediaTime();return true
         }}
         func latest()->(Int,CVPixelBuffer?,Bool,Double) {lock.withLock {(revision,pixels,active,receivedAt)}}
         func stop() {lock.withLock {active=false;pixels=nil}}

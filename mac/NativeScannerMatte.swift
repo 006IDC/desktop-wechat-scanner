@@ -254,7 +254,7 @@ final class NativeMattePresentationStats: @unchecked Sendable {
             "pendingGPU":max(0,submittedCount-completedCount),
             "pendingPresentationCallbacks":max(0,submittedCount-presentationCallbacks),
             "presentationCallbacks":presentationCallbacks,
-            "discardedPresentationCallbacks":max(0,presentationCallbacks-presentedCount),
+            "unusablePresentationTimestamps":max(0,presentationCallbacks-presentedCount),
             "decodedToPresentationSamples":age.count,
             "decodedToPresentationP95Milliseconds":p95(age),
             "decodedToPresentationMaxMilliseconds":age.last ?? -1,

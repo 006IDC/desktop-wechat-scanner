@@ -76,6 +76,12 @@ import CoreVideo
         }!
         precondition(!primary.frame.intersection(primaryCheck.board.frame).isEmpty,"Board missed the selected display")
         precondition(window.screen==primary,"Scanner and synthetic board selected different displays")
+        let capture=ui.desktopCaptureRect,aperture=ScanPreviewAperture.standard
+        let openingCenter=CGPoint(x:capture.minX+capture.width*aperture.midX,
+                                  y:capture.maxY-capture.height*aperture.midY)
+        precondition(!capture.intersection(primary.frame).isEmpty,"Capture missed the selected screen")
+        precondition(abs(openingCenter.x-primaryCheck.board.frame.midX)<1 &&
+                     abs(openingCenter.y-primaryCheck.board.frame.midY)<1,"Capture aperture missed the synthetic QR center")
         _=primaryCheck.finish()
         precondition(window.frame.origin==original,"Diagnostic did not restore the original position")
         print("PASS native overlay: full-window transparency and titlebar restoration; calibration/handoff release and reject touches; native input recovers. No phone, capture or OS input.")

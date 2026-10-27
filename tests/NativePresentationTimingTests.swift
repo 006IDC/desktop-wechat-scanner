@@ -24,7 +24,7 @@ import Foundation
   var ages=age.snapshot()
   precondition(ages["decodedToPresentationSamples"] as? Int == 1)
   precondition(abs((ages["decodedToPresentationP95Milliseconds"] as! Double)-34)<0.0001)
-  precondition(ages["discardedPresentationCallbacks"] as? Int == 1)
+  precondition(ages["unusablePresentationTimestamps"] as? Int == 1)
   for i in 0..<10000 {age.presented(at:4+Double(i),sourceReceivedAt:3.99+Double(i))}
   ages=age.snapshot();precondition(ages["decodedToPresentationSamples"] as? Int == 7200)
   print("PASS native timing: calibration excluded, arrival/drawable/GPU clocks separated, invalid values rejected, bounded samples. Synthetic only.")
