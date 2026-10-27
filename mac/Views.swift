@@ -61,8 +61,20 @@ private final class PhoneWindowBackgroundView: NSView {
     weak var preview: PhonePreviewView?
     var localScanPreview = false { didSet { needsDisplay = true } }
     var nativeScannerPreview = false {didSet {needsDisplay=true}}
+    private(set) var nativeTitleDragRequests=0
     var aperture = ScanPreviewAperture.standard { didSet { needsDisplay = true } }
     override var isOpaque: Bool { false }
+
+    override func mouseDown(with event:NSEvent) {
+        // Full-size transparent content covers AppKit's title surface. Route
+        // only its empty title band through the native window-server drag;
+        // phone pixels, toolbar controls and the ordinary window stay unchanged.
+        if nativeScannerPreview,let window,event.type == .leftMouseDown,
+           event.locationInWindow.y >= window.contentLayoutRect.maxY {
+            nativeTitleDragRequests+=1
+            window.performDrag(with:event)
+        } else {super.mouseDown(with:event)}
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         // Explicitly erase the previous surface when entering or resizing the aperture.
@@ -493,6 +505,7 @@ final class ControlWindowController: NSWindowController {
     private var isStandalone = false
     private var desktopOverlayRestore: (NSWindow.Level, NSWindow.CollectionBehavior)?
     var nativeScannerVisible:Bool {background.nativeScannerPreview}
+    var nativeTitleDragRequests:Int {background.nativeTitleDragRequests}
 
     var desktopCaptureRect: CGRect {
         guard let window, holder.phone.window === window,

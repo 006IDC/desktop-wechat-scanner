@@ -247,3 +247,5 @@ d787206显式40ms候选：微信校准累计1250ms（九帧892ms、GPU就绪993m
 无CUA捕获的d787206对照整轮passed=true、cleanupSucceeded=true、既有screenPermission=true。微信/支付宝均为同窗口原生层，真实合成桌面码识别及返回通过：校准约1361/1269ms；呈现p95均33.33ms、最大50.00/66.67ms，呈现及GPU回调收齐。此范围只是自有窗口程序移动和合成板流程；没有真实鼠标拖动，也未证明实际桌面透出像素与参考等价。不能把CUA并行与对照的差异直接归因为某一个系统组件。
 
 GPU资源复用依据[Apple CIContext文档](https://developer.apple.com/documentation/coreimage/cicontext)：CIContext/CIImage允许多线程使用，context包含内核缓存，不宜频繁创建；这里不共享可变CIFilter或手机校准纹理。
+
+7a1302c实际输入诊断证明微信窗口收到2次down、4次drag、2次up，down均为本窗口(250,805)，contentLayoutRect顶部788，确实命中标题区域，但最大位移为0；这排除了该轮“工具根本没把事件投到窗口”的解释。当前修正fullSize透明根view空白标题区域的mouseDown，调用公开NSWindow.performDrag(with:)；手机画面和工具栏不进入该分支，普通不透明镜像窗口不变，必须再测真实位移。该轮微信识别通过，支付宝本轮导航未确认，整轮不通过；没有发布或替换安装版。

@@ -851,6 +851,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let input=mainControl.window.map {OwnWindowInputDiagnostic(window:$0)}
                         defer {_=input?.finish()}
                         let initial=mainControl.window?.frame.origin ?? .zero
+                        let initialDragRequests=mainControl.nativeTitleDragRequests
                         let until=ProcessInfo.processInfo.systemUptime+60
                         var maximumDisplacement=0.0
                         while ProcessInfo.processInfo.systemUptime<until {
@@ -862,6 +863,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         }
                         item["observedHoldWindowDisplacementPoints"]=maximumDisplacement
                         item["observedOwnWindowInput"]=input?.finish()
+                        item["nativeTitleDragRequests"]=mainControl.nativeTitleDragRequests-initialDragRequests
                         guard cameraActive,!busy,nativeScannerOverlay === nativeOverlay else {
                             throw ScanError("原生预览在观察期间已结束，诊断不继续点击。")
                         }
