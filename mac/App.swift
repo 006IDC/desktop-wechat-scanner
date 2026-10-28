@@ -916,11 +916,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if nativeOverlay != nil,CommandLine.arguments.contains("--diagnostic-native-hold") {
                         // Bounded observation window for real CUA pointer dragging;
                         // only the synthetic board remains eligible for capture.
-                        item["interactivePreviewHoldSeconds"]=60
+                        let holdSeconds=CommandLine.arguments.contains("--diagnostic-native-short-hold") ? 20.0:60.0
+                        item["interactivePreviewHoldSeconds"]=holdSeconds
                         let input=mainControl.window.map {OwnWindowInputDiagnostic(window:$0)}
                         defer {_=input?.finish()}
                         let initial=mainControl.window?.frame.origin ?? .zero
-                        let holdBegan=ProcessInfo.processInfo.systemUptime,until=holdBegan+60
+                        let holdBegan=ProcessInfo.processInfo.systemUptime,until=holdBegan+holdSeconds
                         var maximumDisplacement=0.0
                         var visibleSamples=0,occludedSamples=0,miniaturizedSamples=0
                         while ProcessInfo.processInfo.systemUptime<until {
