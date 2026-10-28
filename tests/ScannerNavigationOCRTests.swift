@@ -6,15 +6,19 @@ import CoreVideo
 @main enum ScannerNavigationOCRTests {
     static func retryBudget() {
         var retry=ScannerNavigationOCR.PlusRetry()
-        require(!retry.permitsTap(at:.nan) && !retry.permitsTap(at:-1),"Invalid retry clock accepted")
-        retry.recordTap(at:.infinity)
-        require(retry.attempts==0 && retry.permitsTap(at:1),"Invalid clock consumed the first tap")
-        retry.recordTap(at:1)
-        require(!retry.permitsTap(at:0.5) && !retry.permitsTap(at:1.79),"Retry skipped its cooldown")
-        retry.recordTap(at:1.5)
+        require(!retry.permitsTap(at:.nan,frameReceivedAt:0) && !retry.permitsTap(at:-1,frameReceivedAt:0),"Invalid retry clock accepted")
+        require(!retry.permitsTap(at:1,frameReceivedAt:.nan) && !retry.permitsTap(at:1,frameReceivedAt:2),"Invalid/future frame accepted")
+        require(!retry.permitsTap(at:2,frameReceivedAt:0),"Expired frame accepted")
+        retry.recordTap(at:.infinity,frameReceivedAt:0)
+        require(retry.attempts==0 && retry.permitsTap(at:1,frameReceivedAt:0.9),"Invalid clock consumed the first tap")
+        retry.recordTap(at:1,frameReceivedAt:0.9)
+        require(!retry.permitsTap(at:0.5,frameReceivedAt:0.4) && !retry.permitsTap(at:1.79,frameReceivedAt:1.7),"Retry skipped its cooldown")
+        require(!retry.permitsTap(at:2,frameReceivedAt:0.9) && !retry.permitsTap(at:2,frameReceivedAt:1),"Pre-tap frame authorized another click")
+        retry.recordTap(at:1.5,frameReceivedAt:1.4)
         require(retry.attempts==1,"Rejected tap consumed retry budget")
-        retry.recordTap(at:2);retry.recordTap(at:3)
-        require(retry.attempts==3 && !retry.permitsTap(at:30),"Diagnostic plus retries are not bounded")
+        require(retry.permitsTap(at:2,frameReceivedAt:1.9),"Fresh post-tap observation could not retry")
+        retry.recordTap(at:2,frameReceivedAt:1.9);retry.recordTap(at:3,frameReceivedAt:2.9)
+        require(retry.attempts==3 && !retry.permitsTap(at:30,frameReceivedAt:29.9),"Diagnostic plus retries are not bounded")
     }
     private enum Icon { case plus, magnifier, ellipsis, blank }
     static func require(_ condition: Bool, _ message: String) {

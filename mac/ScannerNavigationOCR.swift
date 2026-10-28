@@ -10,11 +10,13 @@ enum ScannerNavigationOCR {
     struct PlusRetry {
         private(set) var attempts=0
         private var lastTap:Double?
-        func permitsTap(at time:Double)->Bool {
-            time.isFinite && time>=0 && attempts<3 && (lastTap.map {time-$0>=0.8} ?? true)
+        func permitsTap(at time:Double,frameReceivedAt receipt:Double)->Bool {
+            time.isFinite && time>=0 && receipt.isFinite && receipt>=0 && receipt<=time &&
+                time-receipt<=1 && attempts<3 &&
+                (lastTap.map {time-$0>=0.8 && receipt>$0} ?? true)
         }
-        mutating func recordTap(at time:Double) {
-            guard permitsTap(at:time) else{return}
+        mutating func recordTap(at time:Double,frameReceivedAt receipt:Double) {
+            guard permitsTap(at:time,frameReceivedAt:receipt) else{return}
             attempts+=1;lastTap=time
         }
     }

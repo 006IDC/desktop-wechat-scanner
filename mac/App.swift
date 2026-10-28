@@ -56,6 +56,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var terminationReady=false,terminating=false
     private var framesSent=0, previewsReceived=0, cameraFPS=0.0
     private var latestPhoneFrame:CVPixelBuffer?
+    private var latestPresentedMirrorFrame:(route:MirrorRoute,frame:MirrorVideoMailbox.Frame)?
     private var mirrorDisplay:Int?
     private var scannerSwitchMilliseconds=0.0
     private var previewTimer:Timer?
@@ -394,7 +395,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
     }
-    private func present(_ frame:MirrorVideoMailbox.Frame) {
+    private func present(_ frame:MirrorVideoMailbox.Frame,route:MirrorRoute) {
+        latestPresentedMirrorFrame=(route,frame)
         latestPhoneFrame=frame.pixelBuffer
         previewWaitMilliseconds=(ProcessInfo.processInfo.systemUptime-frame.receivedAt)*1000
         control.setPhonePixelBuffer(frame.pixelBuffer)
@@ -418,8 +420,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         else if wechatWindow != nil,let frame=physicalMirror.frames.takeLatest(),frame.generation==physicalMirror.incarnation {
             physicalFrame=frame.pixelBuffer;mainControl.setPhonePixelBuffer(frame.pixelBuffer)
         }
-        guard connected,!stopping,mirrorDisplay != nil,!(primaryLocked && mirrorDisplay == 0),let frame=activeRoute.frames.takeLatest(),frame.generation==activeRoute.incarnation else{return}
-        present(frame)
+        let route=activeRoute
+        guard connected,!stopping,mirrorDisplay != nil,!(primaryLocked && mirrorDisplay == 0),let frame=route.frames.takeLatest(),frame.generation==route.incarnation else{return}
+        present(frame,route:route)
     }
     private func prepareMirror(display:Int) async throws {
         let route=display==0 ? physicalMirror:scannerMirror
@@ -481,7 +484,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if let failure=route.failure {throw ScanError(failure)}
             if let frame=route.frames.takeLatest(),frame.generation==route.incarnation,
                after == nil || frame.receivedAt >= after! {
-                mirrorDisplay=display;present(frame);return
+                mirrorDisplay=display;present(frame,route:route);return
             }
             try await Task.sleep(nanoseconds:16_000_000)
         }
@@ -497,7 +500,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if desktopMode {return}
         if locked {
             physicalFrame=nil;mainControl.setPhonePixelBuffer(nil)
-            if mode == .phone {latestPhoneFrame=nil;mirrorDisplay=nil}
+            if mode == .phone {latestPhoneFrame=nil;latestPresentedMirrorFrame=nil;mirrorDisplay=nil}
             if !wasLocked,mode == .phone {status("手机主屏已锁定","独立应用仍可使用；正常解锁手机后恢复主屏镜像。")}
         } else {
             // Retry only the physical stream; independent windows retain their session.
@@ -796,8 +799,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
                         status("准备原生扫码预览","正在校准手机应用自己的相机背景…")
                         try await overlay.prepare(phone:phone,epoch:generation)
+                        let attachmentState=try await phone.cameraState()
                         try Task.checkCancellation()
                         guard connected,!stopping,generation==scanGeneration,nativeScannerOverlay === overlay else{throw CancellationError()}
+                        guard overlay.matches(attachmentState) else{throw ScanError("原生扫码状态已变化，已停止挂载预览。")}
                         guard activeRoute === nativeRoute,nativeRoute.incarnation==nativeIncarnation,
                               mirrorDisplay==targetDisplay,overlay.decodedFrameDelivery else{throw ScanError("扫码镜像路由已变化。")}
                         if targetWindow === mainControl {applicationPickerVisible=false}
@@ -1033,6 +1038,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func navigateDiagnosticScanner(package:String,evidence:inout [String:Any]) async throws {
         let connectionGeneration=mirrorGeneration
+        let navigationBegan=ProcessInfo.processInfo.systemUptime
         func checkNavigation() throws {
             try Task.checkCancellation()
             guard connected,!stopping,mirrorGeneration==connectionGeneration else{throw CancellationError()}
@@ -1087,7 +1093,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             targetActivitySamples+=1
             let retryScan=scanTapped && scanAttempts<3 && ProcessInfo.processInfo.systemUptime-lastScanTap>=0.8
-            if let pixels=latestPhoneFrame,!scanTapped || retryScan {
+            if let observation=latestPresentedMirrorFrame,observation.route === activeRoute,
+               observation.route === scannerMirror,observation.frame.generation==observation.route.incarnation,
+               observation.frame.receivedAt>=navigationBegan,!scanTapped || retryScan {
+                let input=observation.frame
+                let pixels=input.pixelBuffer
                 frameSamples+=1
                 let point=try await Task.detached(priority:.userInitiated) { () -> (CGPoint?,Bool,Bool,[String]) in
                     let words=try ScannerNavigationOCR.recognize(pixels)
@@ -1116,15 +1126,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if point.2,!returnedFromResult {
                     try checkNavigation();scannerMirror.session.key(4);returnedFromResult=true
                 }
-                else if let target=point.0,!point.1 || plusRetry.permitsTap(at:ProcessInfo.processInfo.systemUptime) {
+                else if let target=point.0,!point.1 || plusRetry.permitsTap(at:ProcessInfo.processInfo.systemUptime,frameReceivedAt:input.receivedAt) {
                     let current=try await phone.cameraState()
                     try checkNavigation()
                     guard ProcessInfo.processInfo.systemUptime<deadline,current.scannerActivity()==nil,
                           current.activities.first(where:{$0.displayId==display})?.component == state.activities.first(where:{$0.displayId==display})?.component else {
                         continue
                     }
+                    let tapTime=ProcessInfo.processInfo.systemUptime
+                    guard observation.route === activeRoute,input.generation==observation.route.incarnation,
+                          !point.1 || plusRetry.permitsTap(at:tapTime,frameReceivedAt:input.receivedAt) else{continue}
                     try checkNavigation();scannerMirror.session.tap(x:target.x,y:target.y)
-                    if point.1 {plusRetry.recordTap(at:ProcessInfo.processInfo.systemUptime)}else{scanTapped=true;scanAttempts+=1;lastScanTap=ProcessInfo.processInfo.systemUptime}
+                    if point.1 {plusRetry.recordTap(at:tapTime,frameReceivedAt:input.receivedAt)}else{scanTapped=true;scanAttempts+=1;lastScanTap=ProcessInfo.processInfo.systemUptime}
                     try await Task.sleep(nanoseconds:400_000_000)
                 }
             }
@@ -1701,7 +1714,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             wechatWindow?.window?.orderOut(nil);wechatWindow=nil;applicationLibrary?.close();applicationLibrary=nil
             cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil;desktopMode=false;mainControl.setPhoneDesktopMode(false)
             applicationPickerVisible=false;cachedApplications=nil;mainControl.hideApplicationPicker()
-            connected=false;busy=false;stopping=false;independentApplicationsWhenLocked=false;primaryLocked=false;mirrorDisplay=nil;latestPhoneFrame=nil;control.setPhoneImage(nil)
+            connected=false;busy=false;stopping=false;independentApplicationsWhenLocked=false;primaryLocked=false;mirrorDisplay=nil;latestPhoneFrame=nil;latestPresentedMirrorFrame=nil;control.setPhoneImage(nil)
             if !problem.isEmpty {status("需要重新连接以清理",problem)}
             else if !preserveError {status("已断开","可以拔线，下次直接连接即可。")}
             else {refresh();writeDiagnosticState()}
