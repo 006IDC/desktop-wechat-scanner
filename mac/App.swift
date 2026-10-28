@@ -788,6 +788,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if let scanner=state.scannerActivity(),scanner.displayId==targetDisplay {
                         let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
                             fastCalibration:CommandLine.arguments.contains("--native-fast-calibration"),
+                            batchedCalibration:CommandLine.arguments.contains("--native-batched-calibration"),
                             displaySyncEnabled:!CommandLine.arguments.contains("--native-unsynced-presentation"))
                         guard mirrorDisplay==targetDisplay else{throw ScanError("扫码镜像路由已变化。")}
                         let nativeRoute=activeRoute,nativeIncarnation=nativeRoute.incarnation

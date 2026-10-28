@@ -28,6 +28,7 @@ import QuartzCore
     private var identity:(Int,Int)?
     private let display:Int,package:String
     private let fastCalibration:Bool
+    private let batchedCalibration:Bool
     let displaySyncEnabled:Bool
     let layer=CAMetalLayer()
     let statistics=NativeMattePresentationStats()
@@ -68,8 +69,9 @@ import QuartzCore
         }
     }
     private func recordFailure() {renderFailure="原生扫码显示中断。"}
-    init(display:Int,package:String,fastCalibration:Bool=false,displaySyncEnabled:Bool=true) {
-        self.display=display;self.package=package;self.fastCalibration=fastCalibration
+    init(display:Int,package:String,fastCalibration:Bool=false,batchedCalibration:Bool=false,displaySyncEnabled:Bool=true) {
+        self.display=display;self.package=package;self.fastCalibration=fastCalibration || batchedCalibration
+        self.batchedCalibration=batchedCalibration
         self.displaySyncEnabled=displaySyncEnabled
     }
     /// Show genuine black-background frames during calibration, so opening the
@@ -127,6 +129,7 @@ import QuartzCore
         _=try await phone.frame(black,epoch:epoch)
         mark("blackAcknowledgedMilliseconds")
         calibrationTiming["sampleSpacingMilliseconds"]=fastCalibration ? 40:80
+        calibrationTiming["sampleStateChecks"]=0
         var samples=[CVPixelBuffer](),last=frames.latest().0
         if fastCalibration {
             let deadline=ProcessInfo.processInfo.systemUptime+2
@@ -160,9 +163,19 @@ import QuartzCore
             }
             let sample=frames.latest()
             guard sample.2,sample.0>last,let pixels=sample.1 else{throw ScanError("原生扫码校准未收到新画面。")}
-            try await requireCurrent(phone)
+            if !batchedCalibration {
+                try await requireCurrent(phone)
+                calibrationTiming["sampleStateChecks",default:0]+=1
+            }
             samples.append(pixels);last=sample.0
             if index<8 {try await Task.sleep(nanoseconds:fastCalibration ? 40_000_000:80_000_000)}
+        }
+        // The decoded slot rejects reset/replaced streams during sampling.
+        // Re-check camera owner/generation/route after the complete batch and
+        // again before sending blue; mixed or obsolete observations never attach.
+        if batchedCalibration {
+            try await requireCurrent(phone)
+            calibrationTiming["sampleStateChecks",default:0]+=1
         }
         mark("blackSamplesReadyMilliseconds")
         let renderer=try await Task.detached(priority:.userInitiated) {
