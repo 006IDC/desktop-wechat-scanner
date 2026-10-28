@@ -10,6 +10,7 @@ final class NativeScannerMatte {
     private let context: CIContext
     private let queue: MTLCommandQueue
     private let composite: MTLComputePipelineState
+    private let fusedComposite: MTLComputePipelineState?
     private let transmission: MTLTexture
     private let input: MTLTexture
     private let output: MTLTexture
@@ -68,12 +69,51 @@ final class NativeScannerMatte {
             out.write(float4(min(rgb,float3(a)),a),p);
         }
         """
+    // Compile the optional path separately, so unsupported fused shaders cannot
+    // prevent the established reference library from loading.
+    private static let fusedSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+        inline float4 nativeBluePixel(float3 c,float bias) {
+            float t=clamp(c.b-c.r-bias,0.0f,1.0f);
+            float a=max(1.0f-t,max(c.r,c.g));
+            float4 value=float4(min(float3(c.r,c.g,max(0.0f,c.b-(1.0f-a))),float3(a)),a);
+            // Match the reference pipeline's RGBA8 intermediate before filtering.
+            return rint(value*255.0f)/255.0f;
+        }
+        kernel void fusedBlueComposite(texture2d<float,access::read> b [[texture(0)]],
+                                       texture2d<float,access::read> bias [[texture(1)]],
+                                       texture2d<float,access::write> out [[texture(2)]],
+                                       uint2 p [[thread_position_in_grid]]) {
+            if(p.x>=out.get_width() || p.y>=out.get_height()) return;
+            int2 limit=int2(b.get_width()-1,b.get_height()-1);
+            float2 source=(float2(p)+0.5f)*float2(b.get_width(),b.get_height())/float2(out.get_width(),out.get_height())-0.5f;
+            int2 lo=int2(floor(source));float2 f=fract(source);
+            uint2 p00=uint2(clamp(lo,int2(0),limit));
+            uint2 p10=uint2(clamp(lo+int2(1,0),int2(0),limit));
+            uint2 p01=uint2(clamp(lo+int2(0,1),int2(0),limit));
+            uint2 p11=uint2(clamp(lo+int2(1,1),int2(0),limit));
+            float4 c00=nativeBluePixel(b.read(p00).rgb,bias.read(p00).r);
+            float4 c10=nativeBluePixel(b.read(p10).rgb,bias.read(p10).r);
+            float4 c01=nativeBluePixel(b.read(p01).rgb,bias.read(p01).r);
+            float4 c11=nativeBluePixel(b.read(p11).rgb,bias.read(p11).r);
+            out.write(mix(mix(c00,c10,f.x),mix(c01,c11,f.x),f.y),p);
+        }
+        """
+    private static func optionalFusedPipeline(_ device:MTLDevice)->MTLComputePipelineState? {
+        do {
+            let library=try device.makeLibrary(source:fusedSource,options:nil)
+            guard let function=library.makeFunction(name:"fusedBlueComposite") else{return nil}
+            return try device.makeComputePipelineState(function:function)
+        } catch {return nil}
+    }
     /// Device, immutable pipelines and CIContext can be shared. Pixel textures
     /// and command queues remain per renderer; calibration never reuses a phone image.
     private struct Resources {
         let device:MTLDevice,context:CIContext
         let blackWhite:MTLComputePipelineState,blue:MTLComputePipelineState,median:MTLComputePipelineState
         let composite:MTLComputePipelineState,blueComposite:MTLComputePipelineState
+        let fusedBlue:MTLComputePipelineState?
         init() throws {
             guard let device=MTLCreateSystemDefaultDevice() else{throw Unavailable()}
             self.device=device
@@ -85,6 +125,7 @@ final class NativeScannerMatte {
             blackWhite=try pipeline("calibrate");blue=try pipeline("blueCalibrate")
             median=try pipeline("blueMedianCalibrate");composite=try pipeline("composite")
             blueComposite=try pipeline("blueComposite")
+            fusedBlue=NativeScannerMatte.optionalFusedPipeline(device)
             context=CIContext(mtlDevice:device,options:[.workingColorSpace:NSNull(),
                 .outputColorSpace:NSNull(),.cacheIntermediates:false])
             // Compile CI's solid-frame path without any screen/phone input.
@@ -114,6 +155,7 @@ final class NativeScannerMatte {
         let calibrate=algorithm == .blackWhite ? resources.blackWhite :
             (blueCalibration.isEmpty ? resources.blue : resources.median)
         composite=algorithm == .blackWhite ? resources.composite : resources.blueComposite
+        fusedComposite=algorithm == .blueWithNativeColorBias ? resources.fusedBlue:nil
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
             width: Int(extent.width), height: Int(extent.height), mipmapped: false)
         descriptor.usage = [.shaderRead, .shaderWrite, .renderTarget]
@@ -185,25 +227,54 @@ final class NativeScannerMatte {
     /// CAMetalDisplayLink already supplies its drawable; never acquire another.
     func present(black:CIImage,drawable:CAMetalDrawable,stats:NativeMattePresentationStats,
                  sourceReceivedAt:Double?=nil) throws -> Bool {
-        guard black.extent==extent else{throw Unavailable("dimensions")}
         guard let command=queue.makeCommandBuffer() else { throw Unavailable() }
-        context.render(black,to:input,commandBuffer:command,bounds:extent,colorSpace:CGColorSpaceCreateDeviceRGB())
-        try Self.encode(command,pipeline:composite,a:input,b:transmission,output:output)
-        guard let image=CIImage(mtlTexture:output,options:[.colorSpace:NSNull()]) else { throw Unavailable() }
-        let bounds=CGRect(x:0,y:0,width:drawable.texture.width,height:drawable.texture.height)
-        let scaled=image.transformed(by:CGAffineTransform(scaleX:bounds.width/extent.width,y:bounds.height/extent.height))
-        context.render(scaled,to:drawable.texture,commandBuffer:command,bounds:bounds,colorSpace:CGColorSpaceCreateDeviceRGB())
+        let path=try encodeComposition(black: black,into:drawable.texture,command:command)
         drawable.addPresentedHandler { drawable in stats.presented(at:drawable.presentedTime,sourceReceivedAt:sourceReceivedAt) }
         command.addCompletedHandler { buffer in stats.completed(ok:buffer.status == .completed,
             gpuMilliseconds:max(0,buffer.gpuEndTime-buffer.gpuStartTime)*1000) }
-        stats.submitted();command.present(drawable);command.commit()
+        stats.submitted(fusedComposition:path == .fusedBlue);command.present(drawable);command.commit()
         return true
+    }
+    enum CompositionPath {case reference,fusedBlue}
+    func compositionPath(for destination:MTLTexture,allowFused:Bool=true)->CompositionPath {
+        // Core Image applies a wider reconstruction filter for strong minification.
+        // Preserve that reference path, and fall back for incompatible drawables.
+        guard allowFused,fusedComposite != nil,destination.pixelFormat == .bgra8Unorm,
+              destination.textureType == .type2D,destination.sampleCount == 1,
+              destination.usage.contains(.shaderWrite),
+              CGFloat(destination.width)>=extent.width*0.5,
+              CGFloat(destination.height)>=extent.height*0.5 else{return .reference}
+        return .fusedBlue
+    }
+    /// Headless rendering uses the same encoder as presentation. Call serially;
+    /// wait for completion before CPU readback. No drawable/window is acquired.
+    func render(black:CIImage,into destination:MTLTexture,allowFused:Bool=true) throws -> MTLCommandBuffer {
+        guard let command=queue.makeCommandBuffer() else{throw Unavailable()}
+        _=try encodeComposition(black:black,into:destination,command:command,allowFused:allowFused)
+        command.commit();return command
+    }
+    private func encodeComposition(black:CIImage,into destination:MTLTexture,command:MTLCommandBuffer,
+                                   allowFused:Bool=true) throws -> CompositionPath {
+        guard black.extent==extent else{throw Unavailable("dimensions")}
+        context.render(black,to:input,commandBuffer:command,bounds:extent,colorSpace:CGColorSpaceCreateDeviceRGB())
+        let path=compositionPath(for:destination,allowFused:allowFused)
+        if path == .fusedBlue,let fusedComposite {
+            try Self.encode(command,pipeline:fusedComposite,a:input,b:transmission,output:destination)
+            return path
+        }
+        try Self.encode(command,pipeline:composite,a:input,b:transmission,output:output)
+        guard let image=CIImage(mtlTexture:output,options:[.colorSpace:NSNull()]) else { throw Unavailable() }
+        let bounds=CGRect(x:0,y:0,width:destination.width,height:destination.height)
+        let scaled=image.transformed(by:CGAffineTransform(scaleX:bounds.width/extent.width,y:bounds.height/extent.height))
+        context.render(scaled,to:destination,commandBuffer:command,bounds:bounds,colorSpace:CGColorSpaceCreateDeviceRGB())
+        return path
     }
 }
 
 final class NativeMattePresentationStats: @unchecked Sendable {
     private let lock=NSLock()
     private var submittedCount=0,completedCount=0,failedCount=0,presentedCount=0,presentationCallbacks=0,lastPresentation:Double?
+    private var fusedCompositionCount=0
     private var intervals=[Double](),gpu=[Double](),longIntervals=[[Double]]()
     private var firstPresentation:Double?
     private var receivedCount=0,lastReceived:Double?
@@ -220,7 +291,7 @@ final class NativeMattePresentationStats: @unchecked Sendable {
     func drawableWait(milliseconds:Double) {lock.withLock {
         if milliseconds.isFinite,milliseconds>=0,drawableWaits.count<7200 {drawableWaits.append(milliseconds)}
     }}
-    func submitted() {lock.withLock {submittedCount += 1}}
+    func submitted(fusedComposition:Bool=false) {lock.withLock {submittedCount += 1;if fusedComposition {fusedCompositionCount+=1}}}
     func completed(ok:Bool,gpuMilliseconds:Double) { lock.withLock {
         completedCount += 1;if !ok {failedCount += 1}
         if gpu.count < 7200 && gpuMilliseconds.isFinite {gpu.append(gpuMilliseconds)}
@@ -247,6 +318,7 @@ final class NativeMattePresentationStats: @unchecked Sendable {
         let age=decodedToPresentation.sorted()
         func p95(_ values:[Double])->Double {values.isEmpty ? -1:values[Int(Double(values.count-1)*0.95)]}
         return ["submitted":submittedCount,"completed":completedCount,"failed":failedCount,"presented":presentedCount,
+            "fusedCompositionSubmissions":fusedCompositionCount,"referenceCompositionSubmissions":submittedCount-fusedCompositionCount,
             "receivedFrames":receivedCount,"receiveIntervalSamples":received.count,
             "receiveIntervalP95Milliseconds":p95(received),"receiveIntervalMaxMilliseconds":received.last ?? -1,
             "drawableWaitSamples":waits.count,"drawableWaitP95Milliseconds":p95(waits),
