@@ -5,6 +5,19 @@ import Vision
 /// In-memory navigation recognition; callers decide which fixed labels to use.
 /// No image or recognized text is retained, persisted or logged here.
 enum ScannerNavigationOCR {
+    /// Diagnostic navigation only. Every caller must independently re-confirm
+    /// the home screen, actual plus icon and unchanged owned activity before a tap.
+    struct PlusRetry {
+        private(set) var attempts=0
+        private var lastTap:Double?
+        func permitsTap(at time:Double)->Bool {
+            time.isFinite && time>=0 && attempts<3 && (lastTap.map {time-$0>=0.8} ?? true)
+        }
+        mutating func recordTap(at time:Double) {
+            guard permitsTap(at:time) else{return}
+            attempts+=1;lastTap=time
+        }
+    }
     enum Region: String, Sendable {
         /// Whole image, including the home screen's title and bottom tab bar.
         case full

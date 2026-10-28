@@ -4,6 +4,18 @@ import CoreText
 import CoreVideo
 
 @main enum ScannerNavigationOCRTests {
+    static func retryBudget() {
+        var retry=ScannerNavigationOCR.PlusRetry()
+        require(!retry.permitsTap(at:.nan) && !retry.permitsTap(at:-1),"Invalid retry clock accepted")
+        retry.recordTap(at:.infinity)
+        require(retry.attempts==0 && retry.permitsTap(at:1),"Invalid clock consumed the first tap")
+        retry.recordTap(at:1)
+        require(!retry.permitsTap(at:0.5) && !retry.permitsTap(at:1.79),"Retry skipped its cooldown")
+        retry.recordTap(at:1.5)
+        require(retry.attempts==1,"Rejected tap consumed retry budget")
+        retry.recordTap(at:2);retry.recordTap(at:3)
+        require(retry.attempts==3 && !retry.permitsTap(at:30),"Diagnostic plus retries are not bounded")
+    }
     private enum Icon { case plus, magnifier, ellipsis, blank }
     static func require(_ condition: Bool, _ message: String) {
         if !condition { fatalError(message) }
@@ -165,6 +177,7 @@ import CoreVideo
         let smaller = fixture(scale: 0.5)
         samePosition(menuFull, label("MENU", in: try ScannerNavigationOCR.recognize(smaller, region: .menu)).rect)
         samePosition(scannerFull, label("SCANNER", in: try ScannerNavigationOCR.recognize(smaller, region: .scanner)).rect)
-        print("PASS actual Vision OCR on synthetic pixels: full/menu/scanner ROI exclusion, full-image coordinates and 720×1280 normalization across input sizes")
+        retryBudget()
+        print("PASS actual Vision OCR on synthetic pixels: ROI/coordinate/icon checks and bounded plus retry cooldown; no phone or capture")
     }
 }

@@ -1057,7 +1057,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             throw ScanError("等待界面工具打开真实扫一扫超时；诊断未自动点击。")
         }
-        var plusTapped=false,scanTapped=false,returnedFromResult=false
+        var plusRetry=ScannerNavigationOCR.PlusRetry()
+        var scanTapped=false,returnedFromResult=false
         var scanAttempts=0,lastScanTap=0.0
         var observedHomeLabels=Set<String>()
         var stateSamples=0,targetActivitySamples=0,frameSamples=0
@@ -1065,7 +1066,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             evidence["navigationStateSamples"]=stateSamples
             evidence["navigationTargetActivitySamples"]=targetActivitySamples
             evidence["navigationFrameSamples"]=frameSamples
-            evidence["navigationPlusTapped"]=plusTapped
+            evidence["navigationPlusTapped"]=plusRetry.attempts>0
+            evidence["navigationPlusAttempts"]=plusRetry.attempts
             evidence["navigationScanTapped"]=scanTapped
             evidence["navigationScanAttempts"]=scanAttempts
             evidence["navigationKnownLabels"]=observedHomeLabels.sorted()
@@ -1113,15 +1115,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if point.2,!returnedFromResult {
                     try checkNavigation();scannerMirror.session.key(4);returnedFromResult=true
                 }
-                else if let target=point.0,!(point.1 && plusTapped) {
+                else if let target=point.0,!point.1 || plusRetry.permitsTap(at:ProcessInfo.processInfo.systemUptime) {
                     let current=try await phone.cameraState()
                     try checkNavigation()
-                    guard current.scannerActivity()==nil,
+                    guard ProcessInfo.processInfo.systemUptime<deadline,current.scannerActivity()==nil,
                           current.activities.first(where:{$0.displayId==display})?.component == state.activities.first(where:{$0.displayId==display})?.component else {
                         continue
                     }
                     try checkNavigation();scannerMirror.session.tap(x:target.x,y:target.y)
-                    if point.1 {plusTapped=true}else{scanTapped=true;scanAttempts+=1;lastScanTap=ProcessInfo.processInfo.systemUptime}
+                    if point.1 {plusRetry.recordTap(at:ProcessInfo.processInfo.systemUptime)}else{scanTapped=true;scanAttempts+=1;lastScanTap=ProcessInfo.processInfo.systemUptime}
                     try await Task.sleep(nanoseconds:400_000_000)
                 }
             }
