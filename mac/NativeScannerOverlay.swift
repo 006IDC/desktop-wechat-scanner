@@ -6,18 +6,7 @@ import QuartzCore
 /// Opt-in native-camera presentation. The product owns capture/epoch/cleanup;
 /// this object only calibrates the verified scanner and renders original pixels.
 @MainActor final class NativeScannerOverlay {
-    private final class Frames: @unchecked Sendable {
-        private let lock=NSLock()
-        private var revision=0,pixels:CVPixelBuffer?,active=true
-        private var receivedAt=0.0
-        @discardableResult func publish(_ value:CVPixelBuffer)->Bool {lock.withLock {
-            guard active else{return false};revision += 1;pixels=value
-            receivedAt=CACurrentMediaTime();return true
-        }}
-        func latest()->(Int,CVPixelBuffer?,Bool,Double) {lock.withLock {(revision,pixels,active,receivedAt)}}
-        func stop() {lock.withLock {active=false;pixels=nil}}
-    }
-    private let frames=Frames()
+    private let frames=NativeScannerFrames()
     private var decodedBinding:(mailbox:MirrorVideoMailbox,id:UUID,generation:Int)?
     var decodedFrameDelivery:Bool {
         guard let binding=decodedBinding else{return false}
@@ -98,11 +87,23 @@ import QuartzCore
         try Task.checkCancellation()
         if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("原生视频会话已变化。")}
         let state=try await phone.cameraState()
+        try Task.checkCancellation()
+        if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("原生视频会话已变化。")}
         guard matches(state) else{throw ScanError("原生扫码状态已变化，已停止校准。")}
         if identity == nil {identity=(state.generation,state.ownerGeneration)}
     }
     private nonisolated static func background(blue:Bool) throws -> Data {
         try NativeCalibrationImages.image(blue:blue)
+    }
+    private func nextCalibrationFrame(after:Int,notBefore:TimeInterval=0,
+                                      deadline:TimeInterval) async throws -> NativeScannerFrames.Sample {
+        do {
+            let remaining=deadline-CACurrentMediaTime()
+            guard remaining>0 else{throw NativeScannerFrames.Failure.timedOut}
+            return try await frames.wait(after:after,notBefore:notBefore,timeout:remaining)
+        } catch NativeScannerFrames.Failure.stopped {throw CancellationError()}
+        catch NativeScannerFrames.Failure.concurrentWait {throw ScanError("原生扫码校准状态已变化。")}
+        catch NativeScannerFrames.Failure.timedOut {throw ScanError("原生扫码校准未收到新画面。")}
     }
     private nonisolated static func isBlue(_ pixels:CVPixelBuffer)->Bool {
         guard CVPixelBufferGetPixelFormatType(pixels)==kCVPixelFormatType_32BGRA,
@@ -130,45 +131,56 @@ import QuartzCore
         mark("blackAcknowledgedMilliseconds")
         calibrationTiming["sampleSpacingMilliseconds"]=fastCalibration ? 40:80
         calibrationTiming["sampleStateChecks"]=0
-        var samples=[CVPixelBuffer](),last=frames.latest().0
+        var samples=[CVPixelBuffer](),last=frames.latest().0,lastReceipt=0.0
         if fastCalibration {
-            let deadline=ProcessInfo.processInfo.systemUptime+2
+            let deadline=CACurrentMediaTime()+2
             var observed=last,consecutiveDark=0
-            while ProcessInfo.processInfo.systemUptime<deadline {
+            while CACurrentMediaTime()<deadline {
                 try Task.checkCancellation()
-                let sample=frames.latest()
+                let sample:(Int,CVPixelBuffer?,Bool,Double)
+                if batchedCalibration {
+                    let fresh=try await nextCalibrationFrame(after:observed,deadline:deadline)
+                    sample=(fresh.revision,fresh.pixels,true,fresh.receivedAt)
+                } else {sample=frames.latest()}
                 guard sample.2 else{throw CancellationError()}
                 if sample.0>observed,let pixels=sample.1 {
                     observed=sample.0
                     consecutiveDark=NativeCalibrationReadiness.blackVisible(pixels) ? consecutiveDark+1:0
                     if consecutiveDark>=2 {
                         try await requireCurrent(phone)
-                        samples.append(pixels);last=sample.0
+                        samples.append(pixels);last=sample.0;lastReceipt=sample.3
                         mark("darkCandidateReadyMilliseconds")
                         break
                     }
                 }
-                try await Task.sleep(nanoseconds:10_000_000)
+                if !batchedCalibration {try await Task.sleep(nanoseconds:10_000_000)}
             }
             guard !samples.isEmpty else{throw ScanError("原生相机黑底尚未确认，已停止校准。")}
-            try await Task.sleep(nanoseconds:40_000_000)
+            if !batchedCalibration {try await Task.sleep(nanoseconds:40_000_000)}
         } else {
             try await Task.sleep(nanoseconds:350_000_000)
             last=frames.latest().0
         }
         for index in samples.count..<9 {
-            let deadline=ProcessInfo.processInfo.systemUptime+2
-            while frames.latest().0<=last && ProcessInfo.processInfo.systemUptime<deadline {
-                try Task.checkCancellation();try await Task.sleep(nanoseconds:10_000_000)
+            let sample:(Int,CVPixelBuffer?,Bool,Double)
+            if batchedCalibration {
+                let earliest=lastReceipt+(fastCalibration ? 0.04:0.08)
+                let fresh=try await nextCalibrationFrame(after:last,notBefore:earliest,deadline:CACurrentMediaTime()+2)
+                sample=(fresh.revision,fresh.pixels,true,fresh.receivedAt)
+            } else {
+                let deadline=ProcessInfo.processInfo.systemUptime+2
+                while frames.latest().0<=last && ProcessInfo.processInfo.systemUptime<deadline {
+                    try Task.checkCancellation();try await Task.sleep(nanoseconds:10_000_000)
+                }
+                sample=frames.latest()
             }
-            let sample=frames.latest()
             guard sample.2,sample.0>last,let pixels=sample.1 else{throw ScanError("原生扫码校准未收到新画面。")}
             if !batchedCalibration {
                 try await requireCurrent(phone)
                 calibrationTiming["sampleStateChecks",default:0]+=1
             }
-            samples.append(pixels);last=sample.0
-            if index<8 {try await Task.sleep(nanoseconds:fastCalibration ? 40_000_000:80_000_000)}
+            samples.append(pixels);last=sample.0;lastReceipt=sample.3
+            if index<8,!batchedCalibration {try await Task.sleep(nanoseconds:fastCalibration ? 40_000_000:80_000_000)}
         }
         // The decoded slot rejects reset/replaced streams during sampling.
         // Re-check camera owner/generation/route after the complete batch and
@@ -188,14 +200,27 @@ import QuartzCore
         try await requireCurrent(phone)
         hidesCalibrationFrames=true
         let blue=try await Task.detached {try Self.background(blue:true)}.value
+        let beforeBlue=frames.latest().0
         _=try await phone.frame(blue,epoch:epoch)
         mark("blueAcknowledgedMilliseconds")
         let deadline=ProcessInfo.processInfo.systemUptime+3
         var confirmed=false
-        while ProcessInfo.processInfo.systemUptime<deadline {
-            try await requireCurrent(phone)
-            if let pixels=frames.latest().1,Self.isBlue(pixels) {confirmed=true;break}
-            try await Task.sleep(nanoseconds:20_000_000)
+        if batchedCalibration {
+            let limit=CACurrentMediaTime()+3
+            var observed=beforeBlue
+            while CACurrentMediaTime()<limit {
+                let fresh=try await nextCalibrationFrame(after:observed,deadline:limit)
+                observed=fresh.revision
+                if Self.isBlue(fresh.pixels) {
+                    try await requireCurrent(phone);confirmed=true;break
+                }
+            }
+        } else {
+            while ProcessInfo.processInfo.systemUptime<deadline {
+                try await requireCurrent(phone)
+                if let pixels=frames.latest().1,Self.isBlue(pixels) {confirmed=true;break}
+                try await Task.sleep(nanoseconds:20_000_000)
+            }
         }
         guard confirmed else{throw ScanError("原生相机背景尚未确认，已停止透明预览。")}
         mark("blueConfirmedMilliseconds")

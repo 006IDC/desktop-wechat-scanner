@@ -360,3 +360,7 @@ a169b39复验：第一次启动未取得唯一USB设备，未执行扫码；连�
 后台GPU合成优化（2026-10-28）：将blue原生像素提取和常规缩放融合为一遍compute，保持原RGBA8中间量化语义后再对四个源像素作双线性插值，不重绘任何手机控件。任意轴缩小超过2倍时保留Core Image原重建路径；blackWhite算法、非BGRA8目标、无shaderWrite能力及融合shader/library或pipeline不可用时也回退原路径。新增无窗口render(into:)与实际present共用编码器，统计记录fusedCompositionSubmissions/referenceCompositionSubmissions以供未来确认真实drawable提交时选择了哪条路径，不能将提交数当作有效呈现帧数。
 
 合成像素回归覆盖非对称彩色/透明前景、移动绿线、放大/常规缩小/强缩小、单行单列和格式/usage回退；融合与参考输出逐字节差异≤2且保持预乘alpha。最终独立shader/library版本中，720×1565→646×1404的40对交替样本，CPU编码p95约0.0687→0.0404ms、GPU p95约0.6377→0.5014ms、中位数约0.3603→0.2731ms。较早一轮GPU p95约0.6034→0.4251ms，运行间波动存在，不能给出普遍性能保证。另只创建不附着窗口、不present的8×8 CAMetalLayer纹理读取能力，当前主机usage=23包含shaderWrite；这不证明可见呈现或真实扫码。原透明度/跨实例校准隔离、时间统计回归及全量warnings-as-errors编译/链接通过，App没有运行。以上仅合成阶段结果，不能外推手机到Mac的响应速度或参考视频等价；独立只读复核要求明确提交数并隔离可选shader编译，已修正并复查；最新融合路径尚未前台/真机验证，不替换安装版或发布Release。
+
+批量校准的新帧等待改为事件通知（仍只在`--native-batched-calibration`研究路径启用）：decoded slot继续只保留最新一帧、最多一个等待者，以新revision和CA receipt的notBefore门槛维持九帧及至少40ms间隔；已花在状态RPC上的时间不再额外叠加到sleep中。黑底就绪与蓝底确认等新publication唤醒；蓝底确认后再复核owner/state，App挂层前仍做独立核验。普通非batch采样保留原轮询/延时。stop、取消和发布在锁内摘除waiter、锁外resume；UUID限定取消自身请求，结构化timeout分支会取消并等待剩余子任务，不遗留等待任务。
+
+纯CPU合成验证通过latest-only、时间间隔过滤、断流唤醒、超时后恢复、并发拒绝、100次预取消及100次publish/cancel/stop竞态；发布至await恢复p95约0.04ms，仅说明通知机制，不能当作扫码开场或真实手机延迟。解码观察者替换/reset/stop/冻结及主线程阻塞回归通过，全量warnings-as-errors编译/链接通过，App未运行。独立只读复核未发现新的continuation、取消、timeout或采样间隔缺陷；新事件路径与上一轮GPU融合均仍待经机主允许的前台真机验收。
