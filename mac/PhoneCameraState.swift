@@ -19,10 +19,12 @@ struct PhoneCameraState: Decodable, Sendable {
     let ownerStatus: String?
     let ownerKnown: Bool
     let ownerGeneration: Int
+    let solidCalibrationSupported: Bool
 
     private enum CodingKeys: String, CodingKey {
         case version, generation, activeStreams, activities, desktopHome
         case cameraOwner, ownerKnown, ownerGeneration, ownerStatus
+        case solidCalibrationSupported
     }
 
     init(from decoder: Decoder) throws {
@@ -37,6 +39,7 @@ struct PhoneCameraState: Decodable, Sendable {
         ownerKnown = try values.decodeIfPresent(Bool.self, forKey: .ownerKnown) ?? false
         ownerStatus = try values.decodeIfPresent(String.self, forKey: .ownerStatus)
         ownerGeneration = try values.decodeIfPresent(Int.self, forKey: .ownerGeneration) ?? 0
+        solidCalibrationSupported = try values.decodeIfPresent(Bool.self, forKey: .solidCalibrationSupported) ?? false
     }
 
     func scannerActivity() -> Activity? {

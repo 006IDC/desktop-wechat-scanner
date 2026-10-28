@@ -376,3 +376,11 @@ CUA窗口图把原生控件上下倒置，但机主直接观察明确回复屏�
 b35959d无抓图短对照：同一产品显示管线持续约20.05秒，整轮约28.3秒；未调用CUA、无本窗口down/drag/up事件、窗口位移0。有效呈现1199/1205次回调，时间不可用6次，呈现间隔p95约16.67ms、最大约50.00ms，超过50ms间隔0；解码到呈现p95约43.04ms、GPU p95约2.38ms。活跃扫码退出、清理及三个手机服务均正常，journal消失。该静止对照未复现前一轮的秒级时间空档，但不能单独分离抓图、拖动和其他时序差异，不能据此断言某个工具或系统组件是卡顿根因。
 
 机主进一步确认第一轮是本人手动拖动，主观反馈“比较流畅”；与本窗口拖动事件及位移记录相符。这是一次真实使用反馈，不是物理输入到显示的延迟测量，也不证明参考视频等价或长期无卡顿。截取图与实际屏幕方向不一致的原因仍未知，不据该图翻转产品。验证后不再启动前台窗口；默认安装版未替换、TCC未重置、未发布Release。
+
+
+后台纯色校准协议候选（2026-10-28）：仅当显式`--native-batched-calibration`且已认证手机状态报告`solidCalibrationSupported=true`时，黑/蓝背景改走命令25，payload固定9字节（8字节大端非负epoch，1字节颜色0黑/1蓝）。服务端只在desktop-home、realtime-video、非mirror-only模式接受，仍在stateLock内确认真实扫码owner，按stateLock→cameraLock赋值并绑定cameraStateGeneration；过期epoch不改画面，owner/route失效、清帧与后续真实图像均清除填色。仅以同一720×1280源尺寸、原旋转/aspect-fit/整数rect替代PNG解码后的绘制，保留白边，不画任何自制手机控件。ACK只统计赋值和排队，不代表Surface已画出或手机已识别。
+
+旧服务缺少/空能力字段时仍走PNG，非批量路径保持PNG；新能力不绕过scannerActivity归属检查，不改变九帧、至少40ms间隔、新revision蓝底确认或挂层前复核。新增JVM固定payload解析与Swift能力/编码边界测试，覆盖空/错误长度、负epoch、大小端、非法颜色及非Bool能力；源码检查保留未知owner拒绝。尚未真机比较新协议的总开场耗时，也未逐像素验证非16:9 Android Canvas；不能把省掉两次PNG传输/Bitmap解码直接当作视频等效或整体延迟改善。当前仅准备研究候选，不替换安装版、不改TCC、不打开前台测试。
+
+
+本候选后台验证：JVM固定9字节解析、Swift编码与能力/owner解析测试通过；CPU-only帧等待回归含取消/停止/超时、唯一revision、采样间隔及100次竞争通过；全量Mac源码warnings-as-errors编译/链接、全量Android Java编译与DEX构建通过，未启动生成的App。独立只读复核未发现新的锁序、能力绕过、旧填色残留或采样门槛变化；服务端真实owner/epoch/generation状态转换与Android Canvas像素仍须真机验证。未将此前版本的扫码结果沿用于本候选。

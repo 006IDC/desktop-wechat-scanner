@@ -83,7 +83,8 @@ import QuartzCore
         guard let scanner=state.scannerActivity(),scanner.displayId==display,scanner.package==package else{return false}
         return identity.map {$0 == (state.generation,state.ownerGeneration)} ?? true
     }
-    private func requireCurrent(_ phone:PhoneSession) async throws {
+    @discardableResult
+    private func requireCurrent(_ phone:PhoneSession) async throws -> PhoneCameraState {
         try Task.checkCancellation()
         if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("原生视频会话已变化。")}
         let state=try await phone.cameraState()
@@ -91,9 +92,18 @@ import QuartzCore
         if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("原生视频会话已变化。")}
         guard matches(state) else{throw ScanError("原生扫码状态已变化，已停止校准。")}
         if identity == nil {identity=(state.generation,state.ownerGeneration)}
+        return state
     }
     private nonisolated static func background(blue:Bool) throws -> Data {
         try NativeCalibrationImages.image(blue:blue)
+    }
+    private func sendCalibrationBackground(blue:Bool,phone:PhoneSession,epoch:Int,solid:Bool) async throws {
+        if solid {
+            _=try await phone.solidCalibrationFrame(blue:blue,epoch:epoch)
+        } else {
+            let image=try await Task.detached {try Self.background(blue:blue)}.value
+            _=try await phone.frame(image,epoch:epoch)
+        }
     }
     private func nextCalibrationFrame(after:Int,notBefore:TimeInterval=0,
                                       deadline:TimeInterval) async throws -> NativeScannerFrames.Sample {
@@ -125,9 +135,10 @@ import QuartzCore
         // scannerActivity() is the single authoritative allowlist for owner,
         // exact route and owned display. Unknown camera apps cannot calibrate.
         guard display > 0 else{throw ScanError("原生扫码不属于本次独立屏幕。")}
-        try await requireCurrent(phone)
-        let black=try await Task.detached {try Self.background(blue:false)}.value
-        _=try await phone.frame(black,epoch:epoch)
+        let initialState=try await requireCurrent(phone)
+        let solid=batchedCalibration && initialState.solidCalibrationSupported
+        calibrationTiming["solidCalibrationSelected"]=solid ? 1:0
+        try await sendCalibrationBackground(blue:false,phone:phone,epoch:epoch,solid:solid)
         mark("blackAcknowledgedMilliseconds")
         calibrationTiming["sampleSpacingMilliseconds"]=fastCalibration ? 40:80
         calibrationTiming["sampleStateChecks"]=0
@@ -199,9 +210,8 @@ import QuartzCore
         samples.removeAll()
         try await requireCurrent(phone)
         hidesCalibrationFrames=true
-        let blue=try await Task.detached {try Self.background(blue:true)}.value
         let beforeBlue=frames.latest().0
-        _=try await phone.frame(blue,epoch:epoch)
+        try await sendCalibrationBackground(blue:true,phone:phone,epoch:epoch,solid:solid)
         mark("blueAcknowledgedMilliseconds")
         let deadline=ProcessInfo.processInfo.systemUptime+3
         var confirmed=false

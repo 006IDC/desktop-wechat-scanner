@@ -352,7 +352,7 @@ actor PhoneSession {
             throw ScanError(error.localizedDescription + (cleanup.isEmpty ? "" : "\n"+cleanup))
         }
     }
-    private func epochBytes(_ epoch: Int) throws -> Data {
+    private static func epochBytes(_ epoch: Int) throws -> Data {
         guard epoch >= 0 else { throw ScanError("扫码帧序号无效。") }
         var value = UInt64(epoch).bigEndian
         return withUnsafeBytes(of: &value) { Data($0) }
@@ -367,7 +367,7 @@ actor PhoneSession {
         }
         guard let channel else {throw ScanError("手机未连接。")}
         guard data.count <= 4*1024*1024 else {throw ScanError("图像过大。")}
-        var body = try epochBytes(epoch)
+        var body = try Self.epochBytes(epoch)
         body.append(data)
         let started=ProcessInfo.processInfo.systemUptime
         let response:CameraSocket.MeasuredResponse
@@ -380,6 +380,25 @@ actor PhoneSession {
         }
         let processing=try Self.frameProcessingMilliseconds(in:response.data)
         return CameraFrameReceipt(processingMilliseconds:processing,
+                                  requestMilliseconds:(ProcessInfo.processInfo.systemUptime-started)*1000,
+                                  sendMilliseconds:response.sendMilliseconds,
+                                  responseWaitMilliseconds:response.responseWaitMilliseconds,
+                                  responseBodyMilliseconds:response.responseBodyMilliseconds)
+    }
+    /// Fixed-size synthetic calibration only. Capability negotiation happens in
+    /// NativeScannerOverlay; the server still verifies the live scanner owner.
+    static func solidCalibrationBody(epoch:Int,blue:Bool) throws -> Data {
+        var body=try epochBytes(epoch)
+        body.append(blue ? 1:0)
+        return body
+    }
+    func solidCalibrationFrame(blue:Bool,epoch:Int) throws -> CameraFrameReceipt {
+        try Task.checkCancellation()
+        guard let channel else{throw ScanError("手机未连接。")}
+        let body=try Self.solidCalibrationBody(epoch:epoch,blue:blue)
+        let started=ProcessInfo.processInfo.systemUptime
+        let response=try channel.requestMeasured(25,body)
+        return CameraFrameReceipt(processingMilliseconds:try Self.frameProcessingMilliseconds(in:response.data),
                                   requestMilliseconds:(ProcessInfo.processInfo.systemUptime-started)*1000,
                                   sendMilliseconds:response.sendMilliseconds,
                                   responseWaitMilliseconds:response.responseWaitMilliseconds,
@@ -398,13 +417,13 @@ actor PhoneSession {
             if requireConnection {throw ScanError("手机未确认清除相机画面。")}
             return
         }
-        _ = try channel.request(3,epochBytes(epoch))
+        _ = try channel.request(3,Self.epochBytes(epoch))
     }
     /// Discard a moved/retried image within the same capture generation. Unlike
     /// advancing clear(), it cannot invalidate a newer generation's pixels.
     func discardFrame(epoch:Int) throws {
         guard let channel else{throw ScanError("手机未确认丢弃过期画面。")}
-        _ = try channel.request(23,epochBytes(epoch))
+        _ = try channel.request(23,Self.epochBytes(epoch))
     }
     func heartbeat() throws { guard let channel else {throw ScanError("手机未连接。")};_ = try channel.request(4) }
     func cameraState() throws -> PhoneCameraState {

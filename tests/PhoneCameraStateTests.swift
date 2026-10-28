@@ -33,6 +33,16 @@ import Foundation
         require(matched.scannerActivity()?.displayId == 7 && matched.ownerGeneration == 3,
                 "Known virtual camera owner did not match the verified WeChat scanner")
 
+        require(!matched.solidCalibrationSupported,"Absent capability must preserve the PNG path")
+        var capability=basic();capability["solidCalibrationSupported"]=true
+        require(try decode(capability).solidCalibrationSupported,"Explicit capability was lost")
+        capability["ownerKnown"]=false
+        require(try decode(capability).scannerActivity()==nil,"Calibration capability bypassed owner validation")
+        capability=basic();capability["solidCalibrationSupported"]=NSNull()
+        require(try !decode(capability).solidCalibrationSupported,"Null capability must preserve the PNG path")
+        capability["solidCalibrationSupported"]="true"
+        rejected(capability,"Non-boolean calibration capability was accepted")
+
         var fields = basic()
         fields["activities"] = [activity(7, fullWechat)]
         require(try decode(fields).scannerActivity()?.component == fullWechat,

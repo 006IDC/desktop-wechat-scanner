@@ -104,6 +104,7 @@ public final class LiveCameraServer {
     private Image latestDisplayImage;
     private Context context;
     private Bitmap cameraFrame;
+    private Integer cameraSolidColor; // guarded by cameraLock, same generation fence as Bitmap
     private Object device;
     private Object camera;
     private VirtualDisplay display;
@@ -387,9 +388,10 @@ public final class LiveCameraServer {
                 Bitmap obsolete = null;
                 long latestInvalidation = cameraStateGeneration;
                 synchronized (cameraLock) {
-                    if (cameraFrame != null && frameStateGeneration < latestInvalidation) {
+                    if ((cameraFrame != null || cameraSolidColor != null) && frameStateGeneration < latestInvalidation) {
                         obsolete = cameraFrame;
                         cameraFrame = null;
+                        cameraSolidColor = null;
                         frameStateGeneration = -1;
                     }
                 }
@@ -738,20 +740,28 @@ public final class LiveCameraServer {
             canvas = surface.lockCanvas(null);
             canvas.drawColor(Color.WHITE);
             synchronized (cameraLock) {
-                if (cameraFrame != null && (!desktopHomeRequested || frameStateGeneration == cameraStateGeneration)) {
+                boolean solid = cameraSolidColor != null && desktopHomeRequested && frameStateGeneration == cameraStateGeneration;
+                if (solid || (cameraFrame != null && (!desktopHomeRequested || frameStateGeneration == cameraStateGeneration))) {
                     int width = canvas.getWidth();
                     int height = canvas.getHeight();
                     canvas.save();
                     canvas.translate(width / 2f, height / 2f);
                     canvas.rotate(-90);
                     int portraitWidth = height, portraitHeight = width;
-                    float scale = Math.min((float) portraitWidth / cameraFrame.getWidth(), (float) portraitHeight / cameraFrame.getHeight());
-                    int drawWidth = Math.round(cameraFrame.getWidth() * scale);
-                    int drawHeight = Math.round(cameraFrame.getHeight() * scale);
+                    // Match the existing 720x1280 calibration PNG's rotation,
+                    // aspect fit, rounding and white margins exactly.
+                    int sourceWidth = solid ? 720 : cameraFrame.getWidth();
+                    int sourceHeight = solid ? 1280 : cameraFrame.getHeight();
+                    float scale = Math.min((float) portraitWidth / sourceWidth, (float) portraitHeight / sourceHeight);
+                    int drawWidth = Math.round(sourceWidth * scale);
+                    int drawHeight = Math.round(sourceHeight * scale);
                     Rect destination = new Rect(-drawWidth / 2, -drawHeight / 2,
                             drawWidth / 2, drawHeight / 2);
                     Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
-                    canvas.drawBitmap(cameraFrame, null, destination, paint);
+                    if (solid) {
+                        paint.setColor(cameraSolidColor);
+                        canvas.drawRect(destination, paint);
+                    } else canvas.drawBitmap(cameraFrame, null, destination, paint);
                     canvas.restore();
                 }
             }
@@ -982,12 +992,14 @@ public final class LiveCameraServer {
                 if (!stale) synchronized (cameraLock) {
                     previous = cameraFrame;
                     cameraFrame = decoded;
+                    cameraSolidColor = null;
                     frameStateGeneration = acceptedGeneration;
                 }
             }
         } else synchronized (cameraLock) {
             previous = cameraFrame;
             cameraFrame = decoded;
+            cameraSolidColor = null;
         }
         if (stale) {
             decoded.recycle();
@@ -998,10 +1010,30 @@ public final class LiveCameraServer {
         requestPaint();
     }
 
+    private void setCalibrationFrame(boolean blue) throws IOException {
+        if (!desktopHomeRequested || !realtimeVideoRequested || mirrorOnlyRequested)
+            throw new IOException("Solid calibration is unavailable");
+        Bitmap previous;
+        synchronized (stateLock) {
+            if (authorizedDesktopScannerLocked() <= Display.DEFAULT_DISPLAY)
+                throw new IOException("Desktop camera has no verified scanner owner");
+            synchronized (cameraLock) {
+                previous = cameraFrame;
+                cameraFrame = null;
+                cameraSolidColor = blue ? Color.BLUE : Color.BLACK;
+                frameStateGeneration = cameraStateGeneration;
+            }
+        }
+        if (previous != null) previous.recycle();
+        lastCameraUpdateNanos = System.nanoTime();
+        requestPaint();
+    }
+
     private void clearCameraFrame() {
         synchronized (cameraLock) {
             Bitmap previous = cameraFrame;
             cameraFrame = null;
+            cameraSolidColor = null;
             frameStateGeneration = -1;
             if (previous != null) previous.recycle();
         }
@@ -1057,6 +1089,7 @@ public final class LiveCameraServer {
 
     private byte[] liveState() throws Exception {
         JSONObject state = new JSONObject().put("version", 1).put("desktopHome", desktopHomeRequested);
+        state.put("solidCalibrationSupported", desktopHomeRequested && realtimeVideoRequested && !mirrorOnlyRequested);
         JSONArray activities = new JSONArray();
         synchronized (stateLock) {
             state.put("generation", streamGeneration).put("activeStreams", streams.size());
@@ -1124,6 +1157,18 @@ public final class LiveCameraServer {
                     reply(output, true, java.nio.ByteBuffer.allocate(Long.BYTES).putLong(processingNanos).array());
                 }
                 catch (Exception e) { error(output, e.getMessage() == null ? "Invalid camera frame" : e.getMessage()); }
+            } else if (command == 25) {
+                try {
+                    CalibrationFrameRequest calibration = CalibrationFrameRequest.parse(body);
+                    if (calibration.epoch != currentEpoch) { reply(output, true, new byte[0]); continue; }
+                    long started = System.nanoTime();
+                    setCalibrationFrame(calibration.blue);
+                    // ACK measures assignment/queueing, not Surface painting or display.
+                    reply(output, true, java.nio.ByteBuffer.allocate(Long.BYTES)
+                            .putLong(System.nanoTime() - started).array());
+                } catch (Exception failure) {
+                    error(output, failure.getMessage() == null ? "Invalid calibration frame" : failure.getMessage());
+                }
             } else if (command == 2) {
                 if (length != 0) { error(output, "Screenshot request must be empty"); continue; }
                 byte[] encoded = null;
