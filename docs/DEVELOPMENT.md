@@ -760,3 +760,18 @@ Mailbox与生命周期合成回归通过，新增同代prelaunch旧帧必须等�
 认证command10空body仍全目录，1–255 bytes为严格UTF8 ASCII包名；component、控制字符、非法编码和超限拒绝。liveState显式packageLauncherQuerySupported时Mac才发包名，旧服务缺能力发原空body；能力不成为相机owner证据。连接初始state同时取得能力，退出清除；失败不自动忽略再校验。记录本次启动的实际validation耗时与scoped布尔，仅供内部诊断。
 
 最初只读原型cold全目录262.6ms、后续11.3–18.4ms，所选包1.34–4.63ms；原型省略JSON且目标侧未loadLabel，不能当整体启动改善。随后用新提取的**实际函数**（含JSON/label）在手机同进程预热后做三组full/package/package/full，full分别11.22/13.51、12.03/9.99、11.50/14.18ms，package分别3.29/2.55、1.04/1.55、2.78/1.12ms。两包scoped成员与全目录按包过滤集合完全相同，非launcher扫码activity未出现，未知包为空；无App启动/相机/虚拟设备操作，只清理该探针生成的两个JAR。该结果只证明目录核验步骤减少开销，不推算完整扫码或物理响应提速。
+
+### build58 最终包、回退与双App复测
+
+运行源码`8b41393ae769980d0d79b8f7b42d5a4f99aecd8e`，包`build/MiraDroid-0.4.0-build58-8b41393-arm64.zip`，SHA256 `9ccbef3bd15b1e62701db04bd3de05ea21aec5239d97e11465ddb44788f06186`；源码/JAR/strict-deep签名及同designated requirement回读通过，安装版41未替换，未重置录屏授权。
+
+首个双App轮在微信launch阶段失败，未进入导航/采集；后续不录屏的同源客户端单独复核有两次not_arrived（入口核验4.86/3.37ms，任务已在target，前台仍判other，listener却报requested），均正常恢复清理。不能将它归因于新package query、二维码或已证实为解析错误。后来结构观察连续三轮启动通过（约267.1/254.3/243.6ms、入口核验3.85/3.50/3.08ms），top记录对应target，未再复现该矛盾；三次成功不能清掉前两次失败。记录只有固定类别/计数/布尔，无组件正文、任务ID或手机像素。
+
+同客户端配旧build57服务，显式capability回退为false，旧空body全目录核验31.72ms、启动通过约840.7ms，任务/前台对应且清理成功；此跨轮总耗时不作新旧整体A/B。随后同一最终包双App第二轮均严格识码并清理，现有录屏权限true、activationRequested=false、前后台标识前后相同：
+
+|App|入口核验(ms)|完整launch确认(ms)|首次扫码tap→首ACK(ms)|首次tap→结果帧(ms)|QR显示请求→结果帧(ms)|
+|---|---:|---:|---:|---:|---:|
+|微信|5.37|199.13|727.18|2532.90|2125.22|
+|支付宝|2.50|815.01|395.80|2587.30|2302.85|
+
+两次scoped=true、scan tap均仅1次，源码、实际发送、原生文字结果严格匹配，均核known-scanner/target owner/1 stream。这里只验后台生产组件，未构造AppController或测物理拖动/前台动画，不称视频同等效果。Android官方[am start -W](https://developer.android.com/tools/adb)等待路径也仅做隐藏启动探针：微信启动通过804.0ms，其中该shell约52.3ms，不能据一轮认定它更快或解决首轮失败，产品尚未采用。
