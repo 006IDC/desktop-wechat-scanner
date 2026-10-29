@@ -384,3 +384,6 @@ b35959d无抓图短对照：同一产品显示管线持续约20.05秒，整轮�
 
 
 本候选后台验证：JVM固定9字节解析、Swift编码与能力/owner解析测试通过；CPU-only帧等待回归含取消/停止/超时、唯一revision、采样间隔及100次竞争通过；全量Mac源码warnings-as-errors编译/链接、全量Android Java编译与DEX构建通过，未启动生成的App。独立只读复核未发现新的锁序、能力绕过、旧填色残留或采样门槛变化；服务端真实owner/epoch/generation状态转换与Android Canvas像素仍须真机验证。未将此前版本的扫码结果沿用于本候选。
+
+
+2026-10-29真机A/B准备：`--native-png-calibration`仅覆盖研究校准发送选择，与`--native-batched-calibration`联用时保留全部新帧等待、采样及状态检查，以同一签名包/同一Android服务对照PNG和solid。默认选择不变。报告新增black/blue request和processing耗时（ACK赋值/解码成本，非实际paint），以及明确标签`scannerTapToNativeAttachedMilliseconds`：程序在真实扫一扫控件发出内部tap，到原生层挂载的时间，不包含用户找入口、物理鼠标延迟或首像素测量；无本次有效tap则不填写。真机数据尚未取得。

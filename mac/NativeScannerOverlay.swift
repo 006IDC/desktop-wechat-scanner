@@ -18,6 +18,7 @@ import QuartzCore
     private let display:Int,package:String
     private let fastCalibration:Bool
     private let batchedCalibration:Bool
+    private let solidCalibrationEnabled:Bool
     let displaySyncEnabled:Bool
     let layer=CAMetalLayer()
     let statistics=NativeMattePresentationStats()
@@ -58,9 +59,10 @@ import QuartzCore
         }
     }
     private func recordFailure() {renderFailure="原生扫码显示中断。"}
-    init(display:Int,package:String,fastCalibration:Bool=false,batchedCalibration:Bool=false,displaySyncEnabled:Bool=true) {
+    init(display:Int,package:String,fastCalibration:Bool=false,batchedCalibration:Bool=false,solidCalibrationEnabled:Bool=true,displaySyncEnabled:Bool=true) {
         self.display=display;self.package=package;self.fastCalibration=fastCalibration || batchedCalibration
         self.batchedCalibration=batchedCalibration
+        self.solidCalibrationEnabled=solidCalibrationEnabled
         self.displaySyncEnabled=displaySyncEnabled
     }
     /// Show genuine black-background frames during calibration, so opening the
@@ -97,12 +99,12 @@ import QuartzCore
     private nonisolated static func background(blue:Bool) throws -> Data {
         try NativeCalibrationImages.image(blue:blue)
     }
-    private func sendCalibrationBackground(blue:Bool,phone:PhoneSession,epoch:Int,solid:Bool) async throws {
+    private func sendCalibrationBackground(blue:Bool,phone:PhoneSession,epoch:Int,solid:Bool) async throws -> CameraFrameReceipt {
         if solid {
-            _=try await phone.solidCalibrationFrame(blue:blue,epoch:epoch)
+            return try await phone.solidCalibrationFrame(blue:blue,epoch:epoch)
         } else {
             let image=try await Task.detached {try Self.background(blue:blue)}.value
-            _=try await phone.frame(image,epoch:epoch)
+            return try await phone.frame(image,epoch:epoch)
         }
     }
     private func nextCalibrationFrame(after:Int,notBefore:TimeInterval=0,
@@ -136,9 +138,11 @@ import QuartzCore
         // exact route and owned display. Unknown camera apps cannot calibrate.
         guard display > 0 else{throw ScanError("原生扫码不属于本次独立屏幕。")}
         let initialState=try await requireCurrent(phone)
-        let solid=batchedCalibration && initialState.solidCalibrationSupported
+        let solid=batchedCalibration && solidCalibrationEnabled && initialState.solidCalibrationSupported
         calibrationTiming["solidCalibrationSelected"]=solid ? 1:0
-        try await sendCalibrationBackground(blue:false,phone:phone,epoch:epoch,solid:solid)
+        let blackReceipt=try await sendCalibrationBackground(blue:false,phone:phone,epoch:epoch,solid:solid)
+        calibrationTiming["blackRequestMilliseconds"]=blackReceipt.requestMilliseconds
+        calibrationTiming["blackProcessingMilliseconds"]=blackReceipt.processingMilliseconds
         mark("blackAcknowledgedMilliseconds")
         calibrationTiming["sampleSpacingMilliseconds"]=fastCalibration ? 40:80
         calibrationTiming["sampleStateChecks"]=0
@@ -211,7 +215,9 @@ import QuartzCore
         try await requireCurrent(phone)
         hidesCalibrationFrames=true
         let beforeBlue=frames.latest().0
-        try await sendCalibrationBackground(blue:true,phone:phone,epoch:epoch,solid:solid)
+        let blueReceipt=try await sendCalibrationBackground(blue:true,phone:phone,epoch:epoch,solid:solid)
+        calibrationTiming["blueRequestMilliseconds"]=blueReceipt.requestMilliseconds
+        calibrationTiming["blueProcessingMilliseconds"]=blueReceipt.processingMilliseconds
         mark("blueAcknowledgedMilliseconds")
         let deadline=ProcessInfo.processInfo.systemUptime+3
         var confirmed=false

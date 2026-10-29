@@ -72,6 +72,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var launchDiagnosticGeneration=0
     private var scanNavigation:[[String:Any]]=[]
     private var scannerNavigationMilliseconds=0.0
+    private var diagnosticScannerTapUptime:TimeInterval?
+    private var nativeScannerAttachedUptime:TimeInterval?
     private var savedDiagnosticToolbar=false
     private var diagnosticExitStatus:Int32=0
     private let diagnosticWriter=DiagnosticStateWriter(fileURL:FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0]
@@ -762,6 +764,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard connected && !busy && !stopping && !cameraSuppressed else{return}
         guard targetWindow.window?.isVisible == true,targetWindow.window?.isMiniaturized == false else{return}
         busy=true;operationTask?.cancel()
+        nativeScannerAttachedUptime=nil
         operationTask=Task { [self] in
             do {
                 guard await clearCamera() else{localScanClearFailed();return}
@@ -792,6 +795,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
                             fastCalibration:CommandLine.arguments.contains("--native-fast-calibration"),
                             batchedCalibration:CommandLine.arguments.contains("--native-batched-calibration"),
+                            solidCalibrationEnabled:!CommandLine.arguments.contains("--native-png-calibration"),
                             displaySyncEnabled:!CommandLine.arguments.contains("--native-unsynced-presentation"))
                         guard mirrorDisplay==targetDisplay else{throw ScanError("扫码镜像路由已变化。")}
                         let nativeRoute=activeRoute,nativeIncarnation=nativeRoute.incarnation
@@ -807,6 +811,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                               mirrorDisplay==targetDisplay,overlay.decodedFrameDelivery else{throw ScanError("扫码镜像路由已变化。")}
                         if targetWindow === mainControl {applicationPickerVisible=false}
                         targetWindow.showNativeScanner(overlay)
+                        nativeScannerAttachedUptime=ProcessInfo.processInfo.systemUptime
                     } else {showLocalScanFrame(for:targetWindow)}
                 } else if localCameraMode {showLocalScanFrame(for:targetWindow)}
                 busy=false
@@ -869,6 +874,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     item["nativeDisplaySyncEnabled"]=nativeOverlay?.displaySyncEnabled
                     if let nativeOverlay {
                         item["nativeCalibration"]=nativeOverlay.calibrationTiming
+                        if let tapped=diagnosticScannerTapUptime,let attached=nativeScannerAttachedUptime,attached>=tapped {
+                            // Internal scan-control dispatch -> layer attachment,
+                            // not physical input latency or first visible pixel.
+                            item["scannerTapToNativeAttachedMilliseconds"]=(attached-tapped)*1000
+                        }
                         item["nativeSurfaceBeforeAttachment"]=mainControl.nativeSurfaceBeforeAttachment
                     }
                     if CommandLine.arguments.contains("--diagnostic-main-actor-pause") {
@@ -1040,6 +1050,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func navigateDiagnosticScanner(package:String,evidence:inout [String:Any]) async throws {
         let connectionGeneration=mirrorGeneration
         let navigationBegan=ProcessInfo.processInfo.systemUptime
+        diagnosticScannerTapUptime=nil
         func checkNavigation() throws {
             try Task.checkCancellation()
             guard connected,!stopping,mirrorGeneration==connectionGeneration else{throw CancellationError()}
@@ -1138,7 +1149,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     guard observation.route === activeRoute,input.generation==observation.route.incarnation,
                           !point.1 || plusRetry.permitsTap(at:tapTime,frameReceivedAt:input.receivedAt) else{continue}
                     try checkNavigation();scannerMirror.session.tap(x:target.x,y:target.y)
-                    if point.1 {plusRetry.recordTap(at:tapTime,frameReceivedAt:input.receivedAt)}else{scanTapped=true;scanAttempts+=1;lastScanTap=ProcessInfo.processInfo.systemUptime}
+                    if point.1 {plusRetry.recordTap(at:tapTime,frameReceivedAt:input.receivedAt)}else{
+                        diagnosticScannerTapUptime=tapTime
+                        scanTapped=true;scanAttempts+=1;lastScanTap=ProcessInfo.processInfo.systemUptime
+                    }
                     try await Task.sleep(nanoseconds:400_000_000)
                 }
             }
