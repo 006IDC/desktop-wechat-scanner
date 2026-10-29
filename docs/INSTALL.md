@@ -2,7 +2,7 @@
 
 从 [GitHub Releases](https://github.com/006IDC/desktop-wechat-scanner/releases) 下载相应版本 DMG/ZIP，核对同版本 SHA256SUMS.txt。当前预览版为 0.4.0-preview.4；旧 0.3.2 包仍需要外部 ADB，不要混用说明。仅 Apple Silicon、macOS 14.4+。
 
-将 App 拖入 Applications。ZIP 用户先解压；不要从 DMG 内长期运行。升级前断开并退出旧实例。
+新构建的 App 名称为 MiraDroid（原名“桌面微信扫码”）。将 App 拖入 Applications。ZIP 用户先解压；不要从 DMG 内长期运行。升级前断开并退出旧实例，使用一个版本即可；改名沿用原 Bundle ID、签名身份及偏好/恢复路径，不迁移或清空系统录屏授权。
 
 ## 开发者验证提示
 

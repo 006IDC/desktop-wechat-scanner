@@ -11,9 +11,9 @@ import tempfile
 import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
-APP=ROOT/'build/桌面微信扫码.app'
-STABLE_ZIP=ROOT/'build/桌面微信扫码-本机签名.zip'
-AD_HOC_ZIP=ROOT/'build/桌面微信扫码-ad-hoc.zip'
+APP=ROOT/'build/MiraDroid.app'
+STABLE_ZIP=ROOT/'build/MiraDroid-本机签名.zip'
+AD_HOC_ZIP=ROOT/'build/MiraDroid-ad-hoc.zip'
 parser=argparse.ArgumentParser(description=__doc__)
 signing=parser.add_mutually_exclusive_group()
 signing.add_argument('--local-signing',action='store_true',
@@ -117,15 +117,15 @@ resources.mkdir(parents=True,exist_ok=True)
 binary.mkdir(parents=True,exist_ok=True)
 info={
     'CFBundleIdentifier':'com.idc006.DesktopWeChatScanner',
-    'CFBundleName':'桌面微信扫码','CFBundleDisplayName':'桌面微信扫码',
+    'CFBundleName':'MiraDroid','CFBundleDisplayName':'MiraDroid',
     'CFBundleExecutable':'DesktopWeChatScanner','CFBundlePackageType':'APPL',
-    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'42',
+    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'43',
     'DesktopScannerRelease':'0.4.0-preview.5',
     'CFBundleIconFile':'AppIcon.icns',
     'LSMinimumSystemVersion':'14.4','NSHighResolutionCapable':True,
     'NSLocalNetworkUsageDescription':'连接同一局域网内已由你配对授权的 Android 手机，以显示镜像并发送点击。',
     'NSBonjourServices':['_adb-tls-connect._tcp'],
-    'NSScreenCaptureUsageDescription':'将手机应用窗口后方的桌面画面作为已连接手机的扫码相机输入。',
+    'NSScreenCaptureUsageDescription':'将透明取景框选中的电脑画面提供给所选手机应用的相机。',
     'NSPrincipalClass':'NSApplication',
 }
 with (contents/'Info.plist').open('wb') as stream:plistlib.dump(info,stream)

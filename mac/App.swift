@@ -184,12 +184,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func buildMenu(){
         let menu=NSMenu(),appItem=NSMenuItem(),appMenu=NSMenu()
         appMenu.autoenablesItems=false
-        appMenu.addItem(withTitle:"关于桌面微信扫码",action:#selector(about),keyEquivalent:"").target=self
+        appMenu.addItem(withTitle:"关于MiraDroid",action:#selector(about),keyEquivalent:"").target=self
         adbSettingsItem=appMenu.addItem(withTitle:"设置 ADB…",action:#selector(configureADB),keyEquivalent:"")
         adbSettingsItem?.target=self
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle:"隐藏桌面微信扫码",action:#selector(NSApplication.hide(_:)),keyEquivalent:"h").target=NSApp
-        appMenu.addItem(withTitle:"退出桌面微信扫码",action:#selector(NSApplication.terminate(_:)),keyEquivalent:"q")
+        appMenu.addItem(withTitle:"隐藏MiraDroid",action:#selector(NSApplication.hide(_:)),keyEquivalent:"h").target=NSApp
+        appMenu.addItem(withTitle:"退出MiraDroid",action:#selector(NSApplication.terminate(_:)),keyEquivalent:"q")
         appItem.submenu=appMenu;menu.addItem(appItem)
         let item=NSMenuItem(),actions=NSMenu(title:"手机")
         for (title,key,action) in [("手机桌面","1",#selector(homeAction)),("暂停 / 继续桌面相机","p",#selector(pauseAction))] {
@@ -204,7 +204,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         windows.addItem(withTitle:"手机镜像",action:#selector(showMainWindow),keyEquivalent:"0").target=self
         windowItem.submenu=windows;menu.addItem(windowItem);NSApp.windowsMenu=windows;NSApp.mainMenu=menu
     }
-    @objc private func about(){NSApp.orderFrontStandardAboutPanel(options:[.applicationName:"桌面微信扫码",.applicationVersion:"\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "未知"))",.credits:NSAttributedString(string:"Android 手机镜像与桌面扫码\n镜像采用 scrcpy 5.0.1（Apache 2.0）与 Mac 原生解码。")])}
+    @objc private func about(){NSApp.orderFrontStandardAboutPanel(options:[.applicationName:"MiraDroid",.applicationVersion:"\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "未知"))",.credits:NSAttributedString(string:"Android 手机镜像与桌面扫码\n镜像采用 scrcpy 5.0.1（Apache 2.0）与 Mac 原生解码。")])}
     /// Selection stays on the main actor; executable validation runs off it.
     private func chooseADB() async throws -> URL? {
         while !Task.isCancelled {

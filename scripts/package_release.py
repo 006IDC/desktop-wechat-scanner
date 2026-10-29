@@ -13,9 +13,9 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE = '0.4.0-preview.5'
-APP_BUILD = '19'
-APP_NAME = '桌面微信扫码.app'
-STEM = f'DesktopWeChatScanner-{RELEASE}-macOS-arm64'
+APP_BUILD = '43'
+APP_NAME = 'MiraDroid.app'
+STEM = f'MiraDroid-{RELEASE}-macOS-arm64'
 OUT = ROOT / 'build/release' / RELEASE
 SCRCPY_SHA256 = '764eb6f79811d5211fe9df341120882ba9994c7a61b897d7bf3fb662e53bc536'
 
@@ -64,7 +64,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='wechat-release-') as temporary:
         temp = Path(temporary)
         stage = temp/'stage'; stage.mkdir()
-        extract_checked(ROOT/'build/桌面微信扫码-本机签名.zip', stage)
+        extract_checked(ROOT/'build/MiraDroid-本机签名.zip', stage)
         app = stage/APP_NAME
         verify(app)
         # Packaging never creates/opens a signing keychain. Verify the public
@@ -127,8 +127,8 @@ def main():
         if set(bundle) != allowed:
             raise RuntimeError('Incomplete bundle')
         readme = stage/'安装说明.txt'
-        readme.write_text('桌面微信扫码 '+RELEASE+'\n\n'
-                          '将桌面微信扫码.app拖到应用程序目录。仅支持Apple Silicon、macOS 14.4+。\n'
+        readme.write_text('MiraDroid '+RELEASE+'\n\n'
+                          '将MiraDroid.app拖到应用程序目录。仅支持Apple Silicon、macOS 14.4+。\n'
                           '预览版：Android 16目标环境；无线配对和应用独立窗口有设备兼容性限制。\n'
                           '已内置开源ADB，无需额外安装。无线连接需在手机允许配对，配对码只填入App。\n'
                           '配对会保留此Mac的调试信任，断开App不会撤销。请在手机无线调试的已配对设备中忘记此Mac以撤销。\n\n'
@@ -147,7 +147,7 @@ def main():
         (stage/'Applications').symlink_to('/Applications', target_is_directory=True)
         dmg = OUT/(STEM+'.dmg')
         subprocess.run(['hdiutil', 'create', '-srcfolder', str(stage), '-volname',
-                        '桌面微信扫码', '-format', 'UDZO', str(dmg)], check=True)
+                        'MiraDroid', '-format', 'UDZO', str(dmg)], check=True)
         subprocess.run(['hdiutil', 'verify', str(dmg)], check=True)
         mounted = temp/'mounted'; mounted.mkdir()
         subprocess.run(['hdiutil', 'attach', '-readonly', '-nobrowse', '-mountpoint', str(mounted), str(dmg)], check=True)

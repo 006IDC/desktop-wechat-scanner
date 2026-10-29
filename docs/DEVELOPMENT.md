@@ -80,7 +80,7 @@ Android 16 的 scrcpy 二次 AUTO_MIRROR 输出属于默认显示组，真机上
 
 ## 本机稳定开发签名
 
-`python3 scripts/build_app.py` 默认使用项目稳定本机身份，生成 `build/桌面微信扫码-本机签名.zip`；旧命令 `--local-signing` 等效。`--ad-hoc` 只生成独立的 `build/桌面微信扫码-ad-hoc.zip` 测试包，不能与 `--install` 同用。首次签名会创建项目 `.local/signing/identity` 内的身份，后续严格核对同一证书指纹。目录与秘密不入仓，不使用钥匙串 CLI，不修改默认/搜索钥匙串、系统信任或 TCC。私钥丢失时不能自动换身份冒充原应用。自签并不提供 Developer ID 或 Apple 公证。
+`python3 scripts/build_app.py` 默认使用项目稳定本机身份，生成 `build/MiraDroid-本机签名.zip`；旧命令 `--local-signing` 等效。`--ad-hoc` 只生成独立的 `build/MiraDroid-ad-hoc.zip` 测试包，不能与 `--install` 同用。首次签名会创建项目 `.local/signing/identity` 内的身份，后续严格核对同一证书指纹。目录与秘密不入仓，不使用钥匙串 CLI，不修改默认/搜索钥匙串、系统信任或 TCC。私钥丢失时不能自动换身份冒充原应用。自签并不提供 Developer ID 或 Apple 公证。
 
 `python3 -m unittest discover -s tests -p test_local_signing.py` 默认只运行临时夹具的签名元数据单元测试。需要显式验证持久身份签署合成应用时，设置 `RUN_LOCAL_SIGNING_INTEGRATION=1` 再运行同一命令；该集成测试会访问项目本机签名身份并调用 `codesign`，不会安装应用。
 
@@ -114,7 +114,7 @@ swiftc -swift-version 5 -warnings-as-errors -target arm64-apple-macos14.4 -parse
 ```sh
 swiftc -swift-version 5 -warnings-as-errors -O -target arm64-apple-macos14.4 -parse-as-library -module-cache-path .local/swift-cache $(rg --files mac -g '*.swift' | rg -v 'mac/main.swift$') tests/CameraFramePipeline.swift tests/WirelessCameraPerformanceTests.swift -o .local/wireless-camera-performance
 .local/wireless-camera-performance --selftest
-.local/wireless-camera-performance --run-device-test --resources '/准确安装路径/桌面微信扫码.app/Contents/Resources'
+.local/wireless-camera-performance --run-device-test --resources '/准确安装路径/MiraDroid.app/Contents/Resources'
 ```
 
 `--selftest` 只验证合成图像格式、尺寸和 QR 内容，不连接设备。设备测试输出 JSON，须检查 `ok`、`qrMatched`、`phoneCleanupOK` 和 `wirelessDisconnectOK`，不能仅凭退出码认定通过。各段 ACK/FPS/手机处理耗时是真正分段数值；镜像 `RollingWindow` p95 是最近样本窗口，只作上下文，不能直接比较各段。此对比不含图像编码、Mac 采集和窗口绘制耗时，不代表完整产品体验。
@@ -430,3 +430,10 @@ M4/M5/M6立即退出模式有效呈现1/1/0次，不当作持续呈现验收。M
 这些后台测试不能证明第三款真实 App 接受虚拟设备或性能改善。已安装 build41 保持不变，录屏授权不重置，未运行新的手机 App 或发布 Release；需要对通用路径另做真实 App 兼容与耗时验收。
 
 本轮后台验证：上述 JVM 与 Swift 通用协议/路由测试、原 PhoneCameraState 路由回归、CameraPumpMailbox 旧帧/并发回归、隐藏 LocalScanFrame 透明与控制回归、DetachedApplications 假手机生命周期回归均通过；全量 Swift warnings-as-errors 优化编译/链接、Android Java/DEX/测试 APK 构建及测试签名校验通过。独立只读复核发现并修复“legacy 关闭独立窗口误撤兼容授权”的回归，新增 disabled/共享引用/最后引用/重试策略测试后复查未发现遗留问题。未运行测试 APK、候选 App 或手机扫码。
+
+
+## MiraDroid 更名（2026-10-29）
+
+用户指定改用英文名，本轮采用 MiraDroid，候选 build43。仅更新菜单/关于、CFBundleName/DisplayName、构建 App/ZIP、后续发行命名与使用文档。CFBundleIdentifier 仍为 `com.idc006.DesktopWeChatScanner`，可执行文件名、持续签名身份、原有偏好/恢复路径及 GitHub 仓库地址保留；不自动替换当前安装或修改 TCC。NOTICE 保留原名出处及原有版权信息，旧发行与历史记录不改名。
+
+更名前 build42 源码4b020d6已签名打包，包内源码与 Android JAR 逐字节核对，签名要求与已安装版一致。经机主允许，界面勾选通用桌面相机并通过 USB 连接，握手、实际应用目录展示和正常断开通过；之后截图接口返回 ScreenCaptureKit -3811 捕获错误，未继续操作第三款 App，不能记为第三方扫码或耗时通过。已从界面断开并退出候选；未修改录屏权限。
