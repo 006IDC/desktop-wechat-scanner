@@ -1063,6 +1063,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard connected,!stopping,mirrorGeneration==connectionGeneration else{throw CancellationError()}
         }
         if CommandLine.arguments.contains("--diagnostic-navigation-probe") {
+            // Exclude the first empty decoder frame after launching an activity.
+            try await Task.sleep(nanoseconds:2_000_000_000)
             let deadline=ProcessInfo.processInfo.systemUptime+3
             while ProcessInfo.processInfo.systemUptime<deadline {
                 try checkNavigation()
@@ -1075,7 +1077,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         var result:[String:Any]=["width":CVPixelBufferGetWidth(pixels),"height":CVPixelBufferGetHeight(pixels),
                             "pixelFormat":CVPixelBufferGetPixelFormatType(pixels)]
                         let known:Set<String>=["微信","通讯录","发现","我","首页","消息","理财","生活","我的","扫一扫","收付款","收付钱"]
-                        if CVPixelBufferLockBaseAddress(pixels,.readOnly)==kCVReturnSuccess {
+                        if CVPixelBufferGetPixelFormatType(pixels)==kCVPixelFormatType_32BGRA,
+                           CVPixelBufferLockBaseAddress(pixels,.readOnly)==kCVReturnSuccess {
                             defer {CVPixelBufferUnlockBaseAddress(pixels,.readOnly)}
                             if let bytes=CVPixelBufferGetBaseAddress(pixels)?.assumingMemoryBound(to:UInt8.self) {
                                 var darkest=255,lightest=0,nonWhite=0,count=0
@@ -1103,6 +1106,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 return known.contains(value) ? value:nil
                             })
                             result[name]=["wordCount":words.count,"knownLabels":labels.sorted()]
+                        }
+                        let image=CIImage(cvPixelBuffer:pixels)
+                        if let cg=CIContext(options:[.cacheIntermediates:false]).createCGImage(image,from:image.extent) {
+                            let request=VNRecognizeTextRequest();request.recognitionLevel = .accurate
+                            request.recognitionLanguages=["zh-Hans","en-US"]
+                            try VNImageRequestHandler(cgImage:cg).perform([request])
+                            let words=(request.results ?? []).compactMap{$0.topCandidates(1).first?.string}
+                            let labels=Set(words.compactMap { word -> String? in
+                                let value=word.replacingOccurrences(of:" ",with:"")
+                                if ScannerNavigationOCR.isWechatTitle(value) {return "微信"}
+                                return known.contains(value) ? value:nil
+                            })
+                            result["materialized"]= ["wordCount":words.count,"knownLabels":labels.sorted()]
                         }
                         let words=try ScannerNavigationOCR.recognize(pixels)
                         result["plusLocated"]=try ScannerNavigationOCR.plusButton(in:pixels,homeWords:words) != nil
