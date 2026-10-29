@@ -765,7 +765,7 @@ Mailbox与生命周期合成回归通过，新增同代prelaunch旧帧必须等�
 
 运行源码`8b41393ae769980d0d79b8f7b42d5a4f99aecd8e`，包`build/MiraDroid-0.4.0-build58-8b41393-arm64.zip`，SHA256 `9ccbef3bd15b1e62701db04bd3de05ea21aec5239d97e11465ddb44788f06186`；源码/JAR/strict-deep签名及同designated requirement回读通过，安装版41未替换，未重置录屏授权。
 
-首个双App轮在微信launch阶段失败，未进入导航/采集；后续不录屏的同源客户端单独复核有两次not_arrived（入口核验4.86/3.37ms，任务已在target，前台仍判other，listener却报requested），均正常恢复清理。不能将它归因于新package query、二维码或已证实为解析错误。后来结构观察连续三轮启动通过（约267.1/254.3/243.6ms、入口核验3.85/3.50/3.08ms），top记录对应target，未再复现该矛盾；三次成功不能清掉前两次失败。记录只有固定类别/计数/布尔，无组件正文、任务ID或手机像素。
+首个双App轮在微信launch阶段失败，未进入导航/采集；后续不录屏的同源客户端单独复核有两次not_arrived（入口核验4.86/3.37ms，任务已在target，启动循环前台判other；异常补偿后另读listener报requested（非原子、非同一时刻，不能据此认定解析错）），均正常恢复清理。不能将它归因于新package query、二维码或已证实为解析错误。后来结构观察连续三轮启动通过（约267.1/254.3/243.6ms、入口核验3.85/3.50/3.08ms），top记录对应target，未再复现该矛盾；三次成功不能清掉前两次失败。记录只有固定类别/计数/布尔，无组件正文、任务ID或手机像素。
 
 同客户端配旧build57服务，显式capability回退为false，旧空body全目录核验31.72ms、启动通过约840.7ms，任务/前台对应且清理成功；此跨轮总耗时不作新旧整体A/B。随后同一最终包双App第二轮均严格识码并清理，现有录屏权限true、activationRequested=false、前后台标识前后相同：
 
@@ -775,3 +775,14 @@ Mailbox与生命周期合成回归通过，新增同代prelaunch旧帧必须等�
 |支付宝|2.50|815.01|395.80|2587.30|2302.85|
 
 两次scoped=true、scan tap均仅1次，源码、实际发送、原生文字结果严格匹配，均核known-scanner/target owner/1 stream。这里只验后台生产组件，未构造AppController或测物理拖动/前台动画，不称视频同等效果。Android官方[am start -W](https://developer.android.com/tools/adb)等待路径也仅做隐藏启动探针：微信启动通过804.0ms，其中该shell约52.3ms，不能据一轮认定它更快或解决首轮失败，产品尚未采用。
+
+
+### 原生任务放置探针的有效范围
+
+隐藏探针保留初始任务归属/恢复记录与canonical launcher校验，仅临时跳过显式move-stack，观察am start --display是否把已记录任务放到目标屏；同ID任务需通过逐root到达验证，原任务完全消失不计已迁移。微信/支付宝启动与清理均通过（约263.4/779.6ms），但movingRoots/expectedTasks都是0，没有真实迁移对照，不能据此称少了迁移开销或原生路线更快；产品原迁移流程不改。这些探针只在自有显示执行App操作，输出固定元数据，不录屏/不注入Mac输入/不改权限。
+
+## 启动分段与失败阶段保留（build59，2026-10-30，验证中）
+
+为解释同一App为何有200–800ms跨度，按PhoneSession actor内部实际同步步骤记录access、catalog、bind、初始任务读取、恢复写入、显式迁移、am start、确认任务读取及sleep；movingRoots/movingTasks/confirmationReads为次数，其余带Milliseconds键为耗时。total包含失败后的绑定补偿，confirmed仅表最终前台任务确认，不代表首像素、实际输入或任意App兼容。闭包rethrows、执行顺序/次数/原任务快照与所有归属条件不变；计时defer覆盖抛错路径。仅固定数字，实际任务dump/组件/账号/页面不导出。后台launch失败也保留已完成的validation、部分时序、原有固定任务计数及枚举错误类型，避免“backend”抹掉失败发生在哪一步。
+
+为避免将补偿后的系统状态当成失败现场，同一失败前task dump额外只记录foreground所带task tag能否在解析树找到、属于target还是其他display，以及包名一致是否已确认（0包括未知，不能解读为明确不一致）；不输出tag/组件本身、不参与放行。foreground选择顺序完全保留原实现，tag缺失/越界仅记未知；合成测试覆盖显示器范围、原选择不变、tag损坏和URL拒绝。不能靠这项补充宣称已修复前台判断。

@@ -253,6 +253,12 @@ actor PhoneSession {
     private var packageLauncherQuerySupported=false
     private(set) var lastLauncherValidationMilliseconds:Double?
     private(set) var lastLauncherQueryScoped:Bool?
+    private(set) var lastLaunchStages:[String:Double]=[:]
+    private func measureLaunch<T>(_ stage:String,_ operation:() throws ->T) rethrows ->T {
+        let began=ProcessInfo.processInfo.systemUptime
+        defer{lastLaunchStages[stage,default:0]+=(ProcessInfo.processInfo.systemUptime-began)*1000}
+        return try operation()
+    }
     // Canned placement counts only; no component names, IDs, extras or page text.
     private(set) var lastApplicationLaunchEvidence:[String:Int]?
     private var cleaning=false
@@ -529,7 +535,12 @@ actor PhoneSession {
         return Self.foregroundComponent(in:dump,display:target)
     }
     static func foregroundComponent(in dump:String,display:Int) -> String? {
-        var current:Int?, resumed:String?
+        foregroundObservation(in:dump,display:display)?.component
+    }
+    /// Preserve the existing foreground choice; the task tag is observation
+    /// only and never changes launch admission or ownership.
+    static func foregroundObservation(in dump:String,display:Int)->(component:String,taskID:Int?)? {
+        var current:Int?,resumed:(component:String,taskID:Int?)?
         for raw in dump.split(separator:"\n") {
             let line=raw.trimmingCharacters(in:.whitespaces)
             if line.hasPrefix("Display #") {
@@ -537,7 +548,9 @@ actor PhoneSession {
             } else if current==display && (line.contains("topResumedActivity=") || line.contains("mResumedActivity:")) {
                 let fields=line.split(whereSeparator:{$0==" " || $0=="\t" || $0=="}"})
                 if let component=fields.first(where:{$0.contains("/") && !$0.contains("://")}) {
-                    resumed=String(component)
+                    let taskID=fields.first(where:{$0.hasPrefix("t") && Int($0.dropFirst()) != nil})
+                        .flatMap{Int($0.dropFirst())}.flatMap{(1...Int(Int32.max)).contains($0) ? $0:nil}
+                    resumed=(String(component),taskID)
                 }
             }
         }
@@ -690,19 +703,24 @@ actor PhoneSession {
     func launchApplication(_ app: AndroidApplication, on target: Int) throws -> Bool {
         lastApplicationLaunchEvidence=nil
         lastLauncherValidationMilliseconds=nil;lastLauncherQueryScoped=nil
+        lastLaunchStages=[:]
+        let launchBegan=ProcessInfo.processInfo.systemUptime
+        defer{lastLaunchStages["totalMilliseconds"]=(ProcessInfo.processInfo.systemUptime-launchBegan)*1000}
         guard let state = recovery, channel != nil, ownsDisplay(target), app.isValid else { throw ScanError("应用或屏幕不属于本次连接。") }
-        try requireApplicationAccess(on:target)
+        try measureLaunch("accessMilliseconds"){try requireApplicationAccess(on:target)}
         // Revalidate against the authenticated launcher catalog, never execute an arbitrary component.
         guard let channel else{throw ScanError("手机未连接。")}
         let validationBegan=ProcessInfo.processInfo.systemUptime
-        let entries=try catalog(channel,package:app.packageName)
+        let entries=try measureLaunch("catalogMilliseconds"){try catalog(channel,package:app.packageName)}
         lastLauncherValidationMilliseconds=(ProcessInfo.processInfo.systemUptime-validationBegan)*1000
         lastLauncherQueryScoped=packageLauncherQuerySupported
         guard entries.contains(where:{$0.canonicalComponent==app.canonicalComponent}) else{throw ScanError("手机主用户中未找到此应用入口。")}
-        return try DesktopCameraLaunch.perform(bind:{try self.bindDesktopCamera(display:target,package:app.packageName)},launch:{
-            let before = try tasks(requiredDisplay: target)
+        return try DesktopCameraLaunch.perform(bind:{try self.measureLaunch("bindMilliseconds"){try self.bindDesktopCamera(display:target,package:app.packageName)}},launch:{
+            let before = try measureLaunch("initialTaskSnapshotMilliseconds"){try tasks(requiredDisplay:target)}
             let moving = before.filter { $0.userID == 0 && $0.packageName == app.packageName && $0.display != target }
             let groups = Dictionary(grouping: moving, by: \.rootID)
+            lastLaunchStages["movingRoots"]=Double(groups.count)
+            lastLaunchStages["movingTasks"]=Double(moving.count)
             for root in groups.keys {
                 guard before.filter({ $0.rootID == root }).allSatisfy({ $0.userID == 0 && !$0.rootContainsOtherUsers && $0.packageName == app.packageName && $0.display != target }) else {
                     throw ScanError("此应用与其他应用共享任务容器，无法安全地单独移入窗口。")
@@ -716,35 +734,42 @@ actor PhoneSession {
                     recovery?.appTasks?[index] = AndroidOwnedTask(id: old.id, originalDisplay: old.originalDisplay, packageName: old.packageName, ownedDisplay: target)
                 }
             }
-            try save()
+            try measureLaunch("recoverySaveMilliseconds"){try save()}
             for root in groups.keys.sorted() {
                 guard let group = groups[root] else { continue }
-                try moveTasks(group,to:target)
+                try measureLaunch("moveMilliseconds"){try moveTasks(group,to:target)}
             }
-            let result = try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")
+            let result = try measureLaunch("startCommandMilliseconds"){try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")}
             guard !result.lowercased().contains("error:"), !result.lowercased().contains("exception") else { throw ScanError("手机应用启动失败。") }
             for _ in 0..<8 {
-                let activityDump = try shell("dumpsys activity activities")
-                let after = try AndroidTaskSnapshot.parseChecked(activityDump, requiredDisplay: target)
+                lastLaunchStages["confirmationReads",default:0]+=1
+                let (activityDump,after)=try measureLaunch("confirmationSnapshotMilliseconds") {
+                    let dump=try shell("dumpsys activity activities")
+                    return (dump,try AndroidTaskSnapshot.parseChecked(dump,requiredDisplay:target))
+                }
                 for task in after where task.userID == 0 && !task.rootContainsOtherUsers && task.packageName == app.packageName && task.display == target && !(recovery?.appTasks?.contains(where: { $0.id == task.id }) ?? false) {
                     appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: 0, packageName: app.packageName, ownedDisplay: target))
-                    try save()
+                    try measureLaunch("recoverySaveMilliseconds"){try save()}
                 }
-                let foreground=Self.foregroundComponent(in:activityDump,display:target)
+                let observation=Self.foregroundObservation(in:activityDump,display:target),foreground=observation?.component
+                let foregroundTask=observation.flatMap{row in row.taskID.flatMap{id in after.first(where:{$0.id==id})}}
                 lastApplicationLaunchEvidence=[
                     "foregroundKind":foreground.map{$0.hasPrefix(app.packageName+"/") ? 1:2} ?? 0,
+                    "foregroundTaskPlacementKind":foregroundTask.map{$0.display==target ? 1:2} ?? 0,
+                    "foregroundTaskPackageAgreementConfirmed":foregroundTask.map{task in foreground?.hasPrefix(task.packageName+"/")==true ? 1:0} ?? 0,
                     "targetTaskCount":after.filter{$0.display==target}.count,
                     "requestedTasksOnTarget":after.filter{$0.display==target && $0.userID==0 && $0.packageName==app.packageName}.count,
                     "requestedTasksElsewhere":after.filter{$0.display != target && $0.userID==0 && $0.packageName==app.packageName}.count,
                     "otherUserTasksOnTarget":after.filter{$0.display==target && ($0.userID != 0 || $0.rootContainsOtherUsers)}.count]
                 if foreground?.hasPrefix(app.packageName+"/")==true {
+                    lastLaunchStages["confirmed"]=1
                     lastApplicationLaunchEvidence=nil
                     return
                 }
-                Thread.sleep(forTimeInterval: 0.2)
+                measureLaunch("confirmationSleepMilliseconds"){Thread.sleep(forTimeInterval:0.2)}
             }
             throw ScanError("应用未出现在指定屏幕；已保留恢复记录。")
-        },clear:{_ = try self.bindDesktopCamera(display:target,package:nil)})
+        },clear:{_ = try self.measureLaunch("compensationMilliseconds"){try self.bindDesktopCamera(display:target,package:nil)}})
     }
     private func restoreTasks(on target: Int) throws {
         let snapshot = try tasks(requiredDisplay: target)

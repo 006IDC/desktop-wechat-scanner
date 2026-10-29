@@ -277,6 +277,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     item["launchConfirmedMilliseconds"]=(now-launch)*1000
                     item["launcherValidationMilliseconds"]=await phone.lastLauncherValidationMilliseconds
                     item["launcherQueryScoped"]=await phone.lastLauncherQueryScoped
+                    item["launchStages"]=await phone.lastLaunchStages
                     stage="navigate"
                     let tap=try await navigate(phone:phone,mirror:stream,frames:frames,package:package,display:display,evidence:&item)
                     if let tap {
@@ -438,6 +439,14 @@ private final class BackgroundScanResult:@unchecked Sendable {
                         try await Task.sleep(nanoseconds:250_000_000)
                     }
                 } catch {
+                    if stage=="launch" {
+                        item["launcherValidationMilliseconds"]=await phone.lastLauncherValidationMilliseconds
+                        item["launcherQueryScoped"]=await phone.lastLauncherQueryScoped
+                        item["launchStages"]=await phone.lastLaunchStages
+                        item["launchPlacement"]=await phone.lastApplicationLaunchEvidence
+                        if let validation=error as? AndroidTaskSnapshot.ValidationError {item["launchFailureKind"]="task_"+validation.reason.rawValue}
+                        else if let scan=error as? ScanError,scan.message=="应用未出现在指定屏幕；已保留恢复记录。" {item["launchFailureKind"]="not_arrived"}
+                    }
                     item["failureStage"]=stage;item["failureCode"]=(error as? Failure)?.rawValue ?? "backend"
                     items.append(item);throw error
                 }
