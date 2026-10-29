@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import CoreVideo
+import Vision
 
 private final class BackgroundScanFrames:@unchecked Sendable {
     struct Frame:@unchecked Sendable {let pixels:CVPixelBuffer;let sequence:Int;let receivedAt:Double}
@@ -16,8 +17,22 @@ private final class BackgroundScanFrames:@unchecked Sendable {
 private final class BackgroundScanResult:@unchecked Sendable {
     private let lock=NSLock()
     private var result:(received:Double,observed:Double)?
+    private var checks=0,prefixSeen=false,bestDistance:Int?
     func found(received:Double){lock.withLock{if result==nil {result=(received,ProcessInfo.processInfo.systemUptime)}}}
     func snapshot()->(received:Double,observed:Double)? {lock.withLock{result}}
+    func diagnostics()->[String:Any] {lock.withLock {
+        var value:[String:Any]=["resultOCRChecks":checks,"ownResultPrefixSeen":prefixSeen]
+        if let bestDistance {value["bestResultEditDistance"]=bestDistance};return value
+    }}
+    private static func distance(_ input:String,_ expected:String)->Int {
+        let a=Array(input),b=Array(expected);var row=Array(0...b.count)
+        for (i,x) in a.enumerated() {
+            var next=[i+1]+Array(repeating:0,count:b.count)
+            for (j,y) in b.enumerated(){next[j+1]=min(row[j+1]+1,next[j]+1,row[j]+(x==y ? 0:1))}
+            row=next
+        }
+        return row.last!
+    }
     /// Identical observation cadence in both supply groups. Vision work does
     /// not block or run more frequently merely because supply is faster.
     func observe(frames:BackgroundScanFrames,payload:String,after shown:Double,until deadline:Double)->Task<Void,Never> {
@@ -26,8 +41,18 @@ private final class BackgroundScanResult:@unchecked Sendable {
             while !Task.isCancelled,ProcessInfo.processInfo.systemUptime<deadline,frames.available.isAvailable {
                 if let frame=frames.latest(),frame.sequence>sequence,frame.receivedAt>=shown {
                     sequence=frame.sequence
-                    let found=(try? ScannerNavigationOCR.recognize(frame.pixels).contains{$0.value.replacingOccurrences(of:" ",with:"").contains(payload)}) ?? false
-                    if found,!Task.isCancelled {self.found(received:frame.receivedAt);return}
+                    let words=(try? ScannerNavigationOCR.recognize(frame.pixels)) ?? []
+                    let normalized=words.map{$0.value.filter{!$0.isWhitespace}}
+                    // Vision may split a single synthetic token into words.
+                    // Exact matching remains required; no fuzzy match is a pass.
+                    let found=normalized.joined().contains(payload)
+                    let candidates=normalized.filter{$0.contains("006IDC") && $0.count<=64}
+                    let distance=candidates.map{Self.distance($0,payload)}.min()
+                    self.lock.withLock {
+                        self.checks+=1;self.prefixSeen = self.prefixSeen || !candidates.isEmpty
+                        if let distance {self.bestDistance=min(self.bestDistance ?? distance,distance)}
+                    }
+                    if found,!Task.isCancelled,ProcessInfo.processInfo.systemUptime<=deadline {self.found(received:frame.receivedAt);return}
                 }
                 try? await Task.sleep(nanoseconds:125_000_000)
             }
@@ -202,6 +227,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     var costs=[Double](),captures=[Double](),startTimes=[Double]()
                     var resultFrameTime:Double?
                     let result=BackgroundScanResult()
+                    var verifiedQRAt:Double?
                     stage="capture-send-recognize"
                     while now<until {
                         let iteration=now
@@ -216,19 +242,35 @@ private final class BackgroundScanResult:@unchecked Sendable {
                         do {
                             let begin=now,image=try await capture.capture(selection.target,maximumDimension:720)
                             captures.append((now-begin)*1000)
+                            if qrShownAt != nil,verifiedQRAt==nil {
+                                // Diagnostic fixture validity only. Production
+                                // generic camera delivery never decodes QR data.
+                                let matches=try await Task.detached(priority:.userInitiated) {
+                                    let request=VNDetectBarcodesRequest();request.symbologies=[.qr]
+                                    try VNImageRequestHandler(data:image).perform([request])
+                                    return request.results?.contains{$0.payloadStringValue==payload} ?? false
+                                }.value
+                                if !matches {continue};verifiedQRAt=now
+                            }
                             let receipt=try await phone.frame(image,epoch:epoch,selectedAt:target.selectedAt,isCurrent:{pump.isCurrent(selection) && pump.captureReady(at:ProcessInfo.processInfo.systemUptime)})
                             costs.append(receipt.requestMilliseconds);sent+=1;startTimes.append(iteration)
                             if firstACK==nil {firstACK=now;if let tap {item["scanTapToFirstACKMilliseconds"]=(now-tap)*1000}}
                             if qrShownAt != nil,firstQRACK==nil {firstQRACK=now}
                         } catch is DesktopCaptureTransientError {item["captureTransientOccurred"]=true}
                         catch is CameraFrameExpiredError {item["expiredFrameOccurred"]=true}
-                        if let qrShownAt,let match=result.snapshot() {
+                        if let qrShownAt,let match=result.snapshot(),match.observed<=until,now<=until {
                             recognized=true;resultFrameTime=match.received;item["qrShownToResultDecodedMilliseconds"]=(match.received-qrShownAt)*1000
                             item["qrShownToResultObservedMilliseconds"]=(match.observed-qrShownAt)*1000;break
                         }
                         let rest=max(0,1/cadence-(now-iteration));if rest>0 {try await Task.sleep(nanoseconds:UInt64(rest*1_000_000_000))}
                     }
                     recognitionTask?.cancel();await recognitionTask?.value;recognitionTask=nil
+                    item.merge(result.diagnostics()){_,new in new}
+                    item["capturedExpectedQRConfirmed"] = verifiedQRAt != nil
+                    if let qrShownAt,let verifiedQRAt {item["qrShownToSourceVerifiedMilliseconds"]=(verifiedQRAt-qrShownAt)*1000}
+                    let finalState=try await phone.cameraState()
+                    item["activeStreamsAtResultCheck"]=finalState.activeStreams
+                    item["targetActivityAtResultCheck"]=finalState.activities.contains{$0.displayId==display && $0.package==package}
                     pump.stop();try await phone.clear(epoch:epoch+20,requireConnection:true)
                     item["recognized"]=recognized;item["sentFrames"]=sent
                     item["requestMilliseconds"]=percentiles(costs);item["captureMilliseconds"]=percentiles(captures)
