@@ -46,17 +46,23 @@ final class MirrorSession:@unchecked Sendable {
     struct Callbacks {let frame:@Sendable(CVPixelBuffer)->Void;let failure:@Sendable(String)->Void}
     private let lock=NSLock()
     private var callbacks=[Callbacks](),events=[String]()
+    private var initialFrame:CVPixelBuffer?
     static var created=[MirrorSession]()
     init(){Self.created.append(self)}
     var callbackCount:Int {lock.withLock{callbacks.count}}
     var input:[String]{lock.withLock{events}}
+    func setInitialFrame(_ pixels:CVPixelBuffer){lock.withLock{initialFrame=pixels}}
     func touch(action:UInt8,x:Double,y:Double){lock.withLock{events.append("touch\(action)")}}
     func tap(x:Double,y:Double){lock.withLock{events.append("tap")}}
     func swipe(x1:Double,y1:Double,x2:Double,y2:Double){lock.withLock{events.append("swipe")}}
     func key(_ value:Int){lock.withLock{events.append("key\(value)")}}
     func startVideo(adbURL:URL,serverURL:URL,serial:String,displayID:Int,serverSocket:String?,direct:DirectMirrorDescriptor?,
                     onFrame:@escaping @Sendable(CVPixelBuffer)->Void,onFailure:@escaping @Sendable(String)->Void) async throws {
-        lock.withLock{callbacks.append(Callbacks(frame:onFrame,failure:onFailure))}
+        let first=lock.withLock {() -> CVPixelBuffer? in
+            callbacks.append(Callbacks(frame:onFrame,failure:onFailure))
+            defer{initialFrame=nil};return initialFrame
+        }
+        if let first {onFrame(first)}
         try Task.checkCancellation()
     }
     func emit(_ index:Int,pixels:CVPixelBuffer){let f=lock.withLock{callbacks[index].frame};f(pixels)}
@@ -102,8 +108,13 @@ final class MirrorSession:@unchecked Sendable {
     static func pixels(_ width:Int)->CVPixelBuffer {
         var p:CVPixelBuffer?;precondition(CVPixelBufferCreate(nil,width,16,kCVPixelFormatType_32BGRA,nil,&p)==kCVReturnSuccess);return p!
     }
-    @MainActor static func manager(_ phone:PhoneSession)->DetachedApplications {
-        DetachedApplications(phone:phone,adb:URL(fileURLWithPath:"/synthetic/adb"),server:URL(fileURLWithPath:"/synthetic/server"))
+    @MainActor static func manager(_ phone:PhoneSession,timeout:TimeInterval=1)->DetachedApplications {
+        DetachedApplications(phone:phone,adb:URL(fileURLWithPath:"/synthetic/adb"),server:URL(fileURLWithPath:"/synthetic/server"),frameTimeout:timeout)
+    }
+    @MainActor static func ready(_ manager:DetachedApplications,_ phone:PhoneSession,_ mirror:MirrorSession,index:Int=0) async throws {
+        try await until{await phone.launchEntered>=index+1 && mirror.callbackCount>index}
+        mirror.emit(index,pixels:pixels(16));manager.present()
+        try await until{manager.cameraWindows().count==1}
     }
     @MainActor static func rejectedInputs(_ ui:ControlWindowController,_ mirror:MirrorSession){
         let before=mirror.input.count
@@ -155,14 +166,15 @@ final class MirrorSession:@unchecked Sendable {
         require(countBefore==1 && unavailableCalls==1,"Retry bypassed pending camera clear")
         require(await p.closed.isEmpty,"Display closed before camera clear")
         gate.release(true)
-        try await until{mirror.callbackCount==2 && m.cameraWindows().count==1}
+        try await until{await p.launchEntered==2 && mirror.callbackCount==2}
         require(ControlWindowController.created.last === ui,"Retry replaced the Mac window")
         let retriedCreated=await p.created,retriedClosed=await p.closed
         require(retriedCreated.count==2 && retriedClosed==[7],"Retry did not serialize old disposal/new display")
         mirror.emit(0,pixels:old);mirror.fail(0);m.present()
         try await Task.sleep(nanoseconds:15_000_000)
-        require(m.cameraWindows().count==1 && ui.lastWidth==0,"Old callback contaminated retry")
-        mirror.emit(1,pixels:image);m.present();require(ui.lastWidth==16,"New attempt did not present")
+        require(m.cameraWindows().isEmpty && ui.lastWidth==0,"Old callback confirmed readiness or contaminated retry")
+        mirror.emit(1,pixels:image);m.present();try await until{m.cameraWindows().count==1}
+        require(ui.lastWidth==16,"New attempt did not present")
         require(readyCallbacks==2,"Retry did not notify exactly once")
         let n=mirror.input.count;ui.onTap?(0.5,0.5);ui.onSwipe?(0,0,1,1);ui.onBack?()
         require(mirror.input.count==n+3,"Ready input did not resume")
@@ -189,7 +201,7 @@ final class MirrorSession:@unchecked Sendable {
         let fu=ControlWindowController.created.last!
         try await until{fu.status=="应用打开失败"}
         await failed.configure();require(fm.open(app,at:nil),"Failed entry could not retry")
-        try await until{fm.cameraWindows().count==1}
+        try await ready(fm,failed,MirrorSession.created.last!)
         require(ControlWindowController.created.last === fu,"Failure retry allocated another Mac window")
         require(await failed.createEntered==2,"Failure retry did not launch again")
         await fm.stop()
@@ -206,7 +218,7 @@ final class MirrorSession:@unchecked Sendable {
         um.onCameraCleanupFailure={_ in alarms+=1};um.onCameraUnavailable={_ in Task{false}}
         require(um.open(app,at:nil),"Uncertain fixture rejected")
         let uu=ControlWindowController.created.last!,uv=MirrorSession.created.last!
-        try await until{um.cameraWindows().count==1};uv.fail(0)
+        try await ready(um,uncertain,uv);uv.fail(0)
         try await until{alarms==1};rejectedInputs(uu,uv)
         require(await uncertain.closed.isEmpty,"Unconfirmed camera cleanup lost display ownership")
         require(!um.open(app,at:nil),"Uncertain camera permitted local retry")
@@ -225,11 +237,11 @@ final class MirrorSession:@unchecked Sendable {
         let restore=PhoneSession(),rm=manager(restore)
         require(rm.open(app,at:nil),"Restore fixture rejected")
         let ru=ControlWindowController.created.last!,rv=MirrorSession.created.last!
-        try await until{rm.cameraWindows().count==1};await restore.configure(failClose:true);rv.fail(0)
+        try await ready(rm,restore,rv);await restore.configure(failClose:true);rv.fail(0)
         try await until{ru.status=="旧窗口清理未完成"}
         require(await restore.created.count==1,"Restore failure allocated another display")
         await restore.configure();require(rm.open(app,at:nil),"Cleanup retry rejected")
-        try await until{rm.cameraWindows().count==1}
+        try await ready(rm,restore,rv,index:1)
         let restoredClosed=await restore.closed,restoredCreated=await restore.created
         require(restoredClosed==[7] && restoredCreated.count==2,"Cleanup retry did not preserve ownership")
         await rm.stop()
@@ -238,12 +250,36 @@ final class MirrorSession:@unchecked Sendable {
         let stopPhone=PhoneSession(),sm=manager(stopPhone),stopGate=ClearGate()
         sm.onCameraUnavailable={_ in Task{await stopGate.wait()}}
         require(sm.open(app,at:nil),"Stop fixture rejected")
-        let sv=MirrorSession.created.last!;try await until{sm.cameraWindows().count==1};sv.fail(0)
+        let sv=MirrorSession.created.last!;try await ready(sm,stopPhone,sv);sv.fail(0)
         try await until{stopGate.entered};require(sm.open(app,at:nil),"Queued retry rejected")
         let stopping=Task{await sm.stop()};try await Task.sleep(nanoseconds:10_000_000)
         stopGate.release(true);await stopping.value
         let stoppedCreated=await stopPhone.created,stoppedClosed=await stopPhone.closed
         require(stoppedCreated.count==1 && stoppedClosed.isEmpty,"Stop retried or raced global restoration")
+        // A successful Android launch without a current decoded frame must not
+        // enable controls/camera or leave an indefinitely blank ready window.
+        let silentPhone=PhoneSession(),silent=manager(silentPhone,timeout:0.04)
+        var timedOut=false;silent.onDiagnosticEvent={if $0.failure == .firstFrameTimeout {timedOut=true}}
+        require(silent.open(app,at:nil),"Silent mirror fixture rejected")
+        let silentUI=ControlWindowController.created.last!,silentMirror=MirrorSession.created.last!
+        try await until{await silentPhone.launchEntered==1}
+        require(silent.cameraWindows().isEmpty,"No-frame launch became ready")
+        rejectedInputs(silentUI,silentMirror)
+        try await until{timedOut && silentUI.status=="应用打开失败"}
+        require(await silentPhone.closed==[7],"No-frame timeout leaked its display")
+        await silent.stop()
+        // A frame from the empty display before launch must not prove ready.
+        let prePhone=PhoneSession();await prePhone.configure(holdCreate:true)
+        let pre=manager(prePhone);require(pre.open(app,at:nil),"Prelaunch fixture rejected")
+        let preUI=ControlWindowController.created.last!,preMirror=MirrorSession.created.last!
+        try await until{await prePhone.createEntered==1};preMirror.setInitialFrame(image)
+        await prePhone.releaseCreate();try await until{await prePhone.launchEntered==1}
+        pre.present();try await Task.sleep(nanoseconds:20_000_000)
+        require(pre.cameraWindows().isEmpty,"Same-generation prelaunch frame confirmed readiness")
+        rejectedInputs(preUI,preMirror)
+        preMirror.emit(0,pixels:old);pre.present();try await until{pre.cameraWindows().count==1}
+        require(preUI.lastWidth==32,"Postlaunch frame did not finish readiness")
+        await pre.stop()
         require(ControlWindowController.created.allSatisfy{$0.window?.isVisible==false},"Test exposed a window")
         print("PASS startup input gates, mirror failure retirement, camera-clear barrier, same-window retry, old callback fencing, late creation/launch, uncertain cleanup and stop; fake device, no ordered windows")
     }

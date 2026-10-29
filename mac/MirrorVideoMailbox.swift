@@ -14,12 +14,13 @@ final class MirrorVideoMailbox: @unchecked Sendable {
     private var generation=0
     private var active=false
     private var pending:Frame?
+    private var lastReceivedAt:TimeInterval?
     private var decodedObserver:(id:UUID,receive:@Sendable (CVPixelBuffer)->Void,invalidate:@Sendable ()->Void)?
 
     func reset(generation:Int) {
         lock.lock()
         let invalidate=decodedObserver?.invalidate
-        self.generation=generation;active=true;pending=nil;decodedObserver=nil
+        self.generation=generation;active=true;pending=nil;lastReceivedAt=nil;decodedObserver=nil
         lock.unlock();invalidate?()
     }
 
@@ -28,6 +29,7 @@ final class MirrorVideoMailbox: @unchecked Sendable {
         guard active,self.generation==generation else{lock.unlock();return}
         pending=Frame(pixelBuffer:pixelBuffer,generation:generation,
                       receivedAt:ProcessInfo.processInfo.systemUptime)
+        lastReceivedAt=pending?.receivedAt
         let observer=decodedObserver?.receive
         lock.unlock()
         // Never execute a consumer while holding the mailbox lock. The native
@@ -59,6 +61,12 @@ final class MirrorVideoMailbox: @unchecked Sendable {
         let frame=pending;pending=nil
         return frame
     }
+    /// Survives taking the latest frame, but never a reset or stop. Readiness
+    /// can require a decoded frame from the current launch instead of a blank
+    /// frame that arrived while the virtual display was still empty.
+    func receivedFrame(generation:Int,since time:TimeInterval)->Bool {
+        lock.withLock{active && self.generation==generation && lastReceivedAt.map{$0>=time}==true}
+    }
 
     func stop() {
         stop(ifGeneration:nil)
@@ -70,7 +78,7 @@ final class MirrorVideoMailbox: @unchecked Sendable {
         lock.lock()
         guard expected==nil || generation==expected else{lock.unlock();return}
         let invalidate=decodedObserver?.invalidate
-        active=false;pending=nil;decodedObserver=nil
+        active=false;pending=nil;lastReceivedAt=nil;decodedObserver=nil
         lock.unlock();invalidate?()
     }
 }

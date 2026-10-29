@@ -26,13 +26,18 @@ import Dispatch
         require(newest?.generation==1,"Frame generation changed")
         require(newest!.receivedAt>=before && newest!.receivedAt<=after,"Arrival timestamp invalid")
         require(mailbox.takeLatest()==nil,"Mailbox retained a backlog")
+        require(mailbox.receivedFrame(generation:1,since:before),"Taking a frame erased readiness")
+        require(!mailbox.receivedFrame(generation:1,since:after+1),"An older frame confirmed a future launch")
+        require(!mailbox.receivedFrame(generation:2,since:0),"Another generation confirmed readiness")
 
         mailbox.publish(first,generation:1);mailbox.reset(generation:2)
         require(mailbox.takeLatest()==nil,"Reset leaked an old frame")
+        require(!mailbox.receivedFrame(generation:2,since:0),"Reset retained first-frame readiness")
         mailbox.publish(last,generation:1)
         require(mailbox.takeLatest()==nil,"Delayed old generation was accepted")
         mailbox.publish(first,generation:2);mailbox.stop()
         require(mailbox.takeLatest()==nil,"Stop leaked a frame")
+        require(!mailbox.receivedFrame(generation:2,since:0),"Stop retained first-frame readiness")
         mailbox.publish(last,generation:2)
         require(mailbox.takeLatest()==nil,"Stopped mailbox accepted a callback")
 

@@ -4,8 +4,11 @@ import AppKit
 /// virtual device outlives a window, but a failed mirror is never a camera target.
 @MainActor
 final class DetachedApplications: NSObject, NSWindowDelegate {
-    enum DiagnosticStage:String {case creatingDisplay,connectingMirror,launchingApplication,ready,firstFramePresented,mirrorFailed,startupFailed,clearingCamera,cameraClearFailed,displayClosed,restoreFailed}
-    enum DiagnosticFailure:String {case mirrorClosed,mirrorTimeout,mirrorOther,foregroundUnconfirmed,taskTreeInvalid,startupOther,uncertainCamera}
+    enum DiagnosticStage:String {case creatingDisplay,connectingMirror,launchingApplication,waitingForFrame,ready,firstFramePresented,mirrorFailed,startupFailed,clearingCamera,cameraClearFailed,displayClosed,restoreFailed}
+    enum DiagnosticFailure:String {case mirrorClosed,mirrorTimeout,mirrorOther,firstFrameTimeout,foregroundUnconfirmed,taskTreeInvalid,startupOther,uncertainCamera}
+    private struct FirstFrameTimeout:LocalizedError {
+        var errorDescription:String? {"应用已启动，但未收到当前手机画面；连接已停止，请从应用列表重新打开。"}
+    }
     struct DiagnosticEvent {let attempt:Int;let stage:DiagnosticStage;let failure:DiagnosticFailure?;let validation:AndroidTaskSnapshot.ValidationError?}
     private enum Phase { case starting, ready, recovering, failed, closing, stopped }
     @MainActor private final class Entry {
@@ -32,11 +35,14 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
     var onCameraUnavailable:((Int)->Task<Bool,Never>)?
     private let phone:PhoneSession,adb:URL,server:URL
     private let serverSocket:String?
+    private let frameTimeout:TimeInterval
     private let presentation:((ControlWindowController,NSPoint?)->Void)?
     private var entries=[String:Entry](),stopping=false
     init(phone:PhoneSession,adb:URL,server:URL,serverSocket:String?=nil,
+         frameTimeout:TimeInterval=5,
          presentation:((ControlWindowController,NSPoint?)->Void)?=nil) {
         self.phone=phone;self.adb=adb;self.server=server;self.serverSocket=serverSocket;self.presentation=presentation
+        self.frameTimeout=frameTimeout.isFinite ? max(0.01,min(10,frameTimeout)):5
     }
     private func show(_ entry:Entry,at point:NSPoint?) {
         // A backend integration test can suppress ordering its own windows.
@@ -140,8 +146,17 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
                     })
                 try Task.checkCancellation()
                 diagnostic(entry,.launchingApplication)
+                let launchBegan=ProcessInfo.processInfo.systemUptime
                 let cameraReady=try await phone.launchApplication(entry.app,on:display.id)
                 try Task.checkCancellation()
+                diagnostic(entry,.waitingForFrame)
+                let frameDeadline=ProcessInfo.processInfo.systemUptime+frameTimeout
+                while !entry.frames.receivedFrame(generation:epoch,since:launchBegan) {
+                    try Task.checkCancellation()
+                    guard !stopping,entry.epoch==epoch,entry.phase == .starting,availability.isAvailable else{return}
+                    guard ProcessInfo.processInfo.systemUptime<frameDeadline else{throw FirstFrameTimeout()}
+                    try await Task.sleep(nanoseconds:20_000_000)
+                }
                 guard !stopping,entry.epoch==epoch,entry.phase == .starting,availability.isAvailable else{return}
                 entry.phase = .ready;entry.ui.setPhoneInteractionEnabled(true)
                 diagnostic(entry,.ready)
@@ -150,7 +165,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
             } catch {
                 guard !stopping,entry.epoch==epoch,entry.phase == .starting else{return}
                 let validation=error as? AndroidTaskSnapshot.ValidationError
-                let reason:DiagnosticFailure=error is DesktopCameraLaunchFailure ? .uncertainCamera:(validation != nil ? .taskTreeInvalid:(error.localizedDescription=="应用未出现在指定屏幕；已保留恢复记录。" ? .foregroundUnconfirmed:.startupOther))
+                let reason:DiagnosticFailure=error is DesktopCameraLaunchFailure ? .uncertainCamera:(error is FirstFrameTimeout ? .firstFrameTimeout:(validation != nil ? .taskTreeInvalid:(error.localizedDescription=="应用未出现在指定屏幕；已保留恢复记录。" ? .foregroundUnconfirmed:.startupOther)))
                 diagnostic(entry,.startupFailed,reason,validation:validation)
                 fail(entry,epoch:epoch,detail:error.localizedDescription,uncertainCamera:error is DesktopCameraLaunchFailure)
             }
