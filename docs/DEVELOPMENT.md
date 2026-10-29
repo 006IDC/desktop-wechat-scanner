@@ -730,3 +730,9 @@ Mailbox与生命周期合成回归通过，新增同代prelaunch旧帧必须等�
 首轮snapshot模式支付宝严格识码、连续源交接核实、清理通过，但firstACKUsedSnapshot=false，首张在发送前过期；tap→首ACK839.5ms，不能计为snapshot提速。随后ABBA首个stream轮通过（tap→首ACK447.5ms、结果帧1790.5ms）；第二个snapshot轮实际送达首图且交接源核实，tap→首ACK254.6ms，但9秒内未严格匹配文字结果（最小编辑距离1），整组失败即停止，不继续B2/A2，不把近似文字当通过。两轮手机返回帧均核实源QR，约145.5/421.0ms在源确认后首次观察到，ACK较快不等于返回画面较快。两组清理成功，权限一直有效。
 
 故意过期warmup轮firstACKUsedSnapshot=true、streamWarmupFailed/fallback=true，正常capture重建后源交接核实并严格识码；tap→首ACK347.7ms、结果帧1431.8ms，确认失败Task没有被连续await到截止。微信单轮也实际点击其原生扫一扫并严格识码，tap→首ACK684.1ms、结果帧2257.8ms，清理成功；本轮用的是已验证＋菜单，新增Discover备用尚未实测。所有四次入口未请求激活、前后前台标识相同，只有自有后置板；不以此替代物理拖动/真实前台动画验收。snapshot不启用产品默认，继续定位手机收帧到相机Surface实际post的等待。
+
+## 相机Surface等待分段（build56，2026-10-30，验证中）
+
+新增CameraPaintTiming仅保留连接内最多128个数字样本，无像素/包名/文本。计时从服务端发布解码Bitmap或合成色源后，到任一自有相机Surface首次成功unlockCanvasAndPost；重复空闲刷新不重复计数，replacement/clear/失效后的旧ticket不计。lock/draw/post分段含该绘制调用自身的开销，不可简单相加为total（源可能在lock等待期间更新）；不包含JPEG解码/socket/手机App消费/物理呈现。状态与owner不是原子快照，数据不参与归属授权，不能用作某App纯处理时间。旧服务不提供时缺省nil，无效可选数字丢弃，不改变归属证据。
+
+结果文字核验新增无customWords、无expected输入的英文top1二次识别，仅原有结果前缀近似但未命中时尝试；仍须独立top1去空白后完全等于本轮码，不将编辑距离当通过。primary也拒绝附带ASCII字符；拆词只组合同基线邻近的完整ASCII组，跨行/远区不拼。该变化只改善自有诊断核验，不改变手机识别或产品供图。此前失败组继续保留，不追溯转为成功。

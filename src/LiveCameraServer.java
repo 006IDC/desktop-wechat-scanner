@@ -78,6 +78,7 @@ public final class LiveCameraServer {
     private static final int DISPLAY_SYSTEM_DECORATIONS = 1 << 9;
 
     private final Object cameraLock = new Object();
+    private final CameraPaintTiming cameraPaintTiming = new CameraPaintTiming();
     private final Object cameraPermissionLock = new Object();
     private final Object frameLock = new Object();
     private final Object stateLock = new Object();
@@ -403,6 +404,7 @@ public final class LiveCameraServer {
                         cameraFrame = null;
                         cameraSolidColor = null;
                         frameStateGeneration = -1;
+                        cameraPaintTiming.invalidate();
                     }
                 }
                 if (obsolete != null) obsolete.recycle();
@@ -841,12 +843,18 @@ public final class LiveCameraServer {
     private void paint(Surface surface) {
         if (stopping || !surface.isValid()) return;
         Canvas canvas = null;
+        CameraPaintTiming.Ticket paintedTicket = null;
+        long lockBegan = System.nanoTime(), locked = 0, drawn = 0, paintedGeneration = -1;
+        boolean drewSource = false;
         try {
             canvas = surface.lockCanvas(null);
+            locked = System.nanoTime();
             canvas.drawColor(Color.WHITE);
             synchronized (cameraLock) {
                 boolean solid = cameraSolidColor != null && desktopHomeRequested && frameStateGeneration == cameraStateGeneration;
                 if (solid || (cameraFrame != null && (!desktopHomeRequested || frameStateGeneration == cameraStateGeneration))) {
+                    paintedTicket = cameraPaintTiming.current();
+                    paintedGeneration = frameStateGeneration;
                     int width = canvas.getWidth();
                     int height = canvas.getHeight();
                     canvas.save();
@@ -868,12 +876,17 @@ public final class LiveCameraServer {
                         canvas.drawRect(destination, paint);
                     } else canvas.drawBitmap(cameraFrame, null, destination, paint);
                     canvas.restore();
+                    drawn = System.nanoTime(); drewSource = true;
                 }
             }
         } catch (Exception e) {
             if (!stopping) log("paint_error", e.toString());
         } finally {
-            if (canvas != null) try { surface.unlockCanvasAndPost(canvas); } catch (Exception ignored) {}
+            if (canvas != null) try {
+                surface.unlockCanvasAndPost(canvas);
+                if (drewSource && (!desktopHomeRequested || paintedGeneration == cameraStateGeneration))
+                    cameraPaintTiming.posted(paintedTicket, lockBegan, locked, drawn, System.nanoTime());
+            } catch (Exception ignored) {}
         }
     }
 
@@ -1109,12 +1122,14 @@ public final class LiveCameraServer {
                     cameraFrame = decoded;
                     cameraSolidColor = null;
                     frameStateGeneration = acceptedGeneration;
+                    cameraPaintTiming.accept(System.nanoTime());
                 }
             }
         } else synchronized (cameraLock) {
             previous = cameraFrame;
             cameraFrame = decoded;
             cameraSolidColor = null;
+            cameraPaintTiming.accept(System.nanoTime());
         }
         if (stale) {
             decoded.recycle();
@@ -1137,6 +1152,7 @@ public final class LiveCameraServer {
                 cameraFrame = null;
                 cameraSolidColor = blue ? Color.BLUE : Color.BLACK;
                 frameStateGeneration = cameraStateGeneration;
+                cameraPaintTiming.accept(System.nanoTime());
             }
         }
         if (previous != null) previous.recycle();
@@ -1150,6 +1166,7 @@ public final class LiveCameraServer {
             cameraFrame = null;
             cameraSolidColor = null;
             frameStateGeneration = -1;
+            cameraPaintTiming.reset();
             if (previous != null) previous.recycle();
         }
         lastCameraUpdateNanos = System.nanoTime();
@@ -1233,6 +1250,14 @@ public final class LiveCameraServer {
             }
         }
         state.put("activities", activities);
+        CameraPaintTiming.Snapshot timing = cameraPaintTiming.snapshot();
+        state.put("paintTiming", new JSONObject().put("samples", timing.samples)
+                .put("lastAcceptedToPostMilliseconds", timing.lastAcceptedToPost)
+                .put("p95AcceptedToPostMilliseconds", timing.p95AcceptedToPost)
+                .put("maximumAcceptedToPostMilliseconds", timing.maximumAcceptedToPost)
+                .put("lastCanvasLockMilliseconds", timing.lastCanvasLock)
+                .put("lastDrawMilliseconds", timing.lastDraw)
+                .put("lastPostMilliseconds", timing.lastPost));
         return state.toString().getBytes(StandardCharsets.UTF_8);
     }
 

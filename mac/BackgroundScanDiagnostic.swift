@@ -19,10 +19,12 @@ private final class BackgroundScanResult:@unchecked Sendable {
     private var result:(received:Double,observed:Double,sequence:Int)?
     private var firstQR:(received:Double,sequence:Int,textAlreadyMatched:Bool)?
     private var checks=0,prefixSeen=false,bestDistance:Int?
+    private var secondaryChecks=0,secondaryMatched=false
     func snapshot()->(received:Double,observed:Double,sequence:Int)? {lock.withLock{result}}
     func qrSnapshot()->(received:Double,sequence:Int,textAlreadyMatched:Bool)? {lock.withLock{firstQR}}
     func diagnostics()->[String:Any] {lock.withLock {
-        var value:[String:Any]=["resultOCRChecks":checks,"ownResultPrefixSeen":prefixSeen]
+        var value:[String:Any]=["resultOCRChecks":checks,"ownResultPrefixSeen":prefixSeen,
+                              "secondaryTextChecks":secondaryChecks,"secondaryExactTextMatched":secondaryMatched]
         if let bestDistance {value["bestResultEditDistance"]=bestDistance};return value
     }}
     /// Identical observation cadence in both supply groups. Vision work does
@@ -41,6 +43,8 @@ private final class BackgroundScanResult:@unchecked Sendable {
                         self.checks+=1
                         if let observation {
                             self.prefixSeen = self.prefixSeen || observation.prefixSeen
+                            if observation.secondaryTextChecked {self.secondaryChecks+=1}
+                            self.secondaryMatched = self.secondaryMatched || observation.secondaryTextMatched
                             if let distance=observation.editDistance {self.bestDistance=min(self.bestDistance ?? distance,distance)}
                             if observation.qrVisible,self.firstQR==nil {self.firstQR=(frame.receivedAt,frame.sequence,observation.textMatched)}
                             if observation.textMatched,self.result==nil {self.result=(frame.receivedAt,observed,frame.sequence)}
@@ -341,6 +345,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     let finalState=try await phone.cameraState()
                     item["activeStreamsAtResultCheck"]=finalState.activeStreams
                     item["targetActivityAtResultCheck"]=finalState.activities.contains{$0.displayId==display && $0.package==package}
+                    if let timing=finalState.paintTiming {item["phonePaintTiming"]=timing.diagnostics;item["phonePaintTimingScope"]="last-128-current-source-first-posts-since-clear"}
                     let videoTiming=stream.timingSnapshot
                     item["mirrorTimingScope"]="current-stream-last-240-samples"
                     item["mirrorDecodedFrames"]=videoTiming.decodedFrameCount

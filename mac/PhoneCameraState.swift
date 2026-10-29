@@ -2,6 +2,22 @@ import Foundation
 
 /// Small, authenticated status snapshot; never persisted or sent to telemetry.
 struct PhoneCameraState: Decodable, Sendable {
+    struct PaintTiming:Decodable,Sendable {
+        let samples:Int
+        let lastAcceptedToPostMilliseconds,p95AcceptedToPostMilliseconds,maximumAcceptedToPostMilliseconds:Double
+        let lastCanvasLockMilliseconds,lastDrawMilliseconds,lastPostMilliseconds:Double
+        var isValid:Bool {
+            let values=[lastAcceptedToPostMilliseconds,p95AcceptedToPostMilliseconds,maximumAcceptedToPostMilliseconds,
+                        lastCanvasLockMilliseconds,lastDrawMilliseconds,lastPostMilliseconds]
+            return (0...128).contains(samples) && values.allSatisfy{$0.isFinite && (0...60_000).contains($0)} &&
+                lastAcceptedToPostMilliseconds<=maximumAcceptedToPostMilliseconds && p95AcceptedToPostMilliseconds<=maximumAcceptedToPostMilliseconds &&
+                (samples>0 || values.allSatisfy{$0==0})
+        }
+        var diagnostics:[String:Double] {[
+            "samples":Double(samples),"lastAcceptedToPostMilliseconds":lastAcceptedToPostMilliseconds,
+            "p95AcceptedToPostMilliseconds":p95AcceptedToPostMilliseconds,"maximumAcceptedToPostMilliseconds":maximumAcceptedToPostMilliseconds,
+            "lastCanvasLockMilliseconds":lastCanvasLockMilliseconds,"lastDrawMilliseconds":lastDrawMilliseconds,"lastPostMilliseconds":lastPostMilliseconds]}
+    }
     struct Activity: Decodable, Sendable {
         let displayId: Int
         let component: String
@@ -29,11 +45,13 @@ struct PhoneCameraState: Decodable, Sendable {
     let desktopCameraEnabled:Bool
     let desktopCameraGeneration:Int
     let desktopCameraBindings:[CameraBinding]
+    let paintTiming:PaintTiming?
 
     private enum CodingKeys: String, CodingKey {
         case version, generation, activeStreams, activities, desktopHome
         case cameraOwner, ownerKnown, ownerGeneration, ownerStatus
         case solidCalibrationSupported,desktopCameraSupported,desktopCameraEnabled,desktopCameraGeneration,desktopCameraBindings
+        case paintTiming
     }
 
     init(from decoder: Decoder) throws {
@@ -53,6 +71,9 @@ struct PhoneCameraState: Decodable, Sendable {
         desktopCameraEnabled=try values.decodeIfPresent(Bool.self,forKey:.desktopCameraEnabled) ?? false
         desktopCameraGeneration=try values.decodeIfPresent(Int.self,forKey:.desktopCameraGeneration) ?? 0
         desktopCameraBindings=try values.decodeIfPresent([CameraBinding].self,forKey:.desktopCameraBindings) ?? []
+        // Optional numeric observation must never become camera ownership evidence.
+        if let timing=try? values.decode(PaintTiming.self,forKey:.paintTiming),timing.isValid {paintTiming=timing}
+        else {paintTiming=nil}
     }
 
     func scannerActivity() -> Activity? {

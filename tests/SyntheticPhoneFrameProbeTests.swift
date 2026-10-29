@@ -33,6 +33,16 @@ import CoreVideo
         context.flush();return pixels
     }
     static func main() throws {
+        func word(_ value:String,_ x:Double,_ y:Double,_ width:Double)->ScannerNavigationOCR.Text {
+            .init(value:value,rect:CGRect(x:x,y:y,width:width,height:20))
+        }
+        precondition(!SyntheticResultText.secondaryMatches(["X"+expected+"Y"],expected:expected))
+        precondition(!SyntheticResultText.secondaryMatches(["006IDC","20261026PERF"],expected:expected))
+        precondition(SyntheticResultText.secondaryMatches(["  "+expected+" "],expected:expected))
+        precondition(!SyntheticResultText.matches([word("X"+expected+"Y",10,100,300)],expected:expected))
+        precondition(!SyntheticResultText.matches([word("006IDC",10,100,60),word("20261026PERF",80,300,120)],expected:expected))
+        precondition(!SyntheticResultText.matches([word("006IDC",10,100,60),word("20261026PERF",400,100,120)],expected:expected))
+        precondition(SyntheticResultText.matches([word("006IDC",10,100,60),word("20261026PERF",80,100,120)],expected:expected))
         let preview=try SyntheticPhoneFrameProbe.inspect(fixture(qr:expected),expected:expected,probeQR:true)
         precondition(preview.qrVisible && !preview.textMatched,"A visible QR was counted as an app text result")
         let text=try SyntheticPhoneFrameProbe.inspect(fixture(text:expected),expected:expected,probeQR:true)

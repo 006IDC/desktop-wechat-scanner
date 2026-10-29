@@ -30,6 +30,21 @@ import Foundation
 
     static func main() throws {
         let matched = try decode(basic())
+        require(matched.paintTiming==nil,"Older server gained paint observations")
+        var timed=basic()
+        var metrics:[String:Any]=["samples":2,"lastAcceptedToPostMilliseconds":4,"p95AcceptedToPostMilliseconds":8,
+            "maximumAcceptedToPostMilliseconds":8,"lastCanvasLockMilliseconds":1,"lastDrawMilliseconds":2,"lastPostMilliseconds":1]
+        timed["paintTiming"]=metrics
+        require(try decode(timed).paintTiming?.samples==2,"Valid numeric observation missing")
+        metrics["samples"]=129;timed["paintTiming"]=metrics
+        require(try decode(timed).paintTiming==nil,"Unbounded observation accepted")
+        require(try decode(timed).scannerActivity()?.displayId==7,"Bad optional timing changed owner evidence")
+        metrics["samples"]=0;timed["paintTiming"]=metrics
+        require(try decode(timed).paintTiming==nil,"Nonempty zero-sample observation accepted")
+        metrics["samples"]=1;metrics["lastDrawMilliseconds"] = -1;timed["paintTiming"]=metrics
+        require(try decode(timed).paintTiming==nil,"Negative timing accepted")
+        timed["ownerKnown"]=false
+        require(try decode(timed).captureActivity()==nil,"Timing supplied owner evidence")
         require(matched.scannerActivity()?.displayId == 7 && matched.ownerGeneration == 3,
                 "Known virtual camera owner did not match the verified WeChat scanner")
 
