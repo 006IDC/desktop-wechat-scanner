@@ -839,6 +839,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var applications=[[String:Any]]()
         let activeExit=CommandLine.arguments.contains("--diagnostic-active-scanner-exit")
         let navigationProbe=CommandLine.arguments.contains("--diagnostic-navigation-probe")
+        let alipayOnly=CommandLine.arguments.contains("--diagnostic-alipay-only")
+        let testedPackages=alipayOnly ? ["com.eg.android.AlipayGphone"] : (activeExit ? ["com.tencent.mm"]:["com.tencent.mm","com.eg.android.AlipayGphone"])
+        if alipayOnly {report["applicationScope"]="alipay"}
         if activeExit {report["test"]="desktop-native-active-scanner-exit"}
         if navigationProbe {report["test"]="navigation-frame-probe";report["performanceMeasured"]=false}
         do {
@@ -850,7 +853,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             report["applicationPickerVisible"]=applicationPickerVisible
             let apps=try await phone.applications()
-            for package in (activeExit ? ["com.tencent.mm"]:["com.tencent.mm","com.eg.android.AlipayGphone"]) {
+            for package in testedPackages {
                 try Task.checkCancellation()
                 guard let app=apps.first(where:{$0.packageName==package}) else{throw ScanError("测试应用未安装。")}
                 var item:[String:Any]=["package":package,"qrRecognized":false]
@@ -1041,7 +1044,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             passed=applications.count==1 && applications[0]["activeScannerBeforeExit"] as? Bool == true &&
                 applications[0]["failure"] == nil && report["failure"] == nil
         } else {
-            passed=applications.count==2 && applications.allSatisfy {
+            passed=applications.count==testedPackages.count && applications.allSatisfy {
                 $0["automaticCameraStarted"] as? Bool == true && $0["qrRecognized"] as? Bool == true && $0["failure"] == nil
             } && report["failure"] == nil
         }
@@ -1077,6 +1080,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         var result:[String:Any]=["width":CVPixelBufferGetWidth(pixels),"height":CVPixelBufferGetHeight(pixels),
                             "pixelFormat":CVPixelBufferGetPixelFormatType(pixels)]
                         let known:Set<String>=["微信","通讯录","发现","我","首页","消息","理财","生活","我的","扫一扫","收付款","收付钱"]
+                        func directProbe()->[String:Any] {
+                            let words=(try? ScannerNavigationOCR.recognize(pixels)) ?? []
+                            let labels=Set(words.compactMap { word -> String? in
+                                let value=word.value.replacingOccurrences(of:" ",with:"")
+                                if ScannerNavigationOCR.isWechatTitle(value) {return "微信"}
+                                return known.contains(value) ? value:nil
+                            })
+                            return ["wordCount":words.count,"knownLabels":labels.sorted()]
+                        }
+                        result["directBeforeLock"]=directProbe()
                         if CVPixelBufferGetPixelFormatType(pixels)==kCVPixelFormatType_32BGRA,
                            CVPixelBufferLockBaseAddress(pixels,.readOnly)==kCVReturnSuccess {
                             defer {CVPixelBufferUnlockBaseAddress(pixels,.readOnly)}
@@ -1093,6 +1106,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 result["pixelProbe"]=["minimum":darkest,"maximum":lightest,"nonWhiteSamples":nonWhite,"samples":count]
                             }
                         }
+                        result["directAfterLock"]=directProbe()
                         for (name,orientation) in [("up",CGImagePropertyOrientation.up),("down",.down),("left",.left),("right",.right),
                                                    ("upMirrored",.upMirrored),("downMirrored",.downMirrored),("leftMirrored",.leftMirrored),("rightMirrored",.rightMirrored)] {
                             let request=VNRecognizeTextRequest();request.recognitionLevel = .accurate
