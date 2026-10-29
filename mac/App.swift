@@ -1055,6 +1055,42 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             try Task.checkCancellation()
             guard connected,!stopping,mirrorGeneration==connectionGeneration else{throw CancellationError()}
         }
+        if CommandLine.arguments.contains("--diagnostic-navigation-probe") {
+            let deadline=ProcessInfo.processInfo.systemUptime+3
+            while ProcessInfo.processInfo.systemUptime<deadline {
+                try checkNavigation()
+                if let observed=latestPresentedMirrorFrame,observed.route === activeRoute,
+                   observed.frame.generation==observed.route.incarnation,
+                   ProcessInfo.processInfo.systemUptime-observed.frame.receivedAt<1 {
+                    let pixels=observed.frame.pixelBuffer
+                    let result=try await Task.detached { () -> [String:Any] in
+                        var result:[String:Any]=["width":CVPixelBufferGetWidth(pixels),"height":CVPixelBufferGetHeight(pixels),
+                            "pixelFormat":CVPixelBufferGetPixelFormatType(pixels)]
+                        let known:Set<String>=["微信","通讯录","发现","我","首页","消息","理财","生活","我的","扫一扫","收付款","收付钱"]
+                        for (name,orientation) in [("up",CGImagePropertyOrientation.up),("down",.down),("left",.left),("right",.right)] {
+                            let request=VNRecognizeTextRequest();request.recognitionLevel = .accurate
+                            request.recognitionLanguages=["zh-Hans","en-US"]
+                            try VNImageRequestHandler(cvPixelBuffer:pixels,orientation:orientation).perform([request])
+                            let words=(request.results ?? []).compactMap{$0.topCandidates(1).first?.string}
+                            // Whitelisted navigation labels only; never persist chats or arbitrary OCR text.
+                            let labels=Set(words.compactMap { word -> String? in
+                                let value=word.replacingOccurrences(of:" ",with:"")
+                                if ScannerNavigationOCR.isWechatTitle(value) {return "微信"}
+                                return known.contains(value) ? value:nil
+                            })
+                            result[name]=["wordCount":words.count,"knownLabels":labels.sorted()]
+                        }
+                        let words=try ScannerNavigationOCR.recognize(pixels)
+                        result["plusLocated"]=try ScannerNavigationOCR.plusButton(in:pixels,homeWords:words) != nil
+                        return result
+                    }.value
+                    try checkNavigation();evidence["navigationProbe"]=result
+                    throw ScanError("只读入口探针已完成，未点击手机内容。")
+                }
+                try await Task.sleep(nanoseconds:50_000_000)
+            }
+            throw ScanError("只读入口探针未收到当前镜像。")
+        }
         if CommandLine.arguments.contains("--diagnostic-manual-navigation") {
             evidence["manualNavigationRequested"]=true
             evidence["automaticNavigationDisabled"]=true
