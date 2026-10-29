@@ -666,22 +666,12 @@ actor PhoneSession {
         let dump = try shell("dumpsys activity activities")
         return try AndroidTaskSnapshot.parseChecked(dump, requiredDisplay: requiredDisplay)
     }
-    private func moveTask(_ id: Int, to display: Int, expectedRoot: Int? = nil) throws {
+    private func moveTasks(_ expected:[AndroidTaskSnapshot], to display:Int) throws {
         let snapshot = try tasks()
-        guard let task = snapshot.first(where: { $0.id == id }) else { return }
-        guard task.userID == 0, !task.rootContainsOtherUsers,
-              snapshot.filter({ $0.rootID == task.rootID }).allSatisfy({ $0.userID == 0 && !$0.rootContainsOtherUsers }) else {
-            throw ScanError("任务容器包含其他手机用户，不能移动。")
-        }
-        guard expectedRoot == nil || task.rootID == expectedRoot else { throw ScanError("应用任务容器已变化，已保留恢复记录。") }
-        // Android may already have returned the task while a window is closing.
-        // Moving a root to its current display throws instead of being a no-op.
-        if task.display == display { return }
-        let result = try shell("am display move-stack \(task.rootID) \(display)")
+        guard let root=try OwnedTaskMove.rootToMove(expected:expected,current:snapshot,destination:display) else{return}
+        let result = try shell("am display move-stack \(root) \(display)")
         guard !result.lowercased().contains("error"), !result.lowercased().contains("exception") else { throw ScanError("手机拒绝移动应用任务。") }
-        if let moved = try tasks().first(where: { $0.id == id }), moved.display != display {
-            throw ScanError("应用任务没有移动到指定屏幕，已保留恢复记录。")
-        }
+        try OwnedTaskMove.requireArrival(expected:expected,current:tasks(),destination:display)
     }
     @discardableResult
     func launchApplication(_ app: AndroidApplication, on target: Int) throws -> Bool {
@@ -709,12 +699,8 @@ actor PhoneSession {
             }
             try save()
             for root in groups.keys.sorted() {
-                guard let group = groups[root], let representative = group.first else { continue }
-                let current = try tasks().filter { $0.rootID == root }
-                guard current.allSatisfy({ task in task.userID == 0 && !task.rootContainsOtherUsers && group.contains(where: { $0.id == task.id && $0.packageName == task.packageName && $0.display == task.display }) }) else {
-                    throw ScanError("应用任务在移动前发生变化，已保留恢复记录。")
-                }
-                try moveTask(representative.id, to: target, expectedRoot: root)
+                guard let group = groups[root] else { continue }
+                try moveTasks(group,to:target)
             }
             let result = try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")
             guard !result.lowercased().contains("error:"), !result.lowercased().contains("exception") else { throw ScanError("手机应用启动失败。") }
@@ -766,12 +752,8 @@ actor PhoneSession {
             destinations[root] = destination
         }
         for root in groups.keys.sorted() {
-            guard let group = groups[root], let representative = group.first, let destination = destinations[root] else { continue }
-            let current = try tasks().filter { $0.rootID == root }
-            guard current.allSatisfy({ task in task.userID == 0 && !task.rootContainsOtherUsers && group.contains(where: { $0.id == task.id && $0.packageName == task.packageName && task.display == target }) }) else {
-                throw ScanError("应用任务在恢复前发生变化，已保留窗口和恢复记录。")
-            }
-            try moveTask(representative.id, to: destination, expectedRoot: root)
+            guard let group = groups[root], let destination = destinations[root] else { continue }
+            try moveTasks(group,to:destination)
         }
         let restored = try tasks(requiredDisplay: target)
         guard !restored.contains(where: { $0.display == target && !$0.isHome }), groups.allSatisfy({ root, group in
