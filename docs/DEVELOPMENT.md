@@ -649,3 +649,5 @@ OwnedTaskMoveTests合成覆盖上述反例，并贯通真实任务树解析器�
 [Android 16 AOSP TaskFragment.dump](https://android.googlesource.com/platform/frameworks/base/+/android16-qpr2-release/services/core/java/com/android/server/wm/TaskFragment.java)递归输出fragment/活动，Hist使用所属Task。修复将fragment视为真实Task下的结构容器，活动仍核对真实Task ID和用户，直接child计数逐层验证，不生成虚假的可迁移任务；同task内多包新增拒绝。正常/嵌套fragment及内嵌真实Task通过合成测试，跨包、跨用户、错Task ID、错子数、孤立/空/损坏fragment仍拒绝。原迁移组与窗口生命周期合成回归通过，独立只读复核未发现放宽归属门槛的缺陷。
 
 修复后用当前生产PhoneSession和新解析器编译仅恢复入口，核原设备/owner/关联后成功恢复第13轮保留会话，无恢复记录；不清空记录、不新建虚拟设备、不修改录屏权限。研究包49源码`89c80fd`仅用于诊断，尚未运行扫码入口；后续包使用修正后的解析器。
+
+TaskFragment修复后六轮隐藏断流重试全部通过，均收到首段/第二段手机画面、前台应用确认且恢复清理成功；对应原来连续组中第三轮出错的窗口创建序列未再失败。该结果支持所复现的TaskFragment问题已解决，不能证明历史首轮同因、任意App兼容或长期稳定。实际扫码诊断的跨App epoch同时修正为严格递增，避免前一App清帧后拒绝下一App的图像；耗时p95采用nearest-rank口径。

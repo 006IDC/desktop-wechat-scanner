@@ -50,7 +50,7 @@ private final class BackgroundScanFrames:@unchecked Sendable {
     private static var now:Double {ProcessInfo.processInfo.systemUptime}
     private static func percentiles(_ values:[Double])->[String:Double] {
         guard !values.isEmpty else{return [:]};let sorted=values.sorted()
-        return ["count":Double(values.count),"p50":sorted[(sorted.count-1)/2],"p95":sorted[Int(Double(sorted.count-1)*0.95)],"max":sorted.last!]
+        return ["count":Double(values.count),"p50":sorted[(sorted.count-1)/2],"p95":sorted[max(0,Int(ceil(Double(sorted.count)*0.95))-1)],"max":sorted.last!]
     }
     /// Only fixed, independently confirmed navigation targets are tapped.
     /// Nothing from OCR is exported, and login/consent/payment pages fail closed.
@@ -148,7 +148,9 @@ private final class BackgroundScanFrames:@unchecked Sendable {
                     let tap=try await navigate(phone:phone,mirror:stream,frames:frames,package:package,display:display)
                     item["scanTapToOwnerMilliseconds"]=(now-tap)*1000
                     let pump=CameraPumpMailbox(sourceIsAvailable:{frames.available.isAvailable})
-                    let epoch=100+index
+                    // The final clear retires the previous application's epoch.
+                    // The next application's frame epoch must advance past it.
+                    let epoch=100+index*100
                     try await phone.clear(epoch:epoch,requireConnection:true)
                     await capture.setDiagnosticBoard(CGWindowID(window.windowNumber))
                     stage="capture-prepare"
