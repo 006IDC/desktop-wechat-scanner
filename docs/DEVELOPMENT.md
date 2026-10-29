@@ -437,3 +437,33 @@ M4/M5/M6立即退出模式有效呈现1/1/0次，不当作持续呈现验收。M
 用户指定改用英文名，本轮采用 MiraDroid，候选 build43。仅更新菜单/关于、CFBundleName/DisplayName、构建 App/ZIP、后续发行命名与使用文档。CFBundleIdentifier 仍为 `com.idc006.DesktopWeChatScanner`，可执行文件名、持续签名身份、原有偏好/恢复路径及 GitHub 仓库地址保留；不自动替换当前安装或修改 TCC。NOTICE 保留原名出处及原有版权信息，旧发行与历史记录不改名。
 
 更名前 build42 源码4b020d6已签名打包，包内源码与 Android JAR 逐字节核对，签名要求与已安装版一致。经机主允许，界面勾选通用桌面相机并通过 USB 连接，握手、实际应用目录展示和正常断开通过；之后截图接口返回 ScreenCaptureKit -3811 捕获错误，未继续操作第三款 App，不能记为第三方扫码或耗时通过。已从界面断开并退出候选；未修改录屏权限。
+
+
+## 通用模式真机验证（2026-10-29）
+
+实际受测 App 为已签名 MiraDroid build43，包内源码 `08e636f37224a2698f9d97e89a8eaffc3c25196f`；ZIP SHA256 `0b699ad21d880e42d788bf1f1188f8180eaf89236c2501fe6aaea5a59a114495`。本次新增的集成夹具与记录不改变该包的生产源码或签名；安装版、TCC 与公开 Release 未改。CUA 在准确候选路径及重建会话后仍返回 ScreenCaptureKit -3811，系统元数据确认 Mac 未锁、候选在运行且窗口在屏；不把它误判为用户未授权，也未反复申请权限。改用 App 既有 `--run-desktop-diagnostic --generic-desktop-camera --diagnostic-usb --diagnostic-primary-screen --diagnostic-navigation-settle` 原生测试入口，不模拟 OS 输入，采集仅放行自有合成测试板。
+
+首先限定 `--diagnostic-alipay-only`，约20.62秒结束：支付宝真实扫一扫识别固定测试明文，自动透明框、暂停/恢复、同代丢帧确认、返回/重开、清帧与退出清理均通过。随后默认双应用约32.96秒结束，微信和支付宝分别通过同样流程；两次运行均 exit0、passed/cleanupSucceeded/screenPermission 为true，恢复记录消失。nativeScannerPreviewVisible=false、nativeCalibration缺席，与所选通用路径一致。微信识别时透明框仍在，不套用旧“交接后必须关框”判据；结果文字来自真实手机镜像，不将相机 ACK 当识别。
+
+六秒**程序移动**自有透明框的数值（未使用真实鼠标输入）：
+
+| 运行范围 | App | 窗口tick p95 / 最大(ms) | ROI位置误差p95(pt) |
+| --- | --- | --- | --- |
+| 单支付宝 | 支付宝 | 16.893 / 17.468 | 0 |
+| 双应用 | 微信 | 17.499 / 17.669 | 0 |
+| 双应用 | 支付宝 | 17.516 / 41.033 | 0 |
+
+这不是物理输入至画面的端到端延迟，也没有本轮内部 tap→透明框/首图的同口径新旧对照；不能据此填写开场“快了多少”或称视频等效。旧校准约700–1000ms的数据与这组tick不能相减。
+
+### 第三应用与失败证据
+
+只读确认手机未安装 `com.xiaomi.scanner`、已安装 `com.android.camera`，因此使用新增 `tests/GenericCameraDeviceIntegration.swift` 通过生产 PhoneSession API 的正常应用目录启动系统相机，不使用 Activity 捷径、OS 输入、额外安装、桌面采集或像素落盘。夹具只在内存匹配本轮 UUID 合成 QR；ACK后的镜像帧先确认preview，再以更晚帧确认结果文字。报告区分 `cameraDeliveryPassed` 和 `appRecognitionPassed`，整体 `validationScope=third-app-camera-input-delivery`，不将预览当识码。输出只允许 `.local/generic-camera-tests` 的新文件，O_EXCL/0600，路径越界和既有文件拒绝测试通过；warnings-as-errors 编译、独立只读复核通过。
+
+系统相机两轮都确认绑定，但8秒内 activeStreams=0、ownerKnown=true，未进入供图：
+
+- 首轮启动事务约602.72ms，cameraNotOpened；首次断开未确认、保留恢复记录。停止夹具后，用既有自有恢复器完成清理，记录消失；服务检查均正常，无重启或系统服务终止。
+- 补充失败观察后仅复测一次：启动事务约361.82ms，镜像正常收到121帧，相机owner为空、虚拟流0；固定UI提示词仅命中“拍照”，未自动点击任何提示。仍为cameraNotOpened。该轮cleanupStage=complete、关闭确认true、休眠前流0、会话记录消失。
+
+上述启动事务是目录打开/任务确认等后端耗时，不是扫一扫打开速度。两轮只能证明**本次未观察到系统相机打开受控虚拟相机**，不能仅据此确认 ROM/App 不兼容、权限弹窗、物理相机绕过或具体根因。第三应用的相机供图与识码均不计通过，微信/支付宝结果也不外推所有 App。最后三项系统服务约48/44/255ms返回，Mac测试进程及窗口为0，phone session记录不存在、App connected/cameraActive=false、screenPermission=true。
+
+夹具要求显式 `--run-device-test --resources /准确路径/MiraDroid.app/Contents/Resources --package com.android.camera --locked-applications --output .local/generic-camera-tests/唯一新报告.json`；只在已有相应锁屏授权与唯一USB设备时使用该锁屏参数。原生GUI自检与该后端夹具不能同时运行，失败保留会话时先恢复，不叠加新测试。运行原始记录与OCR/像素不入仓，仅保存本节脱敏结论。
