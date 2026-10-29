@@ -19,6 +19,20 @@ import Dispatch
         value.map {Int($0.selectedAt)}
     }
     static func main() {
+        let initial=CameraPumpMailbox()
+        initial.prepareRegion(at:10,immediateFirst:true)
+        require(initial.captureReady(at:10),"Untouched first generic region kept an unnecessary delay")
+        initial.publish(target(1));let firstSelection=initial.selection()!
+        initial.prepareRegion(at:10.01,immediateFirst:true)
+        require(!initial.captureReady(at:10.18) && initial.captureReady(at:10.20),"A later region skipped settling")
+        require(!initial.isCurrent(firstSelection),"A moved region kept an in-flight first frame")
+        let moving=CameraPumpMailbox()
+        moving.delayCapture(until:11);moving.prepareRegion(at:10,immediateFirst:true)
+        require(!moving.captureReady(at:10.99) && moving.captureReady(at:11),"First-frame shortcut erased a pre-existing movement fence")
+        let legacy=CameraPumpMailbox();legacy.prepareRegion(at:10,immediateFirst:false)
+        require(!legacy.captureReady(at:10.17) && legacy.captureReady(at:10.19),"Compatibility mode lost its original settle gate")
+        initial.stop();initial.prepareRegion(at:0,immediateFirst:true)
+        require(!initial.captureReady(at:100),"Region update revived a stopped pump")
         let pump=CameraPumpMailbox()
         require(pump.latest()==nil,"New mailbox contains a target")
         for index in 0..<10_000 {pump.publish(target(index))}
@@ -54,7 +68,7 @@ import Dispatch
         var stats=CameraPumpMailbox.Statistics()
         require(stats.sendMilliseconds==0 && stats.responseWaitMilliseconds==0 &&
                 stats.responseBodyMilliseconds==0,"New transport timings were not zero")
-        stats.sent=47;stats.dropped=3;stats.fps=28.5
+        stats.sent=47;stats.dropped=3;stats.fps=28.5;stats.firstFrameAcknowledgedAt=123.25
         stats.captureMilliseconds=7.25;stats.transferMilliseconds=4.5
         stats.sendMilliseconds=1.25;stats.responseWaitMilliseconds=2.5
         stats.responseBodyMilliseconds=0.75
@@ -62,7 +76,7 @@ import Dispatch
         stats.localQRSubmitted=true
         pump.update(stats)
         let read=pump.snapshot()
-        require(read.statistics.sent==47 && read.statistics.dropped==3 &&
+        require(read.statistics.firstFrameAcknowledgedAt==123.25 && read.statistics.sent==47 && read.statistics.dropped==3 &&
                 read.statistics.fps==28.5 && read.statistics.captureMilliseconds==7.25 &&
                 read.statistics.transferMilliseconds==4.5 &&
                 read.statistics.sendMilliseconds==1.25 &&

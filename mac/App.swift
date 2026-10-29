@@ -48,6 +48,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var localScanFrame:ScanFrameController?
     private var localScanRect:CGRect?
     private var localCameraMode=false
+    private var desktopCameraReadyUptime:TimeInterval?
+    private var settleInitialGenericCapture:Bool {CommandLine.arguments.contains("--run-desktop-diagnostic") && CommandLine.arguments.contains("--diagnostic-initial-settle")}
     private let nativeScannerRequested=CommandLine.arguments.contains("--native-camera-preview")
     private var nativeScannerOverlay:NativeScannerOverlay?
     private var nextCameraDiagnostic=0.0
@@ -785,7 +787,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard connected && !busy && !stopping && !cameraSuppressed else{return}
         guard targetWindow.window?.isVisible == true,targetWindow.window?.isMiniaturized == false else{return}
         busy=true;operationTask?.cancel()
-        nativeScannerAttachedUptime=nil
+        nativeScannerAttachedUptime=nil;desktopCameraReadyUptime=nil
         operationTask=Task { [self] in
             do {
                 guard await clearCamera() else{localScanClearFailed();return}
@@ -836,7 +838,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     } else {showLocalScanFrame(for:targetWindow)}
                 } else if localCameraMode {showLocalScanFrame(for:targetWindow)}
                 busy=false
-                startCameraLoop()
+                startCameraLoop();desktopCameraReadyUptime=ProcessInfo.processInfo.systemUptime
                 status(genericDesktopCamera ? "桌面相机" : (nativeScannerOverlay != nil ? "原生扫一扫" : (localCameraMode ? "拖动扫码框":"拖动窗口扫码")),nativeScannerOverlay != nil ? "拖动窗口对准二维码；原生手机控件和识别结果保持在此窗口。" : (localCameraMode ? (genericDesktopCamera ? "透明框取景持续送入当前手机应用；识别和结果由原 App 完成。":"透明框直接显示桌面；停稳后送入手机，结果在原应用中显示。") : "拖动窗口对准二维码，由真实手机应用识别。"))
             } catch {
                 guard !stopping && connected else{return}
@@ -855,7 +857,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// scanner route. Only our own window moves; no OS input is synthesized.
     /// Capture is restricted to the synthetic board before a scanner opens.
     private func runDesktopDiagnostic() async {
-        var report:[String:Any]=["test":"desktop-native-app-flow","physicalMouseDragMeasured":false]
+        var report:[String:Any]=["test":"desktop-native-app-flow","physicalMouseDragMeasured":false,
+            "genericDesktopCamera":genericDesktopCamera,"initialGenericSettleSelected":settleInitialGenericCapture]
         var applications=[[String:Any]]()
         let activeExit=CommandLine.arguments.contains("--diagnostic-active-scanner-exit")
         let navigationProbe=CommandLine.arguments.contains("--diagnostic-navigation-probe")
@@ -893,6 +896,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         try Task.checkCancellation();try await Task.sleep(nanoseconds:100_000_000)
                     }
                     guard cameraActive,!busy,cameraPump != nil,cameraWindow === mainControl else{throw ScanError("应用内扫一扫未自动启用桌面相机。")}
+                    if genericDesktopCamera,let initialPump=cameraPump {
+                        let firstDeadline=ProcessInfo.processInfo.systemUptime+3
+                        while initialPump.snapshot().statistics.firstFrameAcknowledgedAt==nil,
+                              cameraActive,cameraPump === initialPump,ProcessInfo.processInfo.systemUptime<firstDeadline {
+                            try Task.checkCancellation();try await Task.sleep(nanoseconds:10_000_000)
+                        }
+                        if let tap=diagnosticScannerTapUptime,let ready=desktopCameraReadyUptime,ready>=tap {
+                            item["scannerTapToDesktopCameraReadyMilliseconds"]=(ready-tap)*1000
+                            if let acknowledged=initialPump.snapshot().statistics.firstFrameAcknowledgedAt,acknowledged>=ready {
+                                item["scannerTapToFirstFrameAcknowledgedMilliseconds"]=(acknowledged-tap)*1000
+                                item["desktopCameraReadyToFirstFrameAcknowledgedMilliseconds"]=(acknowledged-ready)*1000
+                            }
+                        }
+                    }
                     let nativeOverlay=nativeScannerOverlay;observedOverlay=nativeOverlay
                     item["nativeScannerPreviewVisible"]=mainControl.nativeScannerVisible
                     item["nativeDecodedFrameDelivery"]=nativeOverlay?.decodedFrameDelivery ?? false
@@ -1528,7 +1545,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             do {
                 let rect=localScanFrame?.captureRect ?? captureControl.desktopCaptureRect
                 if localCameraMode,localScanRect != rect {
-                    localScanRect=rect;pump.delayCapture(until:tick+0.18)
+                    localScanRect=rect
+                    pump.prepareRegion(at:tick,immediateFirst:genericDesktopCamera && !settleInitialGenericCapture)
                 }
                 performanceCheck?.recordCaptureRect(rect,at:tick)
                 pump.publish(try DesktopCaptureTarget.current(for:rect))
@@ -1631,6 +1649,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                     if genericFrameMode {lastDeliveredRevision=selection.revision}
                     stats.sent+=1
+                    if stats.firstFrameAcknowledgedAt==nil {stats.firstFrameAcknowledgedAt=sentAt}
                     if let previous=lastSentAt {stats.maximumGapMilliseconds=max(stats.maximumGapMilliseconds,(sentAt-previous)*1000)}
                     lastSentAt=sentAt;transientFailureSince=nil
                     stats.transferMilliseconds=(sentAt-sending)*1000

@@ -467,3 +467,14 @@ M4/M5/M6立即退出模式有效呈现1/1/0次，不当作持续呈现验收。M
 上述启动事务是目录打开/任务确认等后端耗时，不是扫一扫打开速度。两轮只能证明**本次未观察到系统相机打开受控虚拟相机**，不能仅据此确认 ROM/App 不兼容、权限弹窗、物理相机绕过或具体根因。第三应用的相机供图与识码均不计通过，微信/支付宝结果也不外推所有 App。最后三项系统服务约48/44/255ms返回，Mac测试进程及窗口为0，phone session记录不存在、App connected/cameraActive=false、screenPermission=true。
 
 夹具要求显式 `--run-device-test --resources /准确路径/MiraDroid.app/Contents/Resources --package com.android.camera --locked-applications --output .local/generic-camera-tests/唯一新报告.json`；只在已有相应锁屏授权与唯一USB设备时使用该锁屏参数。原生GUI自检与该后端夹具不能同时运行，失败保留会话时先恢复，不叠加新测试。运行原始记录与OCR/像素不入仓，仅保存本节脱敏结论。
+
+
+## 首次取景等待优化（2026-10-29）
+
+build44候选仅优化首次generic区域：送图泵尚无target且没有任何此前move/retry的captureNotBefore时，初始区域可立即开始取景；否则继续等待180ms，绝不缩短已有截止点。onMoved、刷新、revision/epoch/owner验证、暂停与关闭逻辑未改。新增CameraPumpMailbox回归包含首次立即、已有移动截止点不被覆盖、后续区域继续稳定期、兼容模式仍等待、停止不可恢复及首ACK快照。
+
+原生自检的 `--diagnostic-initial-settle` 只在 `--run-desktop-diagnostic` 入口生效，把同一generic路径恢复为原首次180ms等待，用于同包对照。报告显式记录genericDesktopCamera与initialGenericSettleSelected，先保存初次pump计时，再执行原暂停/重开回归，避免把后续pump归成首次。
+
+新增计时从自身镜像输入派发的uptime开始，desktopCameraReady指ROI发布且后台送图泵已启动；firstFrameAcknowledged指同代当前区域图像请求返回手机处理ACK。不是物理输入、首个显示像素、手机绘制或识别结果。若没有本轮扫描点击或有效初ACK则不填数值；为观察初ACK最多额外等待3秒，不主动接受权限或跳转任意App页面。默认和180ms对照尚待同包USB实测，不以理论节省等同实际快180ms。
+
+系统相机继续只读检查：仅按该App进程过滤最近300条warning，在内存匹配固定的相机ID/权限/会话/后台拒绝等类别，未输出或保存原始日志；八类匹配均为0。该有界筛选未定位原因，不能由零匹配认定没有错误；不扩展读取其他App日志或靠修改系统权限试错。官方[AOSP虚拟相机说明](https://android.googlesource.com/platform/frameworks/av/+/refs/heads/main/services/camera/virtualcamera/README.md)描述标准Camera API消费者与EXTERNAL能力/限制，这是通用来源路线的依据，不能据此断言小米系统相机为何没有打开流。

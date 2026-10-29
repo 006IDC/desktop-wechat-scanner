@@ -5,6 +5,7 @@ import Foundation
 final class CameraPumpMailbox: @unchecked Sendable {
     struct Statistics: Sendable {
         var sent=0,dropped=0
+        var firstFrameAcknowledgedAt:TimeInterval?
         var syntheticQRVisible=false
         var localQRSubmitted=false
         var localSubmission:Selection?
@@ -32,6 +33,15 @@ final class CameraPumpMailbox: @unchecked Sendable {
     func delayCapture(until time:TimeInterval) {
         lock.lock();defer{lock.unlock()}
         if active {captureNotBefore=time;revision &+= 1}
+    }
+    /// The untouched first generic region is already stationary. An earlier
+    /// drag/retry fence, or any previously selected region, still requires settling.
+    func prepareRegion(at time:TimeInterval,immediateFirst:Bool) {
+        lock.lock();defer{lock.unlock()}
+        guard active else{return}
+        let untouched=target==nil && captureNotBefore==0
+        captureNotBefore=max(captureNotBefore,time+(immediateFirst && untouched ? 0:0.18))
+        revision &+= 1
     }
     func captureReady(at time:TimeInterval)->Bool {
         lock.lock();defer{lock.unlock()}
