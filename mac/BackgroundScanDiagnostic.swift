@@ -258,7 +258,8 @@ private final class BackgroundScanResult:@unchecked Sendable {
                             if qrShownAt != nil,firstQRACK==nil {firstQRACK=now}
                         } catch is DesktopCaptureTransientError {item["captureTransientOccurred"]=true}
                         catch is CameraFrameExpiredError {item["expiredFrameOccurred"]=true}
-                        if let qrShownAt,let match=result.snapshot(),match.observed<=until,now<=until {
+                        if let qrShownAt,let verifiedQRAt,let match=result.snapshot(),sent>0,
+                           match.received>=verifiedQRAt,match.observed<=until,now<=until {
                             recognized=true;resultFrameTime=match.received;item["qrShownToResultDecodedMilliseconds"]=(match.received-qrShownAt)*1000
                             item["qrShownToResultObservedMilliseconds"]=(match.observed-qrShownAt)*1000;break
                         }
@@ -276,7 +277,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     item["requestMilliseconds"]=percentiles(costs);item["captureMilliseconds"]=percentiles(captures)
                     item["sendStartGapMilliseconds"]=percentiles(zip(startTimes.dropFirst(),startTimes).map{($0-$1)*1000})
                     if let qrShownAt,let firstQRACK {item["qrShownToFirstACKMilliseconds"]=(firstQRACK-qrShownAt)*1000}
-                    guard recognized else{throw Failure.result}
+                    guard recognized,verifiedQRAt != nil,sent>0 else{throw Failure.result}
                     if abba,index+1<plans.count {
                         // Limit ordinary asynchronous BACK input to a fresh
                         // result of this run, checked against two owned snapshots.
