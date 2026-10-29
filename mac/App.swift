@@ -1171,7 +1171,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             evidence["navigationKnownLabels"]=observedHomeLabels.sorted()
         }
         let deadline=ProcessInfo.processInfo.systemUptime+30
-        try await Task.sleep(nanoseconds:500_000_000)
+        // Optional comparison precondition only, before the actual scan tap.
+        // It is excluded from tap-to-attach and calibration timings.
+        let settle:UInt64=CommandLine.arguments.contains("--diagnostic-navigation-settle") ? 2_000_000_000:500_000_000
+        try await Task.sleep(nanoseconds:settle)
         while ProcessInfo.processInfo.systemUptime<deadline {
             try checkNavigation()
             let state=try await phone.cameraState()
