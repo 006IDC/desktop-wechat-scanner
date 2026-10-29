@@ -732,7 +732,10 @@ actor PhoneSession {
                     "requestedTasksOnTarget":after.filter{$0.display==target && $0.userID==0 && $0.packageName==app.packageName}.count,
                     "requestedTasksElsewhere":after.filter{$0.display != target && $0.userID==0 && $0.packageName==app.packageName}.count,
                     "otherUserTasksOnTarget":after.filter{$0.display==target && ($0.userID != 0 || $0.rootContainsOtherUsers)}.count]
-                if foreground?.hasPrefix(app.packageName+"/")==true {return}
+                if foreground?.hasPrefix(app.packageName+"/")==true {
+                    lastApplicationLaunchEvidence=nil
+                    return
+                }
                 Thread.sleep(forTimeInterval: 0.2)
             }
             throw ScanError("应用未出现在指定屏幕；已保留恢复记录。")
