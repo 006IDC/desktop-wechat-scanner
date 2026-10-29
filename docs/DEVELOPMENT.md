@@ -724,3 +724,9 @@ Mailbox与生命周期合成回归通过，新增同代prelaunch旧帧必须等�
 微信诊断新增真实“发现→扫一扫”备用路径：Home标题/至少三个底tab、Discover标题/菜单地标、扫一扫区域共同核对；只点一次发现，其tap不冒充扫码tap；发送前继续确认同一owned display/activity。产品通用相机流程不新增任何微信按钮或App名单。scope/实验旗标互斥、自有snapshot拒绝普通桌面、Discover合法/错误页面合成通过。
 
 统计更正：build50–54的sendStartGap实际来自每次成功请求所属循环的起点，含采集等待，不是实际socket发送间隔；已更正上方相关表头，数值原样保留，不能据它判断首图后是否停顿。build55的CameraFrameReceipt增加phone actor内部requestStartedAt（旧初始化兼容nil），分别记录loopIterationGap、sendStartGapClock=phone_actor_request_start和ACK完成间隔；这仍不是物理网络上第一个字节时刻。firstCapture只含capture/warmup等待，firstImagePipeline才含源验证和确认。早前30Hz稳定性未通过和保守默认8Hz的结论不因改口径变更，不沿用旧最大loop间隔声称发包停顿。
+
+### build55 后台结果（源码68bd88a）
+
+首轮snapshot模式支付宝严格识码、连续源交接核实、清理通过，但firstACKUsedSnapshot=false，首张在发送前过期；tap→首ACK839.5ms，不能计为snapshot提速。随后ABBA首个stream轮通过（tap→首ACK447.5ms、结果帧1790.5ms）；第二个snapshot轮实际送达首图且交接源核实，tap→首ACK254.6ms，但9秒内未严格匹配文字结果（最小编辑距离1），整组失败即停止，不继续B2/A2，不把近似文字当通过。两轮手机返回帧均核实源QR，约145.5/421.0ms在源确认后首次观察到，ACK较快不等于返回画面较快。两组清理成功，权限一直有效。
+
+故意过期warmup轮firstACKUsedSnapshot=true、streamWarmupFailed/fallback=true，正常capture重建后源交接核实并严格识码；tap→首ACK347.7ms、结果帧1431.8ms，确认失败Task没有被连续await到截止。微信单轮也实际点击其原生扫一扫并严格识码，tap→首ACK684.1ms、结果帧2257.8ms，清理成功；本轮用的是已验证＋菜单，新增Discover备用尚未实测。所有四次入口未请求激活、前后前台标识相同，只有自有后置板；不以此替代物理拖动/真实前台动画验收。snapshot不启用产品默认，继续定位手机收帧到相机Surface实际post的等待。
