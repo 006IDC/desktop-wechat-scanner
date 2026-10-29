@@ -387,3 +387,31 @@ b35959d无抓图短对照：同一产品显示管线持续约20.05秒，整轮�
 
 
 2026-10-29真机A/B准备：`--native-png-calibration`仅覆盖研究校准发送选择，与`--native-batched-calibration`联用时保留全部新帧等待、采样及状态检查，以同一签名包/同一Android服务对照PNG和solid。默认选择不变。报告新增black/blue request和processing耗时（ACK赋值/解码成本，非实际paint），以及明确标签`scannerTapToNativeAttachedMilliseconds`：程序在真实扫一扫控件发出内部tap，到原生层挂载的时间，不包含用户找入口、物理鼠标延迟或首像素测量；无本次有效tap则不填写。真机数据尚未取得。
+
+
+## 纯色校准真机对照（2026-10-29）
+
+实测候选源码`031e7b4`，同一签名App、同一Android服务、唯一已授权USB手机；研究参数`--native-camera-preview --native-batched-calibration`固定，A仅加`--native-png-calibration`，B走已认证能力协商后的solid。安装版仍为build41/9444951。为不把无效入口当测速，早期自动导航失败、人工导航超时/取消、只读导航探针均不进入以下比较；它们的会话也正常清理，未改TCC。`--diagnostic-navigation-settle`仅在真正扫描tap前等2秒，不计入tap→attach或calibration。
+
+支付宝单应用范围：`--run-desktop-diagnostic --diagnostic-usb --diagnostic-primary-screen --diagnostic-navigation-settle --diagnostic-alipay-only`。按A-B-B-A、B-A-A-B共8轮，每轮`solidCalibrationSelected`与参数一致、真实合成纯文本码识别、返回及清理通过，journal消失，screenPermission持续true。此处的passed仅表示支付宝选定范围，不冒充双应用通过。内部tap→attach起止为扫描控件输入派发到原生层挂载，不是物理输入/首像素；calibration为prepare开始到新蓝底确认，也不是扫码结果等待。
+
+| 顺序/方式 | tap→attach ms | calibration ms |
+| --- | ---: | ---: |
+| A3 PNG | 1178.743 | 982.889 |
+| B1 solid | 799.305 | 654.816 |
+| B2 solid | 870.330 | 723.691 |
+| A4 PNG | 872.477 | 634.615 |
+| B3 solid | 901.503 | 683.634 |
+| A5 PNG | 760.610 | 533.298 |
+| A6 PNG | 767.610 | 612.225 |
+| B4 solid | 831.383 | 665.346 |
+
+各4次：tap→attach均值PNG894.860ms、solid850.631ms，平均差44.230ms；但中位数PNG820.044ms、solid850.857ms，未见稳定整体提升。calibration均值690.757→681.872ms仅差8.885ms，中位数623.420→674.490ms。两次背景Android ACK处理总和均值19.864→0.334ms，说明赋值/解码微步骤实际减少；不包括真实Surface paint、Mac PNG生成或用户首像素。黑底候选就绪到九帧齐备平均390.666/391.031ms，此阶段仍远大于背景处理成本。样本小且初始/热身差异明显，不用单次最好值或均值差宣称加速。
+
+微信在同包中改用`--diagnostic-manual-navigation --diagnostic-active-scanner-exit`，由界面工具仅操作真实加号/扫一扫（必要时从当前页返回首页）；自动入口尚不稳定，导航本身的等候不算calibration。有效校准顺序M4 solid746.180ms、M5 PNG714.089ms、M6 solid775.984ms、M7 PNG776.619ms、M8 solid812.496ms。PNG2次均值/中位745.354ms；solid3次均值778.220ms、中位775.984ms，仍未见开场提速。手工入口没有本轮可用的内部tap起点，因此不填tap→attach；不能将校准数字冒充微信完整打开时间。这5轮是预览/活跃扫码退出测试，没有运行微信合成码识别，不复用旧版本识码结果。
+
+M4/M5/M6立即退出模式有效呈现1/1/0次，不当作持续呈现验收。M7/M8额外`--diagnostic-native-hold --diagnostic-native-short-hold`分别运行约20.04/20.02秒，可见384次采样、无遮挡/最小化采样，有效呈现934/1065次，GPU失败0且回调收齐；呈现间隔p95约50.00/16.67ms，但最大时间戳间隔两者仍约1秒。未测物理输入到显示，不据时间戳直接判真实停画，也不据单轮p95称已达到参考视频。镜像截图曾出现重复标题，实际菜单以上方真实加号触发；这不证明截图问题或产品绘制的根因。
+
+只读导航探针只输出尺寸、像素格式、亮度抽样统计及固定导航标签，不保存任意OCR/手机图像。曾取到启动黑帧，等候后有正常导航标签；同帧锁前/锁后/物化识别未证明是CPU读取故障。探针单列`test=navigation-frame-probe/performanceMeasured=false/probeCompleted`，不混入产品测速。原始诊断和数值汇总留本地忽略目录，不上传设备标识、运行配置或手机内容。
+
+末轮结束已核对本候选进程不存在、恢复记录不存在；virtualdevice、virtual_camera、media.camera只读检查约57/47/330ms，均正常响应。全部测试沿用已有录屏授权，没有重置TCC、重新配对、修改证书/系统信任、替换安装版或发布Release。结论是处理微步骤优化成立，稳定整体开场提速尚未成立。
