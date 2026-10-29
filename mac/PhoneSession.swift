@@ -741,7 +741,8 @@ actor PhoneSession {
             }
             let result = try measureLaunch("startCommandMilliseconds"){try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")}
             guard !result.lowercased().contains("error:"), !result.lowercased().contains("exception") else { throw ScanError("手机应用启动失败。") }
-            for _ in 0..<8 {
+            for check in 0..<ApplicationLaunchConfirmation.maximumChecks {
+                try Task.checkCancellation()
                 lastLaunchStages["confirmationReads",default:0]+=1
                 let (activityDump,after)=try measureLaunch("confirmationSnapshotMilliseconds") {
                     let dump=try shell("dumpsys activity activities")
@@ -761,12 +762,17 @@ actor PhoneSession {
                     "requestedTasksOnTarget":after.filter{$0.display==target && $0.userID==0 && $0.packageName==app.packageName}.count,
                     "requestedTasksElsewhere":after.filter{$0.display != target && $0.userID==0 && $0.packageName==app.packageName}.count,
                     "otherUserTasksOnTarget":after.filter{$0.display==target && ($0.userID != 0 || $0.rootContainsOtherUsers)}.count]
+                // Preserve newly discovered task recovery before honoring a
+                // cancellation that arrived during the blocking snapshot.
+                try Task.checkCancellation()
                 if foreground?.hasPrefix(app.packageName+"/")==true {
                     lastLaunchStages["confirmed"]=1
                     lastApplicationLaunchEvidence=nil
                     return
                 }
-                measureLaunch("confirmationSleepMilliseconds"){Thread.sleep(forTimeInterval:0.2)}
+                if let delay=ApplicationLaunchConfirmation.delay(afterCheck:check) {
+                    measureLaunch("confirmationSleepMilliseconds"){Thread.sleep(forTimeInterval:delay)}
+                }
             }
             throw ScanError("应用未出现在指定屏幕；已保留恢复记录。")
         },clear:{_ = try self.measureLaunch("compensationMilliseconds"){try self.bindDesktopCamera(display:target,package:nil)}})
