@@ -152,24 +152,26 @@ public final class LiveCameraServer {
     static final class SessionFlags {
         final boolean independentLock;
         final boolean desktopHome;
-        final boolean balancedDisplay, displayBeforeCamera, mirrorOnly, realtimeVideo;
-        SessionFlags(boolean independentLock, boolean desktopHome, boolean balancedDisplay, boolean displayBeforeCamera, boolean mirrorOnly, boolean realtimeVideo) {
+        final boolean balancedDisplay, displayBeforeCamera, mirrorOnly, realtimeVideo, desktopCameraSource;
+        SessionFlags(boolean independentLock, boolean desktopHome, boolean balancedDisplay, boolean displayBeforeCamera, boolean mirrorOnly, boolean realtimeVideo, boolean desktopCameraSource) {
             this.independentLock = independentLock;
             this.desktopHome = desktopHome;
             this.balancedDisplay = balancedDisplay;
             this.displayBeforeCamera = displayBeforeCamera;
             this.mirrorOnly = mirrorOnly;
             this.realtimeVideo = realtimeVideo;
+            this.desktopCameraSource = desktopCameraSource;
         }
+        boolean needsCompatibilityCameraGrants() { return !mirrorOnly && !desktopCameraSource; }
     }
 
     static SessionFlags parseSessionFlags(String[] args) {
-        if (args == null || args.length < 3 || args.length > 9 ||
+        if (args == null || args.length < 3 || args.length > 10 ||
                 !args[1].matches("006idc_scan_[0-9a-f]{8}") || !args[2].matches("[0-9a-f]{32}"))
-            throw new IllegalArgumentException("Expected associationId 006idc_scan_<8 hex> <32 hex token> [independent-lock] [desktop-home] [balanced-display] [display-before-camera] [mirror-only] [realtime-video]");
+            throw new IllegalArgumentException("Expected associationId 006idc_scan_<8 hex> <32 hex token> [independent-lock] [desktop-home] [balanced-display] [display-before-camera] [mirror-only] [realtime-video] [desktop-camera-source]");
         boolean independentLock = false;
         boolean desktopHome = false;
-        boolean balancedDisplay = false, displayBeforeCamera = false, mirrorOnly = false, realtimeVideo = false;
+        boolean balancedDisplay = false, displayBeforeCamera = false, mirrorOnly = false, realtimeVideo = false, desktopCameraSource = false;
         for (int index = 3; index < args.length; index++) {
             if ("independent-lock".equals(args[index]) && !independentLock) independentLock = true;
             else if ("desktop-home".equals(args[index]) && !desktopHome) desktopHome = true;
@@ -177,11 +179,14 @@ public final class LiveCameraServer {
             else if ("display-before-camera".equals(args[index]) && !displayBeforeCamera) displayBeforeCamera = true;
             else if ("mirror-only".equals(args[index]) && !mirrorOnly) mirrorOnly = true;
             else if ("realtime-video".equals(args[index]) && !realtimeVideo) realtimeVideo = true;
+            else if ("desktop-camera-source".equals(args[index]) && !desktopCameraSource) desktopCameraSource = true;
             else throw new IllegalArgumentException("Unsupported or duplicate virtual display flag");
         }
         if ((balancedDisplay || displayBeforeCamera || mirrorOnly || realtimeVideo) && !desktopHome)
             throw new IllegalArgumentException("Research display flags require desktop-home");
-        return new SessionFlags(independentLock, desktopHome, balancedDisplay, displayBeforeCamera, mirrorOnly, realtimeVideo);
+        if (desktopCameraSource && (!desktopHome || mirrorOnly))
+            throw new IllegalArgumentException("Desktop camera source requires a camera-enabled desktop-home session");
+        return new SessionFlags(independentLock, desktopHome, balancedDisplay, displayBeforeCamera, mirrorOnly, realtimeVideo, desktopCameraSource);
     }
 
     static boolean requestedIndependentLock(String[] args) {
@@ -1497,7 +1502,9 @@ public final class LiveCameraServer {
             }
             if (!live.mirrorOnlyRequested) {
                 log("setup_phase", "camera_policy");
-                live.grantSupportedCameras();
+                // Generic sessions start without compatibility grants. Authenticated
+                // source selection and per-owned-window binding remain required.
+                if (flags.needsCompatibilityCameraGrants()) live.grantSupportedCameras();
                 log("setup_phase", "virtual_camera");
                 live.createVirtualCamera();
             } else {

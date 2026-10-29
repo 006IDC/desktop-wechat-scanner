@@ -247,6 +247,8 @@ actor PhoneSession {
     private var displayID: Int?
     private(set) var independentApplicationsWhenLocked=false
     private var genericDesktopCamera=false
+    // Canned placement counts only; no component names, IDs, extras or page text.
+    private(set) var lastApplicationLaunchEvidence:[String:Int]?
     private var cleaning=false
     private(set) var connectionStage = "idle"
     private var diagnosticLog: ServerLog?
@@ -271,6 +273,9 @@ actor PhoneSession {
     }
     func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, desktopHome: Bool = false, balancedDisplay: Bool = false, displayBeforeCamera: Bool = false, mirrorOnly: Bool = false, realtimeVideo: Bool = false, genericDesktopCamera:Bool=false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
         guard server == nil else { throw ScanError("手机已经连接。") }
+        guard !genericDesktopCamera || (desktopHome && !mirrorOnly) else {
+            throw ScanError("通用桌面相机需要启用相机的应用桌面会话。")
+        }
         do {
             connectionStage = "enumeration"
             progress("正在检查手机连接…")
@@ -322,7 +327,7 @@ actor PhoneSession {
             let process=Process(), pipe=Pipe(), log=ServerLog()
             diagnosticLog = log
             process.executableURL=adbURL
-            let lockArgument=(allowLockedApplications ? " independent-lock":"") + (desktopHome ? " desktop-home":"") + (balancedDisplay ? " balanced-display":"") + (displayBeforeCamera ? " display-before-camera":"") + (mirrorOnly ? " mirror-only":"") + (realtimeVideo ? " realtime-video":"")
+            let lockArgument=(allowLockedApplications ? " independent-lock":"") + (desktopHome ? " desktop-home":"") + (balancedDisplay ? " balanced-display":"") + (displayBeforeCamera ? " display-before-camera":"") + (mirrorOnly ? " mirror-only":"") + (realtimeVideo ? " realtime-video":"") + (genericDesktopCamera ? " desktop-camera-source":"")
             process.arguments=(serverSocket.map { ["-L", $0] } ?? []) + ["-s",r.serial,"shell","CLASSPATH=\(r.path)/server.jar app_process / LiveCameraServer \(association) \(r.socketName) \(r.token)\(lockArgument)"]
             process.standardOutput=pipe;process.standardError=pipe
             pipe.fileHandleForReading.readabilityHandler = { handle in let data=handle.availableData; if !data.isEmpty {log.append(data)} else {log.finish()} }
@@ -680,6 +685,7 @@ actor PhoneSession {
     }
     @discardableResult
     func launchApplication(_ app: AndroidApplication, on target: Int) throws -> Bool {
+        lastApplicationLaunchEvidence=nil
         guard let state = recovery, channel != nil, ownsDisplay(target), app.isValid else { throw ScanError("应用或屏幕不属于本次连接。") }
         try requireApplicationAccess(on:target)
         // Revalidate against the authenticated launcher catalog, never execute an arbitrary component.
@@ -719,7 +725,14 @@ actor PhoneSession {
                     appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: 0, packageName: app.packageName, ownedDisplay: target))
                     try save()
                 }
-                if Self.foregroundComponent(in: activityDump, display: target)?.hasPrefix(app.packageName + "/") == true { return }
+                let foreground=Self.foregroundComponent(in:activityDump,display:target)
+                lastApplicationLaunchEvidence=[
+                    "foregroundKind":foreground.map{$0.hasPrefix(app.packageName+"/") ? 1:2} ?? 0,
+                    "targetTaskCount":after.filter{$0.display==target}.count,
+                    "requestedTasksOnTarget":after.filter{$0.display==target && $0.userID==0 && $0.packageName==app.packageName}.count,
+                    "requestedTasksElsewhere":after.filter{$0.display != target && $0.userID==0 && $0.packageName==app.packageName}.count,
+                    "otherUserTasksOnTarget":after.filter{$0.display==target && ($0.userID != 0 || $0.rootContainsOtherUsers)}.count]
+                if foreground?.hasPrefix(app.packageName+"/")==true {return}
                 Thread.sleep(forTimeInterval: 0.2)
             }
             throw ScanError("应用未出现在指定屏幕；已保留恢复记录。")

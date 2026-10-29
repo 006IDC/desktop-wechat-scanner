@@ -1098,7 +1098,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                 } catch is NavigationProbeComplete {
                     item["probeCompleted"]=true;item["intentionalStop"]=true
-                } catch {item["failure"]=error.localizedDescription}
+                } catch {
+                    item["failure"]=error.localizedDescription
+                    if let evidence=await phone.lastApplicationLaunchEvidence {item["applicationLaunchEvidence"]=evidence}
+                }
                 if let check=performanceCheck {item.merge(check.finish()){_,new in new}}
                 performanceCheck=nil;cameraSuppressed=true
                 let cameraCleared=await clearCamera();await setCaptureDiagnosticBoard(nil)

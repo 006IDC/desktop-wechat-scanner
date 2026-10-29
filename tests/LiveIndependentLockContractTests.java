@@ -93,12 +93,19 @@ public final class LiveIndependentLockContractTests {
 
         LiveCameraServer.SessionFlags normalFlags = LiveCameraServer.parseSessionFlags(legacy);
         require(!normalFlags.balancedDisplay && !normalFlags.displayBeforeCamera && !normalFlags.mirrorOnly && !normalFlags.realtimeVideo, "Research paths enabled by default");
+        require(normalFlags.needsCompatibilityCameraGrants(), "Legacy compatibility grants lost");
+        LiveCameraServer.SessionFlags generic = LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-home","desktop-camera-source"});
+        require(generic.desktopCameraSource && !generic.needsCompatibilityCameraGrants(), "Generic startup still grants compatibility packages");
+        require(LiveCameraServer.parseSessionFlags(desktop).needsCompatibilityCameraGrants(), "Desktop compatibility grants lost");
+        rejects(() -> LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-camera-source"}), "Unscoped generic camera accepted");
+        rejects(() -> LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-home","mirror-only","desktop-camera-source"}), "Camera source in mirror-only accepted");
+        rejects(() -> LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-home","desktop-camera-source","desktop-camera-source"}), "Duplicate source flag accepted");
         LiveCameraServer.SessionFlags research = LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-home","balanced-display","display-before-camera"});
         require(research.balancedDisplay && research.displayBeforeCamera && research.desktopHome, "Explicit research flags lost");
         rejects(() -> LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"balanced-display"}), "Unscoped research accepted");
         rejects(() -> LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-home","balanced-display","balanced-display"}), "Duplicate research accepted");
         LiveCameraServer.SessionFlags mirrorOnly = LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-home","mirror-only"});
-        require(mirrorOnly.mirrorOnly, "Mirror-only isolation lost");
+        require(mirrorOnly.mirrorOnly && !mirrorOnly.needsCompatibilityCameraGrants(), "Mirror-only isolation lost");
         rejects(() -> LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"mirror-only"}), "Unscoped mirror-only accepted");
         rejects(() -> LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-home","mirror-only","mirror-only"}), "Duplicate mirror-only accepted");
         require(LiveCameraServer.parseSessionFlags(new String[]{legacy[0],legacy[1],legacy[2],"desktop-home","realtime-video"}).realtimeVideo, "Realtime research flag lost");
