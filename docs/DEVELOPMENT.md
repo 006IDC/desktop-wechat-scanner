@@ -641,3 +641,11 @@ OwnedTaskMoveTests合成覆盖上述反例，并贯通真实任务树解析器�
 按用户要求，本轮不切换正在使用的Mac应用、不重置录屏权限。恢复夹具把第二帧与前台状态检查拆成独立阶段，新增可选的固定内存事件和任务校验错误类型；不导出任务原文、组件、ID或页面内容，严格拒绝条件暂不改变。精确复测已出现重试启动失败：新显示创建/镜像连接后，在任务树校验中失败；首轮历史报告缺分类，不能追溯认定同因。
 
 新增显式 `--run-background-scan-diagnostic --diagnostic-usb --locked-applications --background-report <new private JSON>` 研究入口。其 `.prohibited` 分支不构造AppController、不调用激活接口，仅检查已有屏幕录制权限；不足则失败，不申请权限。测试板只含随机纯文本二维码，禁止key/main与鼠标输入，排在普通窗口后方；生产DesktopCapture过滤器只包含本进程该测试板。真实手机应用、已认证相机归属、生产采集/帧队列/socket/解码组件参与测试，结果仅固定布尔/计数和耗时，无图片或任意OCR。扫码动作只允许在确认的自有显示/应用页面中执行固定导航；首次扫码点击后仅等待，不重复点击，不通过返回键退出既有页面。此入口不等于完整AppController、物理拖动或前台体验验收，实际扫码结果待下文记录。
+
+### TaskFragment 反例与修复（build50）
+
+精确恢复轮次1–13中，4/7/10/13在重试就绪前失败（其余9轮通过），四轮停止后都不继续自动复试。7的固定类型为startupOther；10已细分为任务树malformedTask；13进一步定位为TaskFragment，且任务恢复失败、记录保留。此前轮次只细分了诊断，没有修改解析器放行条件。不能把这些后来失败追溯当作最早那次second-frame的已证实原因。
+
+[Android 16 AOSP TaskFragment.dump](https://android.googlesource.com/platform/frameworks/base/+/android16-qpr2-release/services/core/java/com/android/server/wm/TaskFragment.java)递归输出fragment/活动，Hist使用所属Task。修复将fragment视为真实Task下的结构容器，活动仍核对真实Task ID和用户，直接child计数逐层验证，不生成虚假的可迁移任务；同task内多包新增拒绝。正常/嵌套fragment及内嵌真实Task通过合成测试，跨包、跨用户、错Task ID、错子数、孤立/空/损坏fragment仍拒绝。原迁移组与窗口生命周期合成回归通过，独立只读复核未发现放宽归属门槛的缺陷。
+
+修复后用当前生产PhoneSession和新解析器编译仅恢复入口，核原设备/owner/关联后成功恢复第13轮保留会话，无恢复记录；不清空记录、不新建虚拟设备、不修改录屏权限。研究包49源码`89c80fd`仅用于诊断，尚未运行扫码入口；后续包使用修正后的解析器。

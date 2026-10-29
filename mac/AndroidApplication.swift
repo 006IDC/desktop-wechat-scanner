@@ -80,7 +80,7 @@ struct AndroidTaskSnapshot: Equatable {
         try scan(dump, strict: true, requiredDisplay: requiredDisplay)
     }
     struct ValidationError:LocalizedError {
-        enum Reason:String {case duplicateDisplay,malformedDisplay,malformedTask,malformedTaskFields,taskFragment,nonPositiveTask,otherUserOnTarget,malformedHistory,userMismatch,conflictingTask,missingDisplay,childCountMismatch,unknownChildren}
+        enum Reason:String {case duplicateDisplay,malformedDisplay,malformedTask,malformedTaskFields,taskFragment,orphanFragment,nonPositiveTask,otherUserOnTarget,malformedHistory,userMismatch,conflictingTask,missingDisplay,childCountMismatch,unknownChildren}
         let reason:Reason
         var expectedChildren:Int?=nil,observedChildren:Int?=nil,onTarget:Bool?=nil
         var errorDescription:String? {"无法完整核实手机任务树，已保留窗口和恢复记录。"}
@@ -92,6 +92,7 @@ struct AndroidTaskSnapshot: Equatable {
         let size: Int?
         let isHome: Bool
         let userID: Int?
+        var isFragment=false
         var childTasks = 0
         var histories = 0
     }
@@ -106,6 +107,7 @@ struct AndroidTaskSnapshot: Equatable {
         var rootUsers: [RootKey: Set<Int>] = [:]
         let displayPattern = try! NSRegularExpression(pattern: "^Display #([0-9]+) \\(activities from top to bottom\\):$")
         let taskPattern = try! NSRegularExpression(pattern: "^\\*\\s+Task\\{[^}]* #([0-9]+)(?:[ }])")
+        let fragmentPattern = try! NSRegularExpression(pattern:"^\\*\\s+TaskFragment\\{[0-9a-fA-F]+ mode=[A-Za-z0-9_-]+(?:[ }])")
         let sizePattern = try! NSRegularExpression(pattern: "(?:^|\\s)sz=([0-9]+)(?:[ }])")
         let taskUserPattern = try! NSRegularExpression(pattern: "(?:^|\\s)U=([0-9]+)(?:[ }])")
         let historyStart = try! NSRegularExpression(pattern: "^(?:\\*\\s*)?Hist\\b")
@@ -145,6 +147,18 @@ struct AndroidTaskSnapshot: Equatable {
                 if let parent = roots.last { nodes[parent].childTasks += 1 }
                 nodes.append(TaskNode(indent: indent, display:currentDisplay, id: id, size: size, isHome: isHome, userID: userID)); roots.append(nodes.count - 1); continue
             }
+            if fragmentPattern.firstMatch(in:line,range:range) != nil {
+                // Android 16 TaskFragment.dump recursively nests activities but
+                // their Hist task ID still refers to the nearest real Task.
+                // A fragment is one direct child, never a movable task itself.
+                guard let parent=roots.last,let owner=roots.last(where:{!nodes[$0].isFragment}) else {
+                    if strict {throw ValidationError(reason:.orphanFragment)};continue
+                }
+                nodes[parent].childTasks+=1
+                let task=nodes[owner]
+                nodes.append(TaskNode(indent:indent,display:currentDisplay,id:task.id,size:nil,isHome:task.isHome,userID:task.userID,isFragment:true))
+                roots.append(nodes.count-1);continue
+            }
             if strict && line.hasPrefix("*") && line.dropFirst().trimmingCharacters(in: .whitespaces).hasPrefix("Task") {
                 let header=line.dropFirst().trimmingCharacters(in:.whitespaces)
                 let reason:ValidationError.Reason=header.hasPrefix("TaskFragment{") ? .taskFragment:((header.contains("#0 ") || header.contains("#-1 ")) ? .nonPositiveTask:.malformedTask)
@@ -164,7 +178,7 @@ struct AndroidTaskSnapshot: Equatable {
             rootUsers[rootKey, default: []].insert(user)
             let entry = Self(id: id, display: currentDisplay, packageName: ns.substring(with: match.range(at: 2)),
                              rootID: nodes[root].id, isHome: nodes[root].isHome, userID: user)
-            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID || old.isHome != entry.isHome || old.userID != entry.userID { throw ValidationError(reason:.conflictingTask) }
+            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID || old.isHome != entry.isHome || old.userID != entry.userID || old.packageName != entry.packageName { throw ValidationError(reason:.conflictingTask) }
             tasks[id] = entry
         }
         if strict {

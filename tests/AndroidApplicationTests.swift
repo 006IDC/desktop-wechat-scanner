@@ -221,6 +221,40 @@ import Foundation
             require(error.reason == .childCountMismatch && error.expectedChildren==1 && error.observedChildren==0 && error.onTarget==true,"Task error classification lost safe counters")
         }
         do { _ = try AndroidTaskSnapshot.parseChecked(checkedHistory, requiredDisplay: 99); fatalError("Unrecognized target accepted as empty") } catch {}
+        // Android 16 dumps Hist under TaskFragment containers, but t20 remains
+        // the real owning Task. Fragments count as direct children, not tasks.
+        let fragments="""
+        Display #8 (activities from top to bottom):
+          * Task{root #20 U=0 type=standard sz=2}
+            * TaskFragment{a1 mode=fullscreen organizerUid=10001 organizerProc=org.example.app}
+              * Hist  #0: ActivityRecord{x u0 org.example.app/.Main t20}
+            * TaskFragment{a2 mode=fullscreen}
+              * TaskFragment{a3 mode=fullscreen}
+                * Hist  #0: ActivityRecord{y u0 org.example.app/.Second t20}
+        """
+        let embedded=try AndroidTaskSnapshot.parseChecked(fragments,requiredDisplay:8)
+        require(embedded.count==1 && embedded[0].id==20 && embedded[0].rootID==20 && embedded[0].userID==0 && embedded[0].packageName=="org.example.app","Fragments became tasks or lost owning task")
+        let unsafeFragments=[
+            fragments.replacingOccurrences(of:"org.example.app/.Second",with:"org.example.other/.Second"),
+            fragments.replacingOccurrences(of:"ActivityRecord{y u0",with:"ActivityRecord{y u999"),
+            fragments.replacingOccurrences(of:".Second t20",with:".Second t21"),
+            fragments.replacingOccurrences(of:"sz=2",with:"sz=3"),
+            fragments.replacingOccurrences(of:"TaskFragment{a2",with:"TaskFragmentBroken{a2"),
+            "Display #8 (activities from top to bottom):\n  * TaskFragment{a1 mode=fullscreen}\n    * Hist #0: ActivityRecord{x u0 org.example.app/.Main t20}",
+            "Display #8 (activities from top to bottom):\n  * Task{root #20 U=0 sz=1}\n    * TaskFragment{a1 mode=fullscreen}"
+        ]
+        for tree in unsafeFragments {
+            do {_=try AndroidTaskSnapshot.parseChecked(tree,requiredDisplay:8);fatalError("Unsafe/incomplete fragment tree accepted")}catch{}
+        }
+        let embeddedChild="""
+        Display #8 (activities from top to bottom):
+          * Task{root #20 U=0 sz=1}
+            * TaskFragment{a1 mode=fullscreen}
+              * Task{child #21 U=0 sz=1}
+                * Hist #0: ActivityRecord{x u0 org.example.app/.Main t21}
+        """
+        let child=try AndroidTaskSnapshot.parseChecked(embeddedChild,requiredDisplay:8)
+        require(child.count==1 && child[0].id==21 && child[0].rootID==20,"Nested actual Task lost root ownership")
         print("PASS authoritative task parser and fail-closed checked production path, trusted empty displays/split children, real Hist spacing and unknown/partial/absent target rejection")
     }
 }
