@@ -112,6 +112,12 @@ import Dispatch
         mailbox.stop();mailbox.publish(first,generation:10)
         require(invalidated.wait(timeout:.now()+1) == .success,"Stop failed to invalidate the old input")
         require(observed.takeLatest()==nil,"Stop retained an observer")
-        print("PASS CVPixelBuffer latest-only mailbox, generation isolation, concurrency")
+        mailbox.reset(generation:11);mailbox.publish(first,generation:11)
+        mailbox.stop(generation:10)
+        require(mailbox.takeLatest()?.generation==11,"Old failure stopped a replacement epoch")
+        mailbox.publish(first,generation:11);mailbox.stop(generation:11)
+        mailbox.publish(last,generation:11)
+        require(mailbox.takeLatest()==nil,"Matching failure did not stop frames synchronously")
+        print("PASS CVPixelBuffer latest-only mailbox, generation isolation, concurrency and epoch-scoped stop")
     }
 }

@@ -52,6 +52,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let metadataWarmup=CaptureMetadataWarmup()
     private var cameraStartupStages:[String:Double]=[:]
     private var cameraStartupPrewarmed=false
+    private var cameraWindowAvailability:CameraWindowAvailability?
+    private var cameraPreparation:(token:UUID,display:Int?)?
+    private var cameraInvalidation:(token:UUID,display:Int,task:Task<Bool,Never>)?
     private var coldCaptureMetadata:Bool {CommandLine.arguments.contains("--run-desktop-diagnostic") && CommandLine.arguments.contains("--diagnostic-cold-capture-metadata")}
     private var captureMetadataWarmupRequested:Bool {
         CommandLine.arguments.contains("--run-desktop-diagnostic") &&
@@ -398,9 +401,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self.disconnect(preserveError:true)
                 }
                 detachedApplications?.onCameraReady={ [weak self] in self?.beginCaptureMetadataWarmup() }
-                detachedApplications?.beforeClose={ [weak self] display in
-                    guard let self,self.cameraDisplay==display else{return}
-                    await self.clearCamera()
+                detachedApplications?.onCameraUnavailable={ [weak self] display in
+                    guard let self else{return Task {false}}
+                    return self.invalidateDetachedCamera(display)
                 }
                 startLoop()
                 if desktopMode {return}
@@ -664,7 +667,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let confirmed:Bool
             do {try await phone.clear(epoch:scanGeneration,requireConnection:true);confirmed=true}
             catch {confirmed=false}
-            cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil
+            cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil;cameraWindowAvailability=nil
             if clearingLocal,!confirmed {localScanClearFailed()}
             return confirmed
         }
@@ -800,21 +803,55 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     private func requestDesktopCamera() {
-        guard connected,!busy,!stopping else{return}
+        guard connected,!busy,!stopping,cameraInvalidation==nil else{return}
         cameraSuppressed=false
         if cameraActive,paused {togglePause()}
         else if cameraActive {localScanFrame?.show()}
         else {status("桌面相机已选定","在所选手机应用内打开相机或扫一扫，即可使用透明取景框。")}
     }
+    private func availableCameraWindow(_ window:ControlWindowController,display:Int?)->Bool {
+        guard desktopMode,window !== mainControl else{return true}
+        return detachedApplications?.cameraWindows().contains {$0.display==display && $0.window === window} == true
+    }
+    /// Stop image admission before waiting for startup/capture teardown. A lost
+    /// detached mirror must neither keep pumping nor finish a late camera start.
+    private func invalidateDetachedCamera(_ display:Int)->Task<Bool,Never> {
+        if let pending=cameraInvalidation,pending.display==display {return pending.task}
+        guard connected,!stopping else{return Task {false}}
+        guard cameraDisplay==display || cameraPreparation?.display==display else{return Task {true}}
+        cameraSuppressed=true;busy=true;paused=true;cameraActive=false
+        cameraPump?.stop();cameraLoop?.cancel()
+        let previous=operationTask,generation=mirrorGeneration,token=UUID()
+        previous?.cancel();refresh()
+        let task=Task { [weak self] in
+            guard let self else{return false}
+            defer {if cameraInvalidation?.token==token {cameraInvalidation=nil}}
+            await previous?.value
+            guard connected,!stopping,mirrorGeneration==generation else{return false}
+            let cleared=await clearCamera()
+            guard connected,!stopping,mirrorGeneration==generation else{return false}
+            busy = !cleared;refresh()
+            status("桌面相机已暂停",cleared ? "应用窗口已停止取景，重新打开应用后可继续。":"手机未确认清除画面，正在结束本次连接。")
+            return cleared
+        }
+        cameraInvalidation=(token,display,task)
+        return task
+    }
     private func startCamera(in requestedWindow:ControlWindowController?=nil,display requestedDisplay:Int?=nil){
         let targetWindow=requestedWindow ?? control
         let targetDisplay=requestedDisplay ?? mirrorDisplay
-        guard connected && !busy && !stopping && !cameraSuppressed else{return}
-        guard targetWindow.window?.isVisible == true,targetWindow.window?.isMiniaturized == false else{return}
+        guard connected && !busy && !stopping && !cameraSuppressed,cameraInvalidation==nil else{return}
+        guard targetWindow.window?.isVisible == true,targetWindow.window?.isMiniaturized == false,
+              availableCameraWindow(targetWindow,display:targetDisplay) else{return}
+        let windowAvailability=detachedApplications?.cameraAvailability(display:targetDisplay,window:targetWindow)
+        guard !desktopMode || targetWindow === mainControl || windowAvailability != nil else{return}
         busy=true;operationTask?.cancel()
+        let preparationToken=UUID()
+        cameraPreparation=(preparationToken,targetDisplay)
         nativeScannerAttachedUptime=nil;desktopCameraReadyUptime=nil;cameraStartupStages=[:];cameraStartupPrewarmed=false
         let startupBegan=ProcessInfo.processInfo.systemUptime
         operationTask=Task { [self] in
+            defer {if cameraPreparation?.token==preparationToken {cameraPreparation=nil}}
             let drainingBegan=ProcessInfo.processInfo.systemUptime
             await metadataWarmup.withForeground { prepared in
                 do {
@@ -840,12 +877,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             await capture.stop();busy=false;return
                         }
                     }
-                    guard targetWindow.window?.isVisible == true,targetWindow.window?.isMiniaturized == false else {
+                    try Task.checkCancellation()
+                    guard targetWindow.window?.isVisible == true,targetWindow.window?.isMiniaturized == false,
+                          availableCameraWindow(targetWindow,display:targetDisplay),windowAvailability?.isAvailable != false else {
                         await capture.stop();busy=false;cameraSuppressed=true;status("桌面相机已暂停","恢复窗口后点扫码继续。");return
                     }
                     cameraStartupStages["verifyOwnerMilliseconds"]=(ProcessInfo.processInfo.systemUptime-stage)*1000
                     stage=ProcessInfo.processInfo.systemUptime
-                    cameraWindow=targetWindow;cameraDisplay=targetDisplay
+                    cameraWindow=targetWindow;cameraDisplay=targetDisplay;cameraWindowAvailability=windowAvailability
                     targetWindow.onPause={ [weak self] in self?.togglePause() }
                     targetWindow.onPermissionSettings={ [weak self] in self?.permissionSettings() }
                     targetWindow.onRelaunch={ [weak self] in self?.relaunch() }
@@ -1433,7 +1472,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return state.captureActivity()
     }
     private func followCameraState(_ state:PhoneCameraState) async {
-        guard connected,!stopping,!busy else{return}
+        guard connected,!stopping,!busy,cameraInvalidation==nil else{return}
         if let overlay=nativeScannerOverlay,!overlay.matches(state) {
             overlay.noteStateChange(state)
             _=await clearCamera()
@@ -1638,6 +1677,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if now>=nextCameraDiagnostic {nextCameraDiagnostic=now+2;writeDiagnosticState()}
     }
     private func startCameraLoop(){
+        guard cameraInvalidation==nil,cameraWindowAvailability?.isAvailable != false else{return}
         cameraLoop?.cancel();cameraPump?.stop()
         // A live, user-requested scanner must keep receiving presentation ticks
         // when the user focuses the QR in another app. Scope the activity to the
@@ -1647,7 +1687,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 reason:"实时手机桌面相机")
         }
         cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0
-        let pump=CameraPumpMailbox(),generation=scanGeneration
+        let availability=cameraWindowAvailability
+        let pump=CameraPumpMailbox(sourceIsAvailable:{availability?.isAvailable != false}),generation=scanGeneration
         let diagnosticQRStart=performanceCheck == nil ? Double.infinity:ProcessInfo.processInfo.systemUptime+6.2
         let saveSyntheticPattern=performanceCheck != nil && CommandLine.arguments.contains("--diagnostic-pattern")
         cameraPump=pump;cameraFramesBase=framesSent
@@ -1930,6 +1971,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             await stopNativeScannerOverlay()
             let chooserClean=await chooser?.waitForCleanup() ?? true
             await capture.stop();await previousCamera?.value
+            _=await cameraInvalidation?.task.value
             await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
             var problem=await phoneSession?.disconnect() ?? ""
             let networkProblem=await disconnectWireless()
@@ -1990,6 +2032,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             await stopNativeScannerOverlay()
             let chooserClean=await chooser?.waitForCleanup() ?? true
             await capture.stop();await previousCamera?.value
+            _=await cameraInvalidation?.task.value
             await detachedApplications?.stop();detachedApplications=nil;await stopMirrors()
             var problem=await phoneSession?.disconnect() ?? ""
             let networkProblem=await disconnectWireless()

@@ -812,6 +812,8 @@ final class ControlWindowController: NSWindowController {
         if let frame { updatePhoneSize(NSSize(width: frame.width, height: frame.height)) }
     }
 
+    func setPhoneInteractionEnabled(_ enabled:Bool) {holder.phone.interactionEnabled=enabled}
+
     /// Native video path: retain/render decoder pixel buffers without making a CGImage.
     func setPhonePixelBuffer(_ pixels: CVPixelBuffer?) {
         holder.phone.setPixelBuffer(pixels)

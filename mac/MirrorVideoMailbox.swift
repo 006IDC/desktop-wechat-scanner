@@ -61,7 +61,14 @@ final class MirrorVideoMailbox: @unchecked Sendable {
     }
 
     func stop() {
+        stop(ifGeneration:nil)
+    }
+    func stop(generation:Int) {
+        stop(ifGeneration:generation)
+    }
+    private func stop(ifGeneration expected:Int?) {
         lock.lock()
+        guard expected==nil || generation==expected else{lock.unlock();return}
         let invalidate=decodedObserver?.invalidate
         active=false;pending=nil;decodedObserver=nil
         lock.unlock();invalidate?()

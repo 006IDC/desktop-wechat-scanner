@@ -149,6 +149,20 @@ import Dispatch
         }
         require(stopped.latest()==nil && stopped.snapshot().failure==nil,
                 "Concurrent callbacks revived a stopped pump")
-        print("PASS latest drag target, concurrent snapshots, metrics readback, failure and stop isolation")
+        let availability=CameraWindowAvailability()
+        let fenced=CameraPumpMailbox(sourceIsAvailable:{availability.isAvailable})
+        fenced.publish(target(1));let selected=fenced.selection()!
+        var handoff=CameraPumpMailbox.Statistics();handoff.localQRSubmitted=true;handoff.localSubmission=selected
+        fenced.update(handoff)
+        require(fenced.captureReady(at:10) && fenced.isCurrent(selected) && fenced.canHandoff(at:10),"Live attempt did not admit frames")
+        DispatchQueue.global().sync{availability.invalidate()}
+        require(fenced.selection()==nil && fenced.latest()==nil && !fenced.captureReady(at:10) && !fenced.isCurrent(selected) && !fenced.canHandoff(at:10),"Lost mirror required a main-thread stop before refusing a send")
+        fenced.publish(target(2));fenced.prepareRegion(at:10,immediateFirst:true)
+        require(fenced.selection()==nil,"Geometry revived an invalidated attempt")
+        let newAvailability=CameraWindowAvailability()
+        let newAttempt=CameraPumpMailbox(sourceIsAvailable:{newAvailability.isAvailable})
+        newAttempt.publish(target(3));availability.invalidate()
+        require(newAvailability.isAvailable && newAttempt.selection() != nil,"Old invalidation killed a replacement")
+        print("PASS latest drag target, concurrent snapshots, metrics, stop isolation and off-main attempt invalidation")
     }
 }
