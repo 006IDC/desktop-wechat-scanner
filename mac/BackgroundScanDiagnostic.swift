@@ -235,9 +235,16 @@ private final class BackgroundScanResult:@unchecked Sendable {
         guard !FileManager.default.fileExists(atPath:journal.path),
               NSRunningApplication.runningApplications(withBundleIdentifier:"com.idc006.DesktopWeChatScanner").allSatisfy({$0.processIdentifier==ProcessInfo.processInfo.processIdentifier}),
               let output=PrivateDiagnosticReport.openNew(path) else{return 2}
+        // The product declares this activity while scanning. Keep this explicit
+        // user-requested background test eligible for the same scheduling; do
+        // not prevent display or system idle sleep. Always release after cleanup.
+        let activity=ProcessInfo.processInfo.beginActivity(options:.userInitiatedAllowingIdleSystemSleep,
+            reason:"用户请求的后台手机扫码验证")
+        defer {ProcessInfo.processInfo.endActivity(activity)}
         var report:[String:Any]=["test":"background-owned-board-scan","physicalInputMeasured":false,"appControllerTested":false,
             "captureScope":"own-synthetic-board-only","activationRequested":false,"phoneVideoQRProbeEnabled":probeQR,
-            "immediateSyntheticQR":immediateQR,"forcedExpiredStreamWarmup":expireWarmup]
+            "immediateSyntheticQR":immediateQR,"forcedExpiredStreamWarmup":expireWarmup,
+            "userInitiatedActivityRequested":true,"idleSystemSleepAllowed":true]
         let adb=resources.appendingPathComponent("adb/bin/adb"),phone=PhoneSession(resources:resources,adbURL:adb)
         let capture=DesktopCapture()
         var board:BoardWindow?,mirror:MirrorSession?,recognitionTask:Task<Void,Never>?,streamWarmup:Task<Void,Error>?,items=[[String:Any]](),stage="prerequisites",passed=false
