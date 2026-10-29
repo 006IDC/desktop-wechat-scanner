@@ -79,8 +79,15 @@ struct AndroidTaskSnapshot: Equatable {
     static func parseChecked(_ dump: String, requiredDisplay: Int? = nil) throws -> [Self] {
         try scan(dump, strict: true, requiredDisplay: requiredDisplay)
     }
+    struct ValidationError:LocalizedError {
+        enum Reason:String {case duplicateDisplay,malformedDisplay,malformedTask,malformedTaskFields,taskFragment,nonPositiveTask,otherUserOnTarget,malformedHistory,userMismatch,conflictingTask,missingDisplay,childCountMismatch,unknownChildren}
+        let reason:Reason
+        var expectedChildren:Int?=nil,observedChildren:Int?=nil,onTarget:Bool?=nil
+        var errorDescription:String? {"无法完整核实手机任务树，已保留窗口和恢复记录。"}
+    }
     private struct TaskNode {
         let indent: Int
+        let display:Int
         let id: Int
         let size: Int?
         let isHome: Bool
@@ -103,7 +110,6 @@ struct AndroidTaskSnapshot: Equatable {
         let taskUserPattern = try! NSRegularExpression(pattern: "(?:^|\\s)U=([0-9]+)(?:[ }])")
         let historyStart = try! NSRegularExpression(pattern: "^(?:\\*\\s*)?Hist\\b")
         let historyPattern = try! NSRegularExpression(pattern: "^\\*\\s+Hist\\s+#[0-9]+:\\s+ActivityRecord\\{[^}]* u([0-9]+) ([A-Za-z_][A-Za-z0-9_.]*)/[^ }]+ t([0-9]+)(?:[ }])")
-        let invalid = ScanError("无法完整核实手机任务树，已保留窗口和恢复记录。")
         for raw in dump.split(separator: "\n") {
             let line = raw.trimmingCharacters(in: .whitespaces)
             let indent = raw.prefix(while: { $0 == " " || $0 == "\t" }).count
@@ -114,11 +120,11 @@ struct AndroidTaskSnapshot: Equatable {
             }
             guard !containerDiagnostics else { continue }
             if let match = displayPattern.firstMatch(in: line, range: range), let id = Int(ns.substring(with: match.range(at: 1))) {
-                if strict && !displays.insert(id).inserted { throw invalid }
+                if strict && !displays.insert(id).inserted { throw ValidationError(reason:.duplicateDisplay) }
                 displays.insert(id); display = id; displayIndent = indent; roots.removeAll(); continue
             }
             if line.hasPrefix("Display #") {
-                if strict { throw invalid }
+                if strict { throw ValidationError(reason:.malformedDisplay) }
                 display = nil; roots.removeAll(); continue
             }
             guard let currentDisplay = display else { continue }
@@ -132,41 +138,45 @@ struct AndroidTaskSnapshot: Equatable {
                 let tail = ns.substring(from: NSMaxRange(match.range(at: 1)))
                     .split(separator: "}", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
                 let isHome = tail.range(of: "(?:^|\\s)type=home(?:\\s|$)", options: .regularExpression) != nil
-                if strict && ((line.contains("sz=") && size == nil) || (line.contains("U=") && userID == nil)) { throw invalid }
-                if strict && requiredDisplay.map({ $0 > 0 && currentDisplay == $0 }) == true && userID.map({ $0 != 0 }) == true { throw invalid }
+                if strict && ((line.contains("sz=") && size == nil) || (line.contains("U=") && userID == nil)) { throw ValidationError(reason:.malformedTaskFields) }
+                if strict && requiredDisplay.map({ $0 > 0 && currentDisplay == $0 }) == true && userID.map({ $0 != 0 }) == true { throw ValidationError(reason:.otherUserOnTarget) }
                 let rootKey = RootKey(display: currentDisplay, id: roots.first.map { nodes[$0].id } ?? id)
                 if let userID { rootUsers[rootKey, default: []].insert(userID) }
                 if let parent = roots.last { nodes[parent].childTasks += 1 }
-                nodes.append(TaskNode(indent: indent, id: id, size: size, isHome: isHome, userID: userID)); roots.append(nodes.count - 1); continue
+                nodes.append(TaskNode(indent: indent, display:currentDisplay, id: id, size: size, isHome: isHome, userID: userID)); roots.append(nodes.count - 1); continue
             }
-            if strict && line.hasPrefix("*") && line.dropFirst().trimmingCharacters(in: .whitespaces).hasPrefix("Task") { throw invalid }
+            if strict && line.hasPrefix("*") && line.dropFirst().trimmingCharacters(in: .whitespaces).hasPrefix("Task") {
+                let header=line.dropFirst().trimmingCharacters(in:.whitespaces)
+                let reason:ValidationError.Reason=header.hasPrefix("TaskFragment{") ? .taskFragment:((header.contains("#0 ") || header.contains("#-1 ")) ? .nonPositiveTask:.malformedTask)
+                throw ValidationError(reason:reason)
+            }
             guard historyStart.firstMatch(in: line, range: range) != nil else { continue }
             guard let leaf = roots.last, let root = roots.first,
                   let match = historyPattern.firstMatch(in: line, range: range),
                   let user = Int(ns.substring(with: match.range(at: 1))),
                   let id = Int(ns.substring(with: match.range(at: 3))), id == nodes[leaf].id else {
-                if strict { throw invalid }; continue
+                if strict { throw ValidationError(reason:.malformedHistory) }; continue
             }
             nodes[leaf].histories += 1
             if strict && (nodes[leaf].userID.map({ $0 != user }) == true ||
-                          (requiredDisplay.map({ $0 > 0 && currentDisplay == $0 }) == true && user != 0)) { throw invalid }
+                          (requiredDisplay.map({ $0 > 0 && currentDisplay == $0 }) == true && user != 0)) { throw ValidationError(reason:.userMismatch) }
             let rootKey = RootKey(display: currentDisplay, id: nodes[root].id)
             rootUsers[rootKey, default: []].insert(user)
             let entry = Self(id: id, display: currentDisplay, packageName: ns.substring(with: match.range(at: 2)),
                              rootID: nodes[root].id, isHome: nodes[root].isHome, userID: user)
-            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID || old.isHome != entry.isHome || old.userID != entry.userID { throw invalid }
+            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID || old.isHome != entry.isHome || old.userID != entry.userID { throw ValidationError(reason:.conflictingTask) }
             tasks[id] = entry
         }
         if strict {
-            guard !displays.isEmpty, requiredDisplay.map({ displays.contains($0) }) ?? true else { throw invalid }
+            guard !displays.isEmpty, requiredDisplay.map({ displays.contains($0) }) ?? true else { throw ValidationError(reason:.missingDisplay) }
             for node in nodes {
                 let recognizedChildren = node.childTasks + node.histories
                 if let size = node.size {
                     // sz counts direct children, not activities in descendants:
                     // a split root with two empty child tasks is legitimately sz=2.
-                    guard recognizedChildren == size else { throw invalid }
+                    guard recognizedChildren == size else { throw ValidationError(reason:.childCountMismatch,expectedChildren:size,observedChildren:recognizedChildren,onTarget:requiredDisplay==node.display) }
                 } else {
-                    guard recognizedChildren > 0 else { throw invalid }
+                    guard recognizedChildren > 0 else { throw ValidationError(reason:.unknownChildren) }
                 }
             }
         }

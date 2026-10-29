@@ -214,6 +214,12 @@ import Foundation
         for tree in rejectedTrees {
             do { _ = try AndroidTaskSnapshot.parseChecked(tree, requiredDisplay: 0); fatalError("Unknown or incomplete tree accepted as safe") } catch {}
         }
+        do {
+            _=try AndroidTaskSnapshot.parseChecked(rejectedTrees[1],requiredDisplay:0)
+            fatalError("Incomplete child count accepted")
+        } catch let error as AndroidTaskSnapshot.ValidationError {
+            require(error.reason == .childCountMismatch && error.expectedChildren==1 && error.observedChildren==0 && error.onTarget==true,"Task error classification lost safe counters")
+        }
         do { _ = try AndroidTaskSnapshot.parseChecked(checkedHistory, requiredDisplay: 99); fatalError("Unrecognized target accepted as empty") } catch {}
         print("PASS authoritative task parser and fail-closed checked production path, trusted empty displays/split children, real Hist spacing and unknown/partial/absent target rejection")
     }

@@ -4,6 +4,9 @@ import AppKit
 /// virtual device outlives a window, but a failed mirror is never a camera target.
 @MainActor
 final class DetachedApplications: NSObject, NSWindowDelegate {
+    enum DiagnosticStage:String {case creatingDisplay,connectingMirror,launchingApplication,ready,firstFramePresented,mirrorFailed,startupFailed,clearingCamera,cameraClearFailed,displayClosed,restoreFailed}
+    enum DiagnosticFailure:String {case mirrorClosed,mirrorTimeout,mirrorOther,foregroundUnconfirmed,taskTreeInvalid,startupOther,uncertainCamera}
+    struct DiagnosticEvent {let attempt:Int;let stage:DiagnosticStage;let failure:DiagnosticFailure?;let validation:AndroidTaskSnapshot.ValidationError?}
     private enum Phase { case starting, ready, recovering, failed, closing, stopped }
     @MainActor private final class Entry {
         let app:AndroidApplication,ui:ControlWindowController
@@ -13,11 +16,17 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
         var availability:CameraWindowAvailability?
         var acceptedTouch:(x:Double,y:Double)?
         var failureDetail=""
+        var firstFramePresented=false
         var acceptsInput:Bool {phase == .ready && display != nil && availability?.isAvailable==true}
         init(_ app:AndroidApplication) {self.app=app;ui=ControlWindowController(title:app.name,standalone:true)}
     }
     var onCameraCleanupFailure:((Error)->Void)?
     var onCameraReady:(()->Void)?
+    /// Optional, fixed metadata only. Ordinary product construction has no observer.
+    var onDiagnosticEvent:((DiagnosticEvent)->Void)?
+    private func diagnostic(_ entry:Entry,_ stage:DiagnosticStage,_ failure:DiagnosticFailure?=nil,validation:AndroidTaskSnapshot.ValidationError?=nil) {
+        onDiagnosticEvent?(DiagnosticEvent(attempt:entry.epoch,stage:stage,failure:failure,validation:validation))
+    }
     /// Stops capture admission synchronously, then confirms asynchronous clear.
     /// The old display cannot be closed/reused until the returned task completes.
     var onCameraUnavailable:((Int)->Task<Bool,Never>)?
@@ -99,6 +108,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
         let epoch=entry.epoch
         let availability=CameraWindowAvailability();entry.availability=availability;entry.acceptedTouch=nil
         entry.phase = .starting;entry.retryRequested=false;entry.failureDetail=""
+        entry.firstFramePresented=false;diagnostic(entry,.creatingDisplay)
         entry.frames.reset(generation:epoch);entry.ui.setPhonePixelBuffer(nil);entry.ui.setPhoneInteractionEnabled(false)
         entry.ui.update(status:"正在打开 \(entry.app.name)",detail:"应用仍在手机运行，画面即将在这里出现。",connected:false,busy:true,paused:true)
         entry.startup=Task { [weak self,entry] in
@@ -109,6 +119,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
                 // Record even a late result: the cleanup owner awaits this task.
                 entry.display=display.id
                 try Task.checkCancellation()
+                diagnostic(entry,.connectingMirror)
                 let endpoint=try await phone.mirrorEndpoint(display:display.id)
                 let direct=try await phone.directMirror(display:display.id)
                 try Task.checkCancellation()
@@ -117,22 +128,30 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
                     onFrame:{ [frames=entry.frames] pixels in
                         guard availability.isAvailable else{return};frames.publish(pixels,generation:epoch)
                     },
-                    onFailure:{ [weak self,weak entry,frames=entry.frames] _ in
+                    onFailure:{ [weak self,weak entry,frames=entry.frames] detail in
                         availability.invalidate();frames.stop(generation:epoch)
                         Task { @MainActor in
                             guard let self,let entry else{return}
+                            guard entry.epoch==epoch else{return}
+                            let reason:DiagnosticFailure=detail.contains("超时") ? .mirrorTimeout:(detail=="手机镜像连接中断。" ? .mirrorClosed:.mirrorOther)
+                            self.diagnostic(entry,.mirrorFailed,reason)
                             self.fail(entry,epoch:epoch,detail:"画面连接中断，请从应用列表重新打开以重试。")
                         }
                     })
                 try Task.checkCancellation()
+                diagnostic(entry,.launchingApplication)
                 let cameraReady=try await phone.launchApplication(entry.app,on:display.id)
                 try Task.checkCancellation()
                 guard !stopping,entry.epoch==epoch,entry.phase == .starting,availability.isAvailable else{return}
                 entry.phase = .ready;entry.ui.setPhoneInteractionEnabled(true)
+                diagnostic(entry,.ready)
                 if cameraReady {onCameraReady?()}
                 entry.ui.update(status:entry.app.name,detail:cameraReady ? "桌面相机已绑定；在此应用内打开相机即可取景。":"独立应用窗口 · 关闭后移回手机；黄色按钮使用系统程序坞动画。",connected:true,busy:false,paused:true)
             } catch {
                 guard !stopping,entry.epoch==epoch,entry.phase == .starting else{return}
+                let validation=error as? AndroidTaskSnapshot.ValidationError
+                let reason:DiagnosticFailure=error is DesktopCameraLaunchFailure ? .uncertainCamera:(validation != nil ? .taskTreeInvalid:(error.localizedDescription=="应用未出现在指定屏幕；已保留恢复记录。" ? .foregroundUnconfirmed:.startupOther))
+                diagnostic(entry,.startupFailed,reason,validation:validation)
                 fail(entry,epoch:epoch,detail:error.localizedDescription,uncertainCamera:error is DesktopCameraLaunchFailure)
             }
         }
@@ -158,6 +177,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
     private func recover(_ entry:Entry) {
         guard entry.cleanup==nil else{return}
         let startup=entry.startup,initialDisplay=entry.display
+        diagnostic(entry,.clearingCamera)
         // Calling this hook must stop any active/startup camera before the first await.
         let initialCameraClear=initialDisplay.flatMap{onCameraUnavailable?($0)}
         entry.cleanup=Task { [self,entry] in
@@ -169,10 +189,11 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
             guard !stopping else{entry.cleanup=nil;return false}
             var clean=cameraClear && !entry.requiresReconnect
             if clean,let display=entry.display {
-                do {try await phone.closeAppDisplay(display);entry.display=nil}
-                catch {clean=false;entry.failureDetail="旧窗口尚未清理完成："+error.localizedDescription}
+                do {try await phone.closeAppDisplay(display);entry.display=nil;diagnostic(entry,.displayClosed)}
+                catch {clean=false;diagnostic(entry,.restoreFailed);entry.failureDetail="旧窗口尚未清理完成："+error.localizedDescription}
             }
             if !cameraClear {
+                diagnostic(entry,.cameraClearFailed)
                 let alreadyUncertain=entry.requiresReconnect
                 entry.requiresReconnect=true
                 entry.failureDetail="桌面相机清理未确认，请断开手机后重新连接。"
@@ -193,7 +214,10 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
     }
     func present() {
         for entry in entries.values where (entry.phase == .starting || entry.phase == .ready) && entry.availability?.isAvailable==true && entry.ui.window?.isMiniaturized != true {
-            if let frame=entry.frames.takeLatest(),frame.generation==entry.epoch {entry.ui.setPhonePixelBuffer(frame.pixelBuffer)}
+            if let frame=entry.frames.takeLatest(),frame.generation==entry.epoch {
+                entry.ui.setPhonePixelBuffer(frame.pixelBuffer)
+                if !entry.firstFramePresented {entry.firstFramePresented=true;diagnostic(entry,.firstFramePresented)}
+            }
         }
     }
     func windowShouldClose(_ sender:NSWindow)->Bool {
