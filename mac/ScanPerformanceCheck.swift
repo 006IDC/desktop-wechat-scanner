@@ -29,6 +29,7 @@ import CoreImage.CIFilterBuiltins
     private(set) var qrVisible = false
     private(set) var movedPoints: CGFloat = 0
     private let reduceMotion: Bool
+    private let animatedBoard:Bool
 
     init(scanner: ControlWindowController,onPrimaryScreen:Bool=false) throws {
         let primary=NSScreen.screens.first {
@@ -40,6 +41,7 @@ import CoreImage.CIFilterBuiltins
         }
         self.scanner = window; originalOrigin = window.frame.origin
         reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        animatedBoard = !reduceMotion && !(CommandLine.arguments.contains("--run-desktop-diagnostic") && CommandLine.arguments.contains("--diagnostic-static-board"))
         let visible = screen.visibleFrame
         if onPrimaryScreen {
             // Select one display before creating the board and capture target.
@@ -100,8 +102,7 @@ import CoreImage.CIFilterBuiltins
             let x=center.x+amplitude*sin(elapsed*Double.pi)
             movedPoints=max(movedPoints,abs(x-center.x))
             scanner.setFrameOrigin(NSPoint(x:x,y:center.y))
-            pattern.phase=elapsed
-            pattern.needsDisplay=true
+            if animatedBoard {pattern.phase=elapsed;pattern.needsDisplay=true}
         } else if !qrVisible {
             scanner.setFrameOrigin(center)
             qrVisible=true; pattern.showQR=true; pattern.needsDisplay=true
@@ -179,7 +180,7 @@ import CoreImage.CIFilterBuiltins
                 "movementResponseWaitP95Milliseconds":percentile(responseWaitCosts),
                 "movementResponseBodyP95Milliseconds":percentile(responseBodyCosts),
                 "movementImageBytesP95":percentile(imageSizes),
-                "movementAmplitudePoints":movedPoints, "reducedMotion":reduceMotion,
+                "movementAmplitudePoints":movedPoints, "reducedMotion":reduceMotion,"boardAnimated":animatedBoard,
                 "physicalMouseDragMeasured":false]
     }
 }

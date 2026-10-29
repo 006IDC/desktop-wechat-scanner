@@ -14,6 +14,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
         }
     }
     var onCameraCleanupFailure:((Error)->Void)?
+    var onCameraReady:(()->Void)?
     var beforeClose: ((Int) async -> Void)?
     func cameraWindows() -> [(display:Int,window:ControlWindowController)] {
         entries.values.compactMap { entry in
@@ -70,6 +71,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
                 try Task.checkCancellation();let cameraReady=try await phone.launchApplication(app, on: display.id)
                 try Task.checkCancellation();entry.ready=true
                 guard !entry.closing, !stopping else { return }
+                if cameraReady {onCameraReady?()}
                 entry.ui.update(status: app.name, detail: cameraReady ? "桌面相机已绑定；在此应用内打开相机即可取景。":"独立应用窗口 · 关闭后移回手机；黄色按钮使用系统程序坞动画。", connected: true, busy: false, paused: true)
             } catch {
                 entry.ready=false

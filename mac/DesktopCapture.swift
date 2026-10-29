@@ -295,6 +295,13 @@ actor DesktopCapture {
             }
             try Task.checkCancellation()
             guard token==generation else {throw CancellationError()}
+            if let boardID=diagnosticBoardID {
+                // Early metadata preparation may precede the board becoming
+                // shareable. Do not cache an unusable diagnostic window list.
+                guard value.windows.contains(where:{$0.windowID==boardID && $0.owningApplication?.processID==ProcessInfo.processInfo.processIdentifier}) else {
+                    throw ScanError("合成测试窗口尚未就绪。")
+                }
+            }
             content=value
         } catch {
             markPermissionFailure(error)

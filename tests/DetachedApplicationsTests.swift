@@ -118,9 +118,12 @@ final class MirrorSession: @unchecked Sendable {
         let readyPhone=PhoneSession()
         await readyPhone.configure(block:false,fail:false)
         let readyManager=DetachedApplications(phone:readyPhone,adb:URL(fileURLWithPath:"/synthetic/adb"),server:URL(fileURLWithPath:"/synthetic/server"))
+        var cameraReadyCallbacks=0
+        readyManager.onCameraReady={cameraReadyCallbacks+=1}
         require(readyManager.open(app,at:nil),"Ready fixture rejected app")
         require(readyManager.cameraWindows().isEmpty,"Pending app became a camera target")
         try await waitUntil{readyManager.cameraWindows().count==1}
+        require(cameraReadyCallbacks==1,"Camera metadata preparation was not offered for a ready window")
         guard let readyWindow=readyManager.cameraWindows().first?.window.window else{fatalError("No ready camera target")}
         require(readyManager.windowShouldClose(readyWindow)==false && readyManager.cameraWindows().isEmpty,"Closing app remained a camera target")
         await readyManager.stop()
@@ -129,9 +132,10 @@ final class MirrorSession: @unchecked Sendable {
         let failedManager=DetachedApplications(phone:failedPhone,adb:URL(fileURLWithPath:"/synthetic/adb"),server:URL(fileURLWithPath:"/synthetic/server"))
         var failures=0
         failedManager.onCameraCleanupFailure={_ in failures+=1}
+        failedManager.onCameraReady={cameraReadyCallbacks+=1}
         require(failedManager.open(app,at:nil),"Failure fixture rejected app")
         try await waitUntil{failures==1}
-        require(failedManager.cameraWindows().isEmpty,"Uncertain binding remained a camera target")
+        require(failedManager.cameraWindows().isEmpty && cameraReadyCallbacks==1,"Uncertain binding became camera-ready")
         await failedManager.stop()
         require(!manager.open(app, at: nil), "Stopped manager silently accepted an app")
         require(ControlWindowController.created.allSatisfy { $0.window?.isVisible == false }, "Probe ordered a window into shared UI")

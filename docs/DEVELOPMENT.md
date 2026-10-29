@@ -511,3 +511,16 @@ App build44安装包源码 `794d923ea3b8bd47a81b927e45ef6c22717b1900`，ZIP SHA2
 随后仅对本次创建的自有GUI进程进行8秒/10ms间隔 `sample`，原始调用栈留本机私有目录，不采集其他App、像素或正文。样本显示主线程存在RunLoop正常等待、Core Animation提交/同步，以及合成板ScanPerformancePattern.draw工作；没有据此发现或证明主线程死锁，也不能把调用栈采样数直接当延迟百分比。合成板本身与采样可能影响观测：该受采样轮功能与清理通过，但微信首ACK约2007.848ms、tick最大116.247ms，支付宝约506.801ms/48.555ms；不混入前述未采样A/B均值，不据此将性能差异归为产品回归或某一确定根因。
 
 本次未重测系统相机；Android源及PhoneSession/PhoneCameraState与build43未改变，先前“未观察到虚拟流”的未通过状态保留，固定类别warning筛选没有定位根因。CUA仍无法完成真实鼠标/视觉验收，本次依然不称视频同等效果，不修改已安装App、不创建Release或重置录屏权限。最终回读：自有GUI进程与屏上窗口均为0，session记录不存在、connected/cameraActive=false、screenPermission=true；三个系统服务约45.8/42.8/306.5ms正常返回。
+
+
+## 元数据准备生命周期重构（2026-10-29）
+
+build45候选将通用来源的SCShareableContent查询移到所选相机应用启动后。后台任务先检查已存在的CGPreflightScreenCaptureAccess，未授权不调用prepare；它只查询可捕获显示器和窗口元数据，不调用SCStream、裁切、编码或phone.frame。前台采集仍保留完整相机owner/binding/revision/epoch校验。主窗与独立窗口只在cameraReady后触发，非相机应用或失败/关闭中的窗口不触发。
+
+CaptureMetadataWarmup负责唯一pending/draining Job；重复start合并，finish取消并等待相同Job，等待期间不开始下一份准备。前台owner的嵌套独占阶段在drain之前禁止新start，跨所有await保持，抛错/返回时恢复；所有正式prepare与换板统一入口，旧runPerformanceCheck也纳入。startCamera、clearCamera、断开和退出统一收束；诊断换合成板前也收束，避免旧元数据请求与新的采集上下文竞争。已完成准备可复用DesktopCapture原有元数据缓存，未完成/失败则由原正式prepare路径处理。没有新增权限申请或后台图像预采集。
+
+显式原生诊断 `--diagnostic-cold-capture-metadata` 关闭此预热，用于同包比较；新增 `--diagnostic-wechat-only` 可限定微信，与alipay-only冲突时拒绝，不扩大该范围通过结论；报告coldCaptureMetadataSelected、metadataWarmupCompleted和startupStages（drain/clear/prepare/verifyOwner/presentAndStartPump、tapToDetection等）。检测前包含镜像输入、Android打开相机、回调及状态轮询，不能单独当作手机处理耗时。原有tap→首图ACK仍不是首像素/识别完成。
+
+`--diagnostic-static-board` 只在原生桌面诊断内冻结合成板持续重绘，窗口仍按相同轨迹移动并正常显示后续测试QR；report.boardAnimated区分工作负载。系统减少动态效果时也不更新该测试条。静态/动态板不能混作同一性能基线，不将降低测试负载称为产品优化。
+
+新增CaptureMetadataWarmupTests的禁止准入、重复start、并发finish、取消/失败/完成复用通过；DetachedApplications假手机回归增加仅ready触发的校验并通过。真机分段及同包对照尚待完成，不预报提速。
