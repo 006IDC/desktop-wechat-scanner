@@ -736,3 +736,15 @@ Mailbox与生命周期合成回归通过，新增同代prelaunch旧帧必须等�
 新增CameraPaintTiming仅保留连接内最多128个数字样本，无像素/包名/文本。计时从服务端发布解码Bitmap或合成色源后，到任一自有相机Surface首次成功unlockCanvasAndPost；重复空闲刷新不重复计数，replacement/clear/失效后的旧ticket不计。lock/draw/post分段含该绘制调用自身的开销，不可简单相加为total（源可能在lock等待期间更新）；不包含JPEG解码/socket/手机App消费/物理呈现。状态与owner不是原子快照，数据不参与归属授权，不能用作某App纯处理时间。旧服务不提供时缺省nil，无效可选数字丢弃，不改变归属证据。
 
 结果文字核验新增无customWords、无expected输入的英文top1二次识别，仅原有结果前缀近似但未命中时尝试；仍须独立top1去空白后完全等于本轮码，不将编辑距离当通过。primary也拒绝附带ASCII字符；拆词只组合同基线邻近的完整ASCII组，跨行/远区不拼。该变化只改善自有诊断核验，不改变手机识别或产品供图。此前失败组继续保留，不追溯转为成功。
+
+### build56 真机分段与频率对照（源码f4982b5）
+
+包SHA256 `219982912e8b10a333f1403f215b7710f689204ff2f652f42f659730448c4fb9`，源码/JAR/同DR深度签名回读通过。支付宝单轮严格识码与清理通过，tap→首ACK699.9ms、结果帧3619.9ms；10个有效相机首post样本最大53.4ms、最后6.03ms。微信单轮也通过，635.97ms到owner、948.25ms首ACK、2808.83ms结果帧；15个相机首post样本最大57.51ms、最后17.30ms。两轮secondaryChecks=0，结果由primary严格命中；不能把本轮较慢结果归因于secondary或把首post数字当完整画面延迟。
+
+同包支付宝8/30/30/8Hz供图四轮均严格识码且清理：tap→首ACK383.5/427.5/263.2/200.3ms；tap→结果帧2094.5/1536.6/1157.7/1119.6ms；QR显示请求→结果帧1899.1/1214.3/990.1/1011.8ms。实际phone-actor请求间隔p50约131.7/34.8/34.1/54.8ms（末轮仅2间隔，另一个128.0ms，不拿小样本p50当稳态）；有效相机首post最大39.1/47.5/7.46/13.6ms。冷暖/顺序仍显著：最后8Hz接近暖30Hz，不提升产品默认供图频率。源QR与返回QR及真实原生文字结果分别核实，不丢弃既有失败。
+
+随后snapshot ABBA在第一轮stream-only的导航阶段失败：已核首页标签且发出一次scan tap，但25秒未确认camera owner，未进入采集，整组失败且停止；不是snapshot或传输性能失败。清理成功、三个系统服务继续响应。所有以上入口既有权限true、activationRequested=false、前后台标识前后相同、无恢复记录；未构造AppController或测前台动画/物理拖动。重新定向读取用户原视频：文件888×576、30fps、16.23秒；编码30fps不证明原软件渲染上限或本软件已达同效。
+
+## 首次扫码点击后的受控恢复（build57，2026-10-30，验证中）
+
+后台导航原本scanTap发出后只等待，未像原桌面诊断那样重新核实重试。复用既有3次/800ms预算：仅初次同component、camera known+closed且activeStreams=0、全新post-tap帧重新OCR核实受控home/menu入口才能重试；await后再核归属、帧和预算；未知页/相机正在打开/活动改变不重试，截止后不点。plus/discover不混入scan重试。仅改变显式后台诊断，正常产品输入不变。报告标last-verified-navigation-tap并同时给first tap→owner/首ACK/结果与重试延时，避免将丢失点击后的最后一次耗时冒充总体提速。新增纯状态反例验证已通过。

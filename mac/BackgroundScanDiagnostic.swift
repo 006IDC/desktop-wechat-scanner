@@ -70,6 +70,12 @@ private final class BackgroundScanResult:@unchecked Sendable {
     static func validExperiments(supplyABBA:Bool,snapshotABBA:Bool,snapshot:Bool,expire:Bool=false)->Bool {
         !(supplyABBA && snapshotABBA) && !(snapshotABBA && snapshot) && (!expire || (snapshot && !supplyABBA && !snapshotABBA))
     }
+    static func canRetryScan(_ state:PhoneCameraState,display:Int,component:String,at time:Double,
+                             frameReceivedAt:Double,retry:ScannerNavigationOCR.PlusRetry)->Bool {
+        retry.attempts>0 && state.activities.first(where:{$0.displayId==display})?.component==component &&
+            state.activeStreams==0 && state.ownerKnown && state.cameraOwner==nil &&
+            retry.permitsTap(at:time,frameReceivedAt:frameReceivedAt)
+    }
     enum Failure:String,Error {case arguments,existingSession,permission,device,application,mirror,navigation,camera,result,focus,cleanup}
     private final class BoardWindow:NSWindow {
         override var canBecomeKey:Bool {false}
@@ -109,29 +115,43 @@ private final class BackgroundScanResult:@unchecked Sendable {
     private static func navigate(phone:PhoneSession,mirror:MirrorSession,frames:BackgroundScanFrames,
                                  package:String,display:Int,evidence:inout [String:Any]) async throws ->Double? {
         let began=now,deadline=now+25
-        var lastFrame=0,lastTap=0.0,scanTap:Double?,plusRetry=ScannerNavigationOCR.PlusRetry(),discoverSelected=false
+        var lastFrame=0,lastTap=0.0,scanTap:Double?,firstScanTap:Double?,scanComponent:String?
+        var plusRetry=ScannerNavigationOCR.PlusRetry(),scanRetry=ScannerNavigationOCR.PlusRetry(),discoverSelected=false
         var fixedLabels=Set<String>(),ocrFrames=0
         defer {
             evidence["navigationScanTapSent"]=scanTap != nil;evidence["navigationPlusTaps"]=plusRetry.attempts
             evidence["navigationOCRFrames"]=ocrFrames;evidence["navigationKnownLabels"]=fixedLabels.sorted()
             evidence["navigationMilliseconds"]=(now-began)*1000
             evidence["navigationDiscoverTapSent"]=discoverSelected
+            evidence["navigationScanTapAttempts"]=scanRetry.attempts
+            if let first=firstScanTap,let last=scanTap {evidence["navigationScanRetryDelayMilliseconds"]=(last-first)*1000}
         }
         while now<deadline {
+            try Task.checkCancellation()
             guard frames.available.isAvailable else{throw Failure.mirror}
             let state=try await phone.cameraState()
+            guard now<deadline else{break}
             if state.captureActivity()?.package==package,state.captureActivity()?.displayId==display {
                 evidence["cameraAlreadyActive"] = scanTap==nil
                 return scanTap
             }
-            if scanTap != nil {try await Task.sleep(nanoseconds:60_000_000);continue}
             guard let activity=state.activities.first(where:{$0.displayId==display}),activity.package==package,
                   let frame=frames.latest(),frame.sequence>lastFrame,frame.receivedAt>=began,
                   now-frame.receivedAt<1,now-lastTap>0.8 else {
                 try await Task.sleep(nanoseconds:60_000_000);continue
             }
+            if scanTap != nil {
+                // A discarded early click must not turn into a 25s blind wait.
+                // Retry only a newly verified home/menu on the identical route,
+                // with a known closed camera and a fresh post-tap observation.
+                guard let component=scanComponent,canRetryScan(state,display:display,component:component,at:now,
+                      frameReceivedAt:frame.receivedAt,retry:scanRetry) else {
+                    try await Task.sleep(nanoseconds:60_000_000);continue
+                }
+            }
             lastFrame=frame.sequence
             let words=try await Task.detached(priority:.userInitiated){try ScannerNavigationOCR.recognize(frame.pixels)}.value
+            guard now<deadline else{break}
             ocrFrames+=1
             let known:Set<String>=["首页","消息","理财","生活","我的","扫一扫","收付款","收付钱","微信","通讯录","发现","我","发起群聊","添加朋友","朋友圈","视频号","小程序","看一看"]
             fixedLabels.formUnion(words.compactMap{known.contains($0.value) ? $0.value:nil})
@@ -158,13 +178,26 @@ private final class BackgroundScanResult:@unchecked Sendable {
                 }
             }
             if let point {
+                if scanTap != nil,(isPlus || isDiscover) {continue}
+                if !isPlus && !isDiscover,!scanRetry.permitsTap(at:now,frameReceivedAt:frame.receivedAt) {continue}
                 let current=try await phone.cameraState()
                 guard current.activities.first(where:{$0.displayId==display})?.component==activity.component,
                       current.captureActivity()==nil,now-frame.receivedAt<1 else{continue}
                 let tap=now
+                try Task.checkCancellation();guard tap<deadline else{break}
+                if scanTap != nil {
+                    guard let component=scanComponent,canRetryScan(current,display:display,component:component,at:tap,
+                          frameReceivedAt:frame.receivedAt,retry:scanRetry) else{continue}
+                }
+                if isPlus,!plusRetry.permitsTap(at:tap,frameReceivedAt:frame.receivedAt) {continue}
+                if !isPlus && !isDiscover,!scanRetry.permitsTap(at:tap,frameReceivedAt:frame.receivedAt) {continue}
                 if isPlus {plusRetry.recordTap(at:tap,frameReceivedAt:frame.receivedAt)}
                 else if isDiscover {discoverSelected=true}
-                else{scanTap=tap}
+                else {
+                    scanRetry.recordTap(at:tap,frameReceivedAt:frame.receivedAt)
+                    if firstScanTap==nil {firstScanTap=tap;scanComponent=activity.component}
+                    scanTap=tap
+                }
                 mirror.tap(x:point.x,y:point.y);lastTap=tap
             }
             try await Task.sleep(nanoseconds:60_000_000)
@@ -231,7 +264,11 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     item["launchConfirmedMilliseconds"]=(now-launch)*1000
                     stage="navigate"
                     let tap=try await navigate(phone:phone,mirror:stream,frames:frames,package:package,display:display,evidence:&item)
-                    if let tap {item["scanTapToOwnerMilliseconds"]=(now-tap)*1000}
+                    if let tap {
+                        let last=(now-tap)*1000,retry=item["navigationScanRetryDelayMilliseconds"] as? Double ?? 0
+                        item["scanTapMetricOrigin"]="last-verified-navigation-tap"
+                        item["scanTapToOwnerMilliseconds"]=last;item["firstScanTapToOwnerMilliseconds"]=last+retry
+                    }
                     let pump=CameraPumpMailbox(sourceIsAvailable:{frames.available.isAvailable})
                     // The final clear retires the previous application's epoch.
                     // The next application's frame epoch must advance past it.
@@ -309,7 +346,10 @@ private final class BackgroundScanResult:@unchecked Sendable {
                             if firstACK==nil {
                                 firstACK=now;item["firstACKUsedSnapshot"]=imageWasSnapshot
                                 item["firstCaptureMilliseconds"]=captures.last;item["firstImagePipelineMilliseconds"]=(now-begin)*1000
-                                if let tap {item["scanTapToFirstACKMilliseconds"]=(now-tap)*1000}
+                                if let tap {
+                                    let last=(now-tap)*1000,retry=item["navigationScanRetryDelayMilliseconds"] as? Double ?? 0
+                                    item["scanTapToFirstACKMilliseconds"]=last;item["firstScanTapToFirstACKMilliseconds"]=last+retry
+                                }
                             }
                             if qrShownAt != nil,firstQRACK==nil {firstQRACK=now}
                         } catch is DesktopCaptureTransientError {item["captureTransientOccurred"]=true;if imageWasSnapshot {item["startupSnapshotFallback"]=true}}
@@ -318,7 +358,10 @@ private final class BackgroundScanResult:@unchecked Sendable {
                            match.received>=verifiedQRAt,match.observed<=until,now<=until,(!snapshotBootstrap || streamSourceVerified) {
                             recognized=true;resultFrameTime=match.received;item["qrShownToResultDecodedMilliseconds"]=(match.received-qrShownAt)*1000
                             item["qrShownToResultObservedMilliseconds"]=(match.observed-qrShownAt)*1000
-                            if let tap {item["scanTapToResultDecodedMilliseconds"]=(match.received-tap)*1000}
+                            if let tap {
+                                let last=(match.received-tap)*1000,retry=item["navigationScanRetryDelayMilliseconds"] as? Double ?? 0
+                                item["scanTapToResultDecodedMilliseconds"]=last;item["firstScanTapToResultDecodedMilliseconds"]=last+retry
+                            }
                             break
                         }
                         let rest=max(0,1/cadence-(now-iteration));if rest>0 {try await Task.sleep(nanoseconds:UInt64(rest*1_000_000_000))}
