@@ -13,11 +13,37 @@ private final class BackgroundScanFrames:@unchecked Sendable {
     func latest()->Frame? {lock.withLock{frame}}
 }
 
+private final class BackgroundScanResult:@unchecked Sendable {
+    private let lock=NSLock()
+    private var result:(received:Double,observed:Double)?
+    func found(received:Double){lock.withLock{if result==nil {result=(received,ProcessInfo.processInfo.systemUptime)}}}
+    func snapshot()->(received:Double,observed:Double)? {lock.withLock{result}}
+    /// Identical observation cadence in both supply groups. Vision work does
+    /// not block or run more frequently merely because supply is faster.
+    func observe(frames:BackgroundScanFrames,payload:String,after shown:Double,until deadline:Double)->Task<Void,Never> {
+        Task.detached(priority:.userInitiated) {
+            var sequence=0
+            while !Task.isCancelled,ProcessInfo.processInfo.systemUptime<deadline,frames.available.isAvailable {
+                if let frame=frames.latest(),frame.sequence>sequence,frame.receivedAt>=shown {
+                    sequence=frame.sequence
+                    let found=(try? ScannerNavigationOCR.recognize(frame.pixels).contains{$0.value.replacingOccurrences(of:" ",with:"").contains(payload)}) ?? false
+                    if found,!Task.isCancelled {self.found(received:frame.receivedAt);return}
+                }
+                try? await Task.sleep(nanoseconds:125_000_000)
+            }
+        }
+    }
+}
+
 /// Non-activating, explicit research entry. The only captured window is our
 /// synthetic QR board, ordered behind normal windows and unable to receive input.
 /// It exercises production capture/mailbox/socket/decoder components, not the
 /// AppController UI, physical dragging, or another application's desktop pixels.
 @MainActor enum BackgroundScanDiagnostic {
+    static func validScope(alipay:Bool,wechat:Bool,abba:Bool)->Bool {
+        guard !(alipay && wechat) else{return false}
+        return !abba || alipay != wechat
+    }
     enum Failure:String,Error {case arguments,existingSession,permission,device,application,mirror,navigation,camera,result,focus,cleanup}
     private final class BoardWindow:NSWindow {
         override var canBecomeKey:Bool {false}
@@ -55,14 +81,21 @@ private final class BackgroundScanFrames:@unchecked Sendable {
     /// Only fixed, independently confirmed navigation targets are tapped.
     /// Nothing from OCR is exported, and login/consent/payment pages fail closed.
     private static func navigate(phone:PhoneSession,mirror:MirrorSession,frames:BackgroundScanFrames,
-                                 package:String,display:Int) async throws ->Double {
+                                 package:String,display:Int,evidence:inout [String:Any]) async throws ->Double? {
         let began=now,deadline=now+25
         var lastFrame=0,lastTap=0.0,scanTap:Double?,plusRetry=ScannerNavigationOCR.PlusRetry()
+        var fixedLabels=Set<String>(),ocrFrames=0
+        defer {
+            evidence["navigationScanTapSent"]=scanTap != nil;evidence["navigationPlusTaps"]=plusRetry.attempts
+            evidence["navigationOCRFrames"]=ocrFrames;evidence["navigationKnownLabels"]=fixedLabels.sorted()
+            evidence["navigationMilliseconds"]=(now-began)*1000
+        }
         while now<deadline {
             guard frames.available.isAvailable else{throw Failure.mirror}
             let state=try await phone.cameraState()
             if state.captureActivity()?.package==package,state.captureActivity()?.displayId==display {
-                guard let scanTap else{throw Failure.navigation};return scanTap
+                evidence["cameraAlreadyActive"] = scanTap==nil
+                return scanTap
             }
             if scanTap != nil {try await Task.sleep(nanoseconds:60_000_000);continue}
             guard let activity=state.activities.first(where:{$0.displayId==display}),activity.package==package,
@@ -72,6 +105,9 @@ private final class BackgroundScanFrames:@unchecked Sendable {
             }
             lastFrame=frame.sequence
             let words=try await Task.detached(priority:.userInitiated){try ScannerNavigationOCR.recognize(frame.pixels)}.value
+            ocrFrames+=1
+            let known:Set<String>=["首页","消息","理财","生活","我的","扫一扫","收付款","收付钱","微信","通讯录","发现","我","发起群聊","添加朋友"]
+            fixedLabels.formUnion(words.compactMap{known.contains($0.value) ? $0.value:nil})
             var point:CGPoint?,isPlus=false
             if package=="com.tencent.mm" {
                 let menu=words.contains{$0.value.contains("添加朋友")} && words.contains{$0.value.contains("发起群聊")}
@@ -104,6 +140,9 @@ private final class BackgroundScanFrames:@unchecked Sendable {
         throw Failure.navigation
     }
     static func run() async -> Int32 {
+        let alipayOnly=CommandLine.arguments.contains("--diagnostic-alipay-only"),wechatOnly=CommandLine.arguments.contains("--diagnostic-wechat-only")
+        let abba=CommandLine.arguments.contains("--diagnostic-supply-abba")
+        guard validScope(alipay:alipayOnly,wechat:wechatOnly,abba:abba) else{return 2}
         guard CommandLine.arguments.contains("--diagnostic-usb"),CommandLine.arguments.contains("--locked-applications"),
               let path=option("--background-report"),let resources=Bundle.main.resourceURL else{return 2}
         let frontBefore=NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -115,7 +154,7 @@ private final class BackgroundScanFrames:@unchecked Sendable {
             "captureScope":"own-synthetic-board-only","activationRequested":false]
         let adb=resources.appendingPathComponent("adb/bin/adb"),phone=PhoneSession(resources:resources,adbURL:adb)
         let capture=DesktopCapture()
-        var board:BoardWindow?,mirror:MirrorSession?,items=[[String:Any]](),stage="prerequisites",passed=false
+        var board:BoardWindow?,mirror:MirrorSession?,recognitionTask:Task<Void,Never>?,items=[[String:Any]](),stage="prerequisites",passed=false
         do {
             guard CGPreflightScreenCaptureAccess() else{throw Failure.permission}
             report["existingCapturePermission"]=true
@@ -125,9 +164,11 @@ private final class BackgroundScanFrames:@unchecked Sendable {
             _=try await phone.connect(openWechatOnConnect:false,selectedSerial:devices[0].serial,allowLockedApplications:true,desktopHome:true,genericDesktopCamera:true){_ in}
             guard await phone.independentApplicationsWhenLocked,let display=await phone.scannerDisplay()?.id else{throw Failure.device}
             let apps=try await phone.applications()
-            let packages=CommandLine.arguments.contains("--diagnostic-alipay-only") ? ["com.eg.android.AlipayGphone"] : ["com.tencent.mm","com.eg.android.AlipayGphone"]
-            for (index,package) in packages.enumerated() {
-                var item:[String:Any]=["application":package=="com.tencent.mm" ? "wechat":"alipay","recognized":false]
+            let packages=alipayOnly ? ["com.eg.android.AlipayGphone"]:(wechatOnly ? ["com.tencent.mm"]:["com.tencent.mm","com.eg.android.AlipayGphone"])
+            let plans:[(String,Double)]=abba ? [8.0,30.0,30.0,8.0].map{(packages[0],$0)}:packages.map{($0,8)}
+            for (index,plan) in plans.enumerated() {
+                let (package,cadence)=plan
+                var item:[String:Any]=["application":package=="com.tencent.mm" ? "wechat":"alipay","recognized":false,"supplyCadenceHz":cadence]
                 do {
                     guard let app=apps.first(where:{$0.packageName==package}),let screen=NSScreen.screens.first else{throw Failure.application}
                     let payload="006IDC"+UUID().uuidString.replacingOccurrences(of:"-",with:"").prefix(12)
@@ -145,8 +186,8 @@ private final class BackgroundScanFrames:@unchecked Sendable {
                     guard try await phone.launchApplication(app,on:display) else{throw Failure.application}
                     item["launchConfirmedMilliseconds"]=(now-launch)*1000
                     stage="navigate"
-                    let tap=try await navigate(phone:phone,mirror:stream,frames:frames,package:package,display:display)
-                    item["scanTapToOwnerMilliseconds"]=(now-tap)*1000
+                    let tap=try await navigate(phone:phone,mirror:stream,frames:frames,package:package,display:display,evidence:&item)
+                    if let tap {item["scanTapToOwnerMilliseconds"]=(now-tap)*1000}
                     let pump=CameraPumpMailbox(sourceIsAvailable:{frames.available.isAvailable})
                     // The final clear retires the previous application's epoch.
                     // The next application's frame epoch must advance past it.
@@ -157,13 +198,18 @@ private final class BackgroundScanFrames:@unchecked Sendable {
                     let prepare=now;try await capture.prepare();item["capturePrepareMilliseconds"]=(now-prepare)*1000
                     let until=now+9,blankUntil=now+1.5
                     pump.prepareRegion(at:now,immediateFirst:true)
-                    var qrShownAt:Double?,firstQRACK:Double?,firstACK:Double?,lastChecked=0,sent=0,recognized=false
+                    var qrShownAt:Double?,firstQRACK:Double?,firstACK:Double?,sent=0,recognized=false
                     var costs=[Double](),captures=[Double](),startTimes=[Double]()
+                    var resultFrameTime:Double?
+                    let result=BackgroundScanResult()
                     stage="capture-send-recognize"
                     while now<until {
                         let iteration=now
                         guard frames.available.isAvailable else{throw Failure.mirror}
-                        if qrShownAt==nil,now>=blankUntil {pattern.showQR=true;pattern.needsDisplay=true;pattern.displayIfNeeded();qrShownAt=now}
+                        if qrShownAt==nil,now>=blankUntil {
+                            pattern.showQR=true;pattern.needsDisplay=true;pattern.displayIfNeeded();qrShownAt=now
+                            recognitionTask=result.observe(frames:frames,payload:String(payload),after:qrShownAt!,until:until)
+                        }
                         let target=try DesktopCaptureTarget.current(for:window.frame)
                         pump.publish(target)
                         guard let selection=pump.selection() else{throw Failure.camera}
@@ -172,28 +218,36 @@ private final class BackgroundScanFrames:@unchecked Sendable {
                             captures.append((now-begin)*1000)
                             let receipt=try await phone.frame(image,epoch:epoch,selectedAt:target.selectedAt,isCurrent:{pump.isCurrent(selection) && pump.captureReady(at:ProcessInfo.processInfo.systemUptime)})
                             costs.append(receipt.requestMilliseconds);sent+=1;startTimes.append(iteration)
-                            if firstACK==nil {firstACK=now;item["scanTapToFirstACKMilliseconds"]=(now-tap)*1000}
+                            if firstACK==nil {firstACK=now;if let tap {item["scanTapToFirstACKMilliseconds"]=(now-tap)*1000}}
                             if qrShownAt != nil,firstQRACK==nil {firstQRACK=now}
                         } catch is DesktopCaptureTransientError {item["captureTransientOccurred"]=true}
                         catch is CameraFrameExpiredError {item["expiredFrameOccurred"]=true}
-                        if let qrShownAt,let frame=frames.latest(),frame.sequence>lastChecked,frame.receivedAt>=qrShownAt {
-                            lastChecked=frame.sequence
-                            let found=try await Task.detached(priority:.userInitiated){
-                                try ScannerNavigationOCR.recognize(frame.pixels).contains{$0.value.replacingOccurrences(of:" ",with:"").contains(payload)}
-                            }.value
-                            if found {
-                                recognized=true;item["qrShownToResultDecodedMilliseconds"]=(frame.receivedAt-qrShownAt)*1000
-                                item["qrShownToResultObservedMilliseconds"]=(now-qrShownAt)*1000;break
-                            }
+                        if let qrShownAt,let match=result.snapshot() {
+                            recognized=true;resultFrameTime=match.received;item["qrShownToResultDecodedMilliseconds"]=(match.received-qrShownAt)*1000
+                            item["qrShownToResultObservedMilliseconds"]=(match.observed-qrShownAt)*1000;break
                         }
-                        let rest=max(0,0.125-(now-iteration));if rest>0 {try await Task.sleep(nanoseconds:UInt64(rest*1_000_000_000))}
+                        let rest=max(0,1/cadence-(now-iteration));if rest>0 {try await Task.sleep(nanoseconds:UInt64(rest*1_000_000_000))}
                     }
+                    recognitionTask?.cancel();await recognitionTask?.value;recognitionTask=nil
                     pump.stop();try await phone.clear(epoch:epoch+20,requireConnection:true)
                     item["recognized"]=recognized;item["sentFrames"]=sent
                     item["requestMilliseconds"]=percentiles(costs);item["captureMilliseconds"]=percentiles(captures)
                     item["sendStartGapMilliseconds"]=percentiles(zip(startTimes.dropFirst(),startTimes).map{($0-$1)*1000})
                     if let qrShownAt,let firstQRACK {item["qrShownToFirstACKMilliseconds"]=(firstQRACK-qrShownAt)*1000}
                     guard recognized else{throw Failure.result}
+                    if abba,index+1<plans.count {
+                        // Limit ordinary asynchronous BACK input to a fresh
+                        // result of this run, checked against two owned snapshots.
+                        // As with other mirror input, page transitions can race
+                        // the queued event; this is not an atomic route command.
+                        let before=try await phone.cameraState()
+                        let after=try await phone.cameraState()
+                        guard let resultFrameTime,now-resultFrameTime<1,
+                              let activity=before.activities.first(where:{$0.displayId==display}),activity.package==package,
+                              after.activities.first(where:{$0.displayId==display})?.component==activity.component else{throw Failure.navigation}
+                        stream.key(4);item["ownResultBackSent"]=true
+                        try await Task.sleep(nanoseconds:250_000_000)
+                    }
                 } catch {
                     item["failureStage"]=stage;item["failureCode"]=(error as? Failure)?.rawValue ?? "backend"
                     items.append(item);throw error
@@ -205,6 +259,7 @@ private final class BackgroundScanFrames:@unchecked Sendable {
         } catch {
             report["failureStage"]=stage;report["failureCode"]=(error as? Failure)?.rawValue ?? "backend"
         }
+        recognitionTask?.cancel();await recognitionTask?.value
         await capture.stop();await mirror?.stop();board?.orderOut(nil)
         let cleanup=await phone.disconnect()
         report["applications"]=items;report["cleanupSucceeded"]=cleanup.isEmpty
