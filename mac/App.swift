@@ -1118,7 +1118,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 if ScannerNavigationOCR.isWechatTitle(value) {return "微信"}
                                 return known.contains(value) ? value:nil
                             })
-                            result["materialized"]= ["wordCount":words.count,"knownLabels":labels.sorted()]
+                            result["materialized"]=["wordCount":words.count,"knownLabels":labels.sorted()]
                         }
                         let words=try ScannerNavigationOCR.recognize(pixels)
                         result["plusLocated"]=try ScannerNavigationOCR.plusButton(in:pixels,homeWords:words) != nil
