@@ -53,6 +53,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var cameraStartupStages:[String:Double]=[:]
     private var cameraStartupPrewarmed=false
     private var coldCaptureMetadata:Bool {CommandLine.arguments.contains("--run-desktop-diagnostic") && CommandLine.arguments.contains("--diagnostic-cold-capture-metadata")}
+    private var captureMetadataWarmupRequested:Bool {
+        CommandLine.arguments.contains("--run-desktop-diagnostic") &&
+        CommandLine.arguments.contains("--diagnostic-prewarm-capture-metadata") && !coldCaptureMetadata
+    }
     private var settleInitialGenericCapture:Bool {CommandLine.arguments.contains("--run-desktop-diagnostic") && CommandLine.arguments.contains("--diagnostic-initial-settle")}
     private let nativeScannerRequested=CommandLine.arguments.contains("--native-camera-preview")
     private var nativeScannerOverlay:NativeScannerOverlay?
@@ -788,7 +792,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         await metadataWarmup.withForeground { _ in await capture.setDiagnosticBoard(id) }
     }
     private func beginCaptureMetadataWarmup() {
-        guard connected,!stopping,!cameraActive,genericDesktopCamera,screenAccessGranted,!coldCaptureMetadata else{return}
+        guard connected,!stopping,!cameraActive,genericDesktopCamera,screenAccessGranted,captureMetadataWarmupRequested else{return}
         metadataWarmup.start(allowed:true) { [capture] in
             // Preflight only: a background optimization never requests access.
             guard CGPreflightScreenCaptureAccess() else{throw CancellationError()}
@@ -898,7 +902,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func runDesktopDiagnostic() async {
         var report:[String:Any]=["test":"desktop-native-app-flow","physicalMouseDragMeasured":false,
             "genericDesktopCamera":genericDesktopCamera,"initialGenericSettleSelected":settleInitialGenericCapture,
-            "coldCaptureMetadataSelected":coldCaptureMetadata]
+            "coldCaptureMetadataSelected":coldCaptureMetadata,
+            "metadataWarmupRequested":captureMetadataWarmupRequested]
         var applications=[[String:Any]]()
         let activeExit=CommandLine.arguments.contains("--diagnostic-active-scanner-exit")
         let navigationProbe=CommandLine.arguments.contains("--diagnostic-navigation-probe")
