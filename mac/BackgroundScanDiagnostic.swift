@@ -118,6 +118,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
         var lastFrame=0,lastTap=0.0,scanTap:Double?,firstScanTap:Double?,scanComponent:String?
         var plusRetry=ScannerNavigationOCR.PlusRetry(),scanRetry=ScannerNavigationOCR.PlusRetry(),discoverSelected=false
         var fixedLabels=Set<String>(),ocrFrames=0
+        var postTapSamples=0,lastRouteKind="absent",lastOwnerEvidence="unknown",lastStreams=0
         defer {
             evidence["navigationScanTapSent"]=scanTap != nil;evidence["navigationPlusTaps"]=plusRetry.attempts
             evidence["navigationOCRFrames"]=ocrFrames;evidence["navigationKnownLabels"]=fixedLabels.sorted()
@@ -125,12 +126,24 @@ private final class BackgroundScanResult:@unchecked Sendable {
             evidence["navigationDiscoverTapSent"]=discoverSelected
             evidence["navigationScanTapAttempts"]=scanRetry.attempts
             if let first=firstScanTap,let last=scanTap {evidence["navigationScanRetryDelayMilliseconds"]=(last-first)*1000}
+            if postTapSamples>0 {
+                evidence["postTapStateSamples"]=postTapSamples;evidence["postTapRouteKind"]=lastRouteKind
+                evidence["postTapOwnerEvidence"]=lastOwnerEvidence;evidence["postTapActiveStreams"]=lastStreams
+            }
         }
         while now<deadline {
             try Task.checkCancellation()
             guard frames.available.isAvailable else{throw Failure.mirror}
             let state=try await phone.cameraState()
             guard now<deadline else{break}
+            if scanTap != nil {
+                postTapSamples+=1;lastStreams=state.activeStreams
+                lastOwnerEvidence = !state.ownerKnown ? "unknown":(state.cameraOwner==nil ? "closed":(state.cameraOwner==package ? "target":"other"))
+                let activity=state.activities.first(where:{$0.displayId==display})
+                if let activity {
+                    lastRouteKind=activity.package != package ? "other":(activity.component==scanComponent ? "initial":(DesktopScannerRoute.isScanner(activity.component) ? "known-scanner":"other-target"))
+                }else{lastRouteKind="absent"}
+            }
             if state.captureActivity()?.package==package,state.captureActivity()?.displayId==display {
                 evidence["cameraAlreadyActive"] = scanTap==nil
                 return scanTap
@@ -141,7 +154,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                 try await Task.sleep(nanoseconds:60_000_000);continue
             }
             if scanTap != nil {
-                // A discarded early click must not turn into a 25s blind wait.
+                // An unconfirmed click must not turn into a 25s blind wait.
                 // Retry only a newly verified home/menu on the identical route,
                 // with a known closed camera and a fresh post-tap observation.
                 guard let component=scanComponent,canRetryScan(state,display:display,component:component,at:now,
@@ -262,6 +275,8 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     let launch=now
                     guard try await phone.launchApplication(app,on:display) else{throw Failure.application}
                     item["launchConfirmedMilliseconds"]=(now-launch)*1000
+                    item["launcherValidationMilliseconds"]=await phone.lastLauncherValidationMilliseconds
+                    item["launcherQueryScoped"]=await phone.lastLauncherQueryScoped
                     stage="navigate"
                     let tap=try await navigate(phone:phone,mirror:stream,frames:frames,package:package,display:display,evidence:&item)
                     if let tap {

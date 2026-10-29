@@ -518,7 +518,7 @@ public final class LiveCameraServer {
             synchronized (stateLock) {if (!desktopCameraRouting.enabled()) throw new IOException("Desktop camera mode was not selected");}
             boolean requested=false;
             if (request.action==1) {
-                JSONArray catalog=new JSONArray(new String(applications(),StandardCharsets.UTF_8));
+                JSONArray catalog=new JSONArray(new String(LauncherCatalog.query(context,request.packageName),StandardCharsets.UTF_8));
                 boolean launchable=false;
                 for (int i=0;i<catalog.length();i++) if(request.packageName.equals(catalog.getJSONObject(i).getString("packageName"))) {launchable=true;break;}
                 if (!launchable) throw new IOException("Camera application is not in the primary-user launcher catalog");
@@ -966,28 +966,8 @@ public final class LiveCameraServer {
         log("display_width", displayWidth); log("display_height", displayHeight); log("display_dpi", displayDpi);
     }
 
-    private byte[] applications() throws Exception {
-        // Explicitly query the primary user, never work-profile/private-profile apps.
-        if (Process.myUid() / 100000 != 0) throw new IOException("Primary user required");
-        Intent launcher = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
-        PackageManager pm = context.getPackageManager();
-        List<ResolveInfo> resolved = pm.queryIntentActivities(launcher, PackageManager.MATCH_DIRECT_BOOT_AWARE | PackageManager.MATCH_DIRECT_BOOT_UNAWARE);
-        JSONArray entries = new JSONArray();
-        HashSet<String> seen = new HashSet<>();
-        for (ResolveInfo entry : resolved) {
-            if (entries.length() >= 500) break;
-            if (entry.activityInfo == null || !entry.activityInfo.exported || !entry.activityInfo.enabled || !entry.activityInfo.applicationInfo.enabled) continue;
-            String pkg = entry.activityInfo.packageName;
-            String cls = entry.activityInfo.name;
-            if (pkg == null || cls == null || !pkg.matches("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+") ||
-                    !cls.matches("[A-Za-z_$][A-Za-z0-9_$]*(\\.[A-Za-z_$][A-Za-z0-9_$]*)*")) continue;
-            String component = new ComponentName(pkg, cls).flattenToString();
-            if (!seen.add(component)) continue;
-            String label = String.valueOf(entry.loadLabel(pm)).replaceAll("[\\p{Cntrl}]", " ");
-            if (label.length() > 160) label = label.substring(0, 160);
-            entries.put(new JSONObject().put("packageName", pkg).put("component", component).put("name", label));
-        }
-        return entries.toString().getBytes(StandardCharsets.UTF_8);
+    private byte[] applications(byte[] query) throws Exception {
+        return LauncherCatalog.query(context,LauncherPackageQuery.parse(query));
     }
 
     private byte[] createAppDisplay() throws Exception {
@@ -1250,6 +1230,7 @@ public final class LiveCameraServer {
             }
         }
         state.put("activities", activities);
+        state.put("packageLauncherQuerySupported",true);
         CameraPaintTiming.Snapshot timing = cameraPaintTiming.snapshot();
         state.put("paintTiming", new JSONObject().put("samples", timing.samples)
                 .put("lastAcceptedToPostMilliseconds", timing.lastAcceptedToPost)
@@ -1372,11 +1353,11 @@ public final class LiveCameraServer {
                 try { reply(output, true, liveState()); }
                 catch (Exception failure) { error(output, "Live state unavailable"); }
             } else if (command == 10 || command == 11 || command == 12) {
-                if ((command == 12 && length != Integer.BYTES) || (command != 12 && length != 0)) {
+                if ((command == 12 && length != Integer.BYTES) || (command == 11 && length != 0) || (command == 10 && length > 255)) {
                     error(output, "Invalid app command payload"); continue;
                 }
                 try {
-                    if (command == 10) reply(output, true, applications());
+                    if (command == 10) reply(output, true, applications(body));
                     else if (command == 11) reply(output, true, createAppDisplay());
                     else {
                         releaseAppDisplay(new DataInputStream(new ByteArrayInputStream(body)).readInt());

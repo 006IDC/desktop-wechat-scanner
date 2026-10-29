@@ -30,6 +30,13 @@ import Foundation
 
     static func main() throws {
         let matched = try decode(basic())
+        require(!matched.packageLauncherQuerySupported,"Legacy server advertised package query")
+        var packageCapability=basic();packageCapability["packageLauncherQuerySupported"]=true
+        require(try decode(packageCapability).packageLauncherQuerySupported,"Explicit launcher query capability lost")
+        packageCapability["ownerKnown"]=false
+        require(try decode(packageCapability).captureActivity()==nil,"Launcher query capability became camera ownership")
+        packageCapability["packageLauncherQuerySupported"]="true"
+        rejected(packageCapability,"Non-boolean launcher capability accepted")
         require(matched.paintTiming==nil,"Older server gained paint observations")
         var timed=basic()
         var metrics:[String:Any]=["samples":2,"lastAcceptedToPostMilliseconds":4,"p95AcceptedToPostMilliseconds":8,

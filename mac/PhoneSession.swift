@@ -250,6 +250,9 @@ actor PhoneSession {
     private var displayID: Int?
     private(set) var independentApplicationsWhenLocked=false
     private var genericDesktopCamera=false
+    private var packageLauncherQuerySupported=false
+    private(set) var lastLauncherValidationMilliseconds:Double?
+    private(set) var lastLauncherQueryScoped:Bool?
     // Canned placement counts only; no component names, IDs, extras or page text.
     private(set) var lastApplicationLaunchEvidence:[String:Int]?
     private var cleaning=false
@@ -280,6 +283,7 @@ actor PhoneSession {
             throw ScanError("通用桌面相机需要启用相机的应用桌面会话。")
         }
         do {
+            packageLauncherQuerySupported=false
             connectionStage = "enumeration"
             progress("正在检查手机连接…")
             let listing = try adb(["devices","-l"])
@@ -348,8 +352,9 @@ actor PhoneSession {
             connectionStage = "authentication"
             channel=try CameraSocket(port:port,token:r.token)
             self.genericDesktopCamera=genericDesktopCamera
+            let capabilities=try cameraState()
             if genericDesktopCamera {
-                guard desktopHome,!mirrorOnly,try cameraState().desktopCameraSupported else {
+                guard desktopHome,!mirrorOnly,capabilities.desktopCameraSupported else {
                     throw ScanError("手机服务未提供通用桌面相机，请使用完整的新版本。")
                 }
                 guard try channel?.request(26,Data([2]))==Data([1]),try cameraState().desktopCameraEnabled else {
@@ -463,7 +468,9 @@ actor PhoneSession {
         return try DesktopCameraLaunch.accepted(reply,clearing:package == nil)
     }
     func cameraState() throws -> PhoneCameraState {
-        try PhoneCameraState.decode(cameraStatusSnapshot())
+        let state=try PhoneCameraState.decode(cameraStatusSnapshot())
+        packageLauncherQuerySupported=state.packageLauncherQuerySupported
+        return state
     }
     /// Authenticated bounded technical status; callers must not persist app activity history.
     func cameraStatusSnapshot() throws -> Data {
@@ -608,7 +615,10 @@ actor PhoneSession {
         guard let channel else { throw ScanError("手机未连接。") }
         return try catalog(channel)
     }
-    private func catalog(_ channel: CameraSocket) throws -> [AndroidApplication] { try AndroidApplication.decodeCatalog(channel.request(10)) }
+    private func catalog(_ channel:CameraSocket,package:String?=nil) throws ->[AndroidApplication] {
+        let body=try package.map{try LauncherCatalogRequest.body(package:$0,supported:packageLauncherQuerySupported)} ?? Data()
+        return try AndroidApplication.decodeCatalog(channel.request(10,body))
+    }
     private func appendAppDisplay(_ display: AndroidAppDisplay) {
         // Read before optional-chain writeback begins (Swift exclusivity).
         var displays = recovery?.appDisplays ?? []
@@ -679,10 +689,16 @@ actor PhoneSession {
     @discardableResult
     func launchApplication(_ app: AndroidApplication, on target: Int) throws -> Bool {
         lastApplicationLaunchEvidence=nil
+        lastLauncherValidationMilliseconds=nil;lastLauncherQueryScoped=nil
         guard let state = recovery, channel != nil, ownsDisplay(target), app.isValid else { throw ScanError("应用或屏幕不属于本次连接。") }
         try requireApplicationAccess(on:target)
         // Revalidate against the authenticated launcher catalog, never execute an arbitrary component.
-        guard let channel, try catalog(channel).contains(where: { $0.canonicalComponent == app.canonicalComponent }) else { throw ScanError("手机主用户中未找到此应用入口。") }
+        guard let channel else{throw ScanError("手机未连接。")}
+        let validationBegan=ProcessInfo.processInfo.systemUptime
+        let entries=try catalog(channel,package:app.packageName)
+        lastLauncherValidationMilliseconds=(ProcessInfo.processInfo.systemUptime-validationBegan)*1000
+        lastLauncherQueryScoped=packageLauncherQuerySupported
+        guard entries.contains(where:{$0.canonicalComponent==app.canonicalComponent}) else{throw ScanError("手机主用户中未找到此应用入口。")}
         return try DesktopCameraLaunch.perform(bind:{try self.bindDesktopCamera(display:target,package:app.packageName)},launch:{
             let before = try tasks(requiredDisplay: target)
             let moving = before.filter { $0.userID == 0 && $0.packageName == app.packageName && $0.display != target }
@@ -883,6 +899,7 @@ actor PhoneSession {
         cleanupCameraStreamsBeforeSleep=nil;cleanupCameraClosureConfirmed=false;cleanupScannerBeforeSleep=false
         diagnosticLog=nil
         genericDesktopCamera=false
+        packageLauncherQuerySupported=false
         independentApplicationsWhenLocked=false
         cleaning=true;defer {cleaning=false}
         if let state = recovery {

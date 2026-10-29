@@ -748,3 +748,15 @@ Mailbox与生命周期合成回归通过，新增同代prelaunch旧帧必须等�
 ## 首次扫码点击后的受控恢复（build57，2026-10-30，验证中）
 
 后台导航原本scanTap发出后只等待，未像原桌面诊断那样重新核实重试。复用既有3次/800ms预算：仅初次同component、camera known+closed且activeStreams=0、全新post-tap帧重新OCR核实受控home/menu入口才能重试；await后再核归属、帧和预算；未知页/相机正在打开/活动改变不重试，截止后不点。plus/discover不混入scan重试。仅改变显式后台诊断，正常产品输入不变。报告标last-verified-navigation-tap并同时给first tap→owner/首ACK/结果与重试延时，避免将丢失点击后的最后一次耗时冒充总体提速。新增纯状态反例验证已通过。
+
+### build57 后台复测与保留失败（源码5bfc99a）
+
+包SHA256 `fac1dfcabc1f20f6894301045a006cf8fcee77969af18abd95bb2025e9e590ac`。snapshot ABBA第一轮从已有相机恢复，严格识码2146.0ms，无实际scan tap起点，不能计打开扫码性能；第二轮在一次scan tap后仍未确认相机，整组导航失败并停止。重试安全条件未满足时没有放宽或强点。清理成功、无恢复记录、已有权限true；activationRequested=false但前台标识前后不同，不能据此认定测试抢前台或宣称整段PID不变。本轮缺少state细分，不能断言是丢点击、卡绘制或snapshot失败；后续只增加固定routeKind/ownerEvidence/stream计数，仍不导出App组件正文或任意画面。
+
+## 启动入口按包核验（build58，2026-10-30，验证中）
+
+发现launchApplication客户端复核与服务端camera bind都重新加载全目录/所有label。保留安全再校验，改为只查询所选包：提取LauncherCatalog共享同一MAIN+LAUNCHER、主用户、exported/enabled过滤和canonicalComponent精确比对；只用[Intent.setPackage](https://developer.android.com/reference/android/content/Intent#setPackage(java.lang.String))限制候选，不设component以免绕过IntentFilter。camera bind仍核owned display和声明CAMERA权限。原全目录入口/500上限/label清理不变；不缓存可能失效的授权结果。
+
+认证command10空body仍全目录，1–255 bytes为严格UTF8 ASCII包名；component、控制字符、非法编码和超限拒绝。liveState显式packageLauncherQuerySupported时Mac才发包名，旧服务缺能力发原空body；能力不成为相机owner证据。连接初始state同时取得能力，退出清除；失败不自动忽略再校验。记录本次启动的实际validation耗时与scoped布尔，仅供内部诊断。
+
+最初只读原型cold全目录262.6ms、后续11.3–18.4ms，所选包1.34–4.63ms；原型省略JSON且目标侧未loadLabel，不能当整体启动改善。随后用新提取的**实际函数**（含JSON/label）在手机同进程预热后做三组full/package/package/full，full分别11.22/13.51、12.03/9.99、11.50/14.18ms，package分别3.29/2.55、1.04/1.55、2.78/1.12ms。两包scoped成员与全目录按包过滤集合完全相同，非launcher扫码activity未出现，未知包为空；无App启动/相机/虚拟设备操作，只清理该探针生成的两个JAR。该结果只证明目录核验步骤减少开销，不推算完整扫码或物理响应提速。
