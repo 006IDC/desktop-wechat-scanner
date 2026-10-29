@@ -221,14 +221,17 @@ struct CameraFrameReceipt {
     let sendMilliseconds: Double
     let responseWaitMilliseconds: Double
     let responseBodyMilliseconds: Double
+    /// Monotonic request start inside the phone actor, not a UI-loop timestamp.
+    let requestStartedAt:TimeInterval?
     init(processingMilliseconds: Double?, requestMilliseconds: Double,
          sendMilliseconds: Double=0, responseWaitMilliseconds: Double=0,
-         responseBodyMilliseconds: Double=0) {
+         responseBodyMilliseconds: Double=0,requestStartedAt:TimeInterval?=nil) {
         self.processingMilliseconds=processingMilliseconds
         self.requestMilliseconds=requestMilliseconds
         self.sendMilliseconds=sendMilliseconds
         self.responseWaitMilliseconds=responseWaitMilliseconds
         self.responseBodyMilliseconds=responseBodyMilliseconds
+        self.requestStartedAt=requestStartedAt
     }
 }
 
@@ -398,7 +401,7 @@ actor PhoneSession {
                                   requestMilliseconds:(ProcessInfo.processInfo.systemUptime-started)*1000,
                                   sendMilliseconds:response.sendMilliseconds,
                                   responseWaitMilliseconds:response.responseWaitMilliseconds,
-                                  responseBodyMilliseconds:response.responseBodyMilliseconds)
+                                  responseBodyMilliseconds:response.responseBodyMilliseconds,requestStartedAt:started)
     }
     /// Fixed-size synthetic calibration only. Capability negotiation happens in
     /// NativeScannerOverlay; the server still verifies the live scanner owner.

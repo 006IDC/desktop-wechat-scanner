@@ -317,6 +317,53 @@ actor DesktopCapture {
         return try await capture(target,maximumDimension:maximumDimension)
     }
 
+    /// Research-only bootstrap. It cannot capture a normal desktop source:
+    /// the exact, current-process diagnostic board must be explicitly selected.
+    /// The ordinary product capture path remains the continuous stream below.
+    func captureDiagnosticSnapshot(_ target:DesktopCaptureTarget,maximumDimension:Int=720) async throws -> Data {
+        guard diagnosticBoardID != nil,CGPreflightScreenCaptureAccess() else{throw ScanError("单帧研究需要既有授权和自有测试板。")}
+        try checkPermission();try Task.checkCancellation();try target.validate();try target.requireFresh(at:ProcessInfo.processInfo.systemUptime)
+        guard !captureInFlight else{throw DesktopCaptureTransientError.encodingBusy}
+        captureInFlight=true;defer{captureInFlight=false}
+        guard target.screenFrame.contains(target.rect) else{throw ScanError("单帧研究区域必须完整位于一个显示器。")}
+        try await prepare()
+        let token=generation
+        guard let content,let boardID=diagnosticBoardID,
+              let display=content.displays.first(where:{$0.displayID==target.displayID}),
+              let board=content.windows.first(where:{$0.windowID==boardID && $0.owningApplication?.processID==ProcessInfo.processInfo.processIdentifier}) else{throw ScanError("单帧研究的自有测试板不可用。")}
+        let filter=SCContentFilter(display:display,including:[board])
+        let crop=try DesktopCaptureGeometry.pixelCrop(rect:target.rect,screen:target.screenFrame,pixels:target.pixelSize)
+        let size=try DesktopCaptureGeometry.outputSize(crop.size,maximumDimension:maximumDimension)
+        let config=SCStreamConfiguration()
+        config.sourceRect=CGRect(x:target.rect.minX-target.screenFrame.minX,y:target.screenFrame.maxY-target.rect.maxY,
+                                 width:target.rect.width,height:target.rect.height)
+        config.width=Int(size.width);config.height=Int(size.height);config.pixelFormat=kCVPixelFormatType_32BGRA
+        config.showsCursor=false;config.capturesAudio=false;config.preservesAspectRatio=true;config.ignoreShadowsSingleWindow=true
+        do {
+            let sample:CMSampleBuffer=try await captureOperation(timeout:0.5,message:"自有测试板单帧超时。",timeoutError:DesktopCaptureTransientError.frameExpired) {reply in
+                SCScreenshotManager.captureSampleBuffer(contentFilter:filter,configuration:config) {sample,error in
+                    if let sample {reply.finish(.success(sample))}
+                    else {reply.finish(.failure(error ?? ScanError("自有测试板单帧失败。")))}
+                }
+            }
+            try Task.checkCancellation();guard token==generation else{throw CancellationError()}
+            try target.requireFresh(at:ProcessInfo.processInfo.systemUptime)
+            guard let pixels=CMSampleBufferGetImageBuffer(sample) else{throw ScanError("自有单帧没有像素。")}
+            let full=CGRect(x:0,y:0,width:CVPixelBufferGetWidth(pixels),height:CVPixelBufferGetHeight(pixels))
+            let data=try await encoder.encode(DesktopFrame(pixels:pixels,selectedAt:target.selectedAt),rect:full,screen:full,maximumDimension:maximumDimension)
+            try Task.checkCancellation();guard token==generation else{throw CancellationError()}
+            try target.requireFresh(at:ProcessInfo.processInfo.systemUptime);return data
+        }catch {markPermissionFailure(error);throw error}
+    }
+    func startDiagnosticStream(_ target:DesktopCaptureTarget) async throws {
+        guard diagnosticBoardID != nil,CGPreflightScreenCaptureAccess() else{throw ScanError("连续预备需要既有授权和自有测试板。")}
+        guard !captureInFlight else{throw DesktopCaptureTransientError.encodingBusy}
+        try target.validate();try target.requireFresh(at:ProcessInfo.processInfo.systemUptime)
+        guard target.screenFrame.contains(target.rect) else{throw ScanError("连续预备区域必须完整位于一个显示器。")}
+        do {try await ensureStream(display:target.displayID,screen:target.screenFrame,pixels:target.pixelSize)}
+        catch {markPermissionFailure(error);throw error}
+    }
+
     func capture(_ target:DesktopCaptureTarget, maximumDimension:Int=1600) async throws -> Data {
         try checkPermission();try Task.checkCancellation()
         try target.validate()
@@ -399,7 +446,7 @@ actor DesktopCapture {
         } catch {
             output.frames.finish(error)
             if self.stream === stream {await stop()}
-            else {try? await stream.stopCapture()}
+            else {await Self.stopCaptureBounded(stream)}
             throw error
         }
     }
@@ -411,7 +458,11 @@ actor DesktopCapture {
         let previous=stream
         stream=nil;output=nil;displayID=nil;screenFrame=nil;pixelSize=nil
         guard let previous else {await stoppingTask?.value;return}
-        let cleanup=Task {
+        let cleanup=Task {await Self.stopCaptureBounded(previous)}
+        stoppingTask=cleanup
+        await cleanup.value
+    }
+    private nonisolated static func stopCaptureBounded(_ previous:SCStream) async {
         // Cleanup must run even when its caller's capture Task has already been cancelled.
         let _:Void?=try? await withCheckedThrowingContinuation { continuation in
             let reply=CaptureReply<Void>()
@@ -419,9 +470,6 @@ actor DesktopCapture {
             DispatchQueue.global().asyncAfter(deadline:.now()+3){reply.finish(.success(()))}
             previous.stopCapture{_ in reply.finish(.success(()))}
         }
-        }
-        stoppingTask=cleanup
-        await cleanup.value
     }
     private func checkPermission() throws {
         if permissionBlocked && CGPreflightScreenCaptureAccess() {permissionBlocked=false}
