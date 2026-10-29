@@ -7,6 +7,7 @@ import CoreVideo
 @MainActor
 final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private enum Mode { case phone, wechat }
+    private struct NavigationProbeComplete:Error {}
     private final class MirrorRoute {
         let session=MirrorSession(),frames=MirrorVideoMailbox()
         var startup:Task<Void,Error>?
@@ -837,7 +838,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var report:[String:Any]=["test":"desktop-native-app-flow","physicalMouseDragMeasured":false]
         var applications=[[String:Any]]()
         let activeExit=CommandLine.arguments.contains("--diagnostic-active-scanner-exit")
+        let navigationProbe=CommandLine.arguments.contains("--diagnostic-navigation-probe")
         if activeExit {report["test"]="desktop-native-active-scanner-exit"}
+        if navigationProbe {report["test"]="navigation-frame-probe";report["performanceMeasured"]=false}
         do {
             guard desktopMode,screenAccessGranted else{throw ScanError("通用桌面诊断尚未就绪。")}
             report["primaryLockedBefore"]=try await !phone.primaryUserUnlocked()
@@ -1006,6 +1009,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if let nativeOverlay {
                         item["nativePresentation"]=nativeOverlay.statistics.snapshot()
                     }
+                } catch is NavigationProbeComplete {
+                    item["probeCompleted"]=true;item["intentionalStop"]=true
                 } catch {item["failure"]=error.localizedDescription}
                 if let check=performanceCheck {item.merge(check.finish()){_,new in new}}
                 performanceCheck=nil;cameraSuppressed=true
@@ -1030,7 +1035,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cameraSuppressed=true;await clearCamera();await capture.setDiagnosticBoard(nil)
         report["applications"]=applications
         let passed:Bool
-        if activeExit {
+        if navigationProbe {
+            passed = !applications.isEmpty && applications.allSatisfy {$0["probeCompleted"] as? Bool == true && $0["failure"] == nil} && report["failure"] == nil
+        } else if activeExit {
             passed=applications.count==1 && applications[0]["activeScannerBeforeExit"] as? Bool == true &&
                 applications[0]["failure"] == nil && report["failure"] == nil
         } else {
@@ -1059,15 +1066,32 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let deadline=ProcessInfo.processInfo.systemUptime+3
             while ProcessInfo.processInfo.systemUptime<deadline {
                 try checkNavigation()
-                if let observed=latestPresentedMirrorFrame,observed.route === activeRoute,
-                   observed.frame.generation==observed.route.incarnation,
+                if let observed=latestPresentedMirrorFrame,observed.route === activeRoute,observed.route === scannerMirror,
+                   observed.frame.generation==observed.route.incarnation,observed.frame.receivedAt>=navigationBegan,
                    ProcessInfo.processInfo.systemUptime-observed.frame.receivedAt<1 {
+                    let route=observed.route,incarnation=observed.frame.generation
                     let pixels=observed.frame.pixelBuffer
                     let result=try await Task.detached { () -> [String:Any] in
                         var result:[String:Any]=["width":CVPixelBufferGetWidth(pixels),"height":CVPixelBufferGetHeight(pixels),
                             "pixelFormat":CVPixelBufferGetPixelFormatType(pixels)]
                         let known:Set<String>=["微信","通讯录","发现","我","首页","消息","理财","生活","我的","扫一扫","收付款","收付钱"]
-                        for (name,orientation) in [("up",CGImagePropertyOrientation.up),("down",.down),("left",.left),("right",.right)] {
+                        if CVPixelBufferLockBaseAddress(pixels,.readOnly)==kCVReturnSuccess {
+                            defer {CVPixelBufferUnlockBaseAddress(pixels,.readOnly)}
+                            if let bytes=CVPixelBufferGetBaseAddress(pixels)?.assumingMemoryBound(to:UInt8.self) {
+                                var darkest=255,lightest=0,nonWhite=0,count=0
+                                let width=CVPixelBufferGetWidth(pixels),height=CVPixelBufferGetHeight(pixels),stride=CVPixelBufferGetBytesPerRow(pixels)
+                                for y in Swift.stride(from:0,to:height,by:max(1,height/64)) {
+                                    for x in Swift.stride(from:0,to:width,by:max(1,width/32)) {
+                                        let offset=y*stride+x*4
+                                        let v=(Int(bytes[offset])+Int(bytes[offset+1])+Int(bytes[offset+2]))/3
+                                        darkest=min(darkest,v);lightest=max(lightest,v);if v<235 {nonWhite+=1};count+=1
+                                    }
+                                }
+                                result["pixelProbe"]=["minimum":darkest,"maximum":lightest,"nonWhiteSamples":nonWhite,"samples":count]
+                            }
+                        }
+                        for (name,orientation) in [("up",CGImagePropertyOrientation.up),("down",.down),("left",.left),("right",.right),
+                                                   ("upMirrored",.upMirrored),("downMirrored",.downMirrored),("leftMirrored",.leftMirrored),("rightMirrored",.rightMirrored)] {
                             let request=VNRecognizeTextRequest();request.recognitionLevel = .accurate
                             request.recognitionLanguages=["zh-Hans","en-US"]
                             try VNImageRequestHandler(cvPixelBuffer:pixels,orientation:orientation).perform([request])
@@ -1084,8 +1108,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         result["plusLocated"]=try ScannerNavigationOCR.plusButton(in:pixels,homeWords:words) != nil
                         return result
                     }.value
-                    try checkNavigation();evidence["navigationProbe"]=result
-                    throw ScanError("只读入口探针已完成，未点击手机内容。")
+                    try checkNavigation()
+                    guard route === activeRoute,route === scannerMirror,route.incarnation==incarnation,
+                          observed.frame.generation==incarnation,observed.frame.receivedAt>=navigationBegan else{continue}
+                    evidence["navigationProbe"]=result
+                    throw NavigationProbeComplete()
                 }
                 try await Task.sleep(nanoseconds:50_000_000)
             }
