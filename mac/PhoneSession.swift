@@ -246,6 +246,7 @@ actor PhoneSession {
     private var displayWidth=720, displayHeight=1280, displayDpi=320
     private var displayID: Int?
     private(set) var independentApplicationsWhenLocked=false
+    private var genericDesktopCamera=false
     private var cleaning=false
     private(set) var connectionStage = "idle"
     private var diagnosticLog: ServerLog?
@@ -268,7 +269,7 @@ actor PhoneSession {
         try JSONEncoder().encode(state).write(to: recoveryURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:recoveryURL.path)
     }
-    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, desktopHome: Bool = false, balancedDisplay: Bool = false, displayBeforeCamera: Bool = false, mirrorOnly: Bool = false, realtimeVideo: Bool = false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
+    func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, desktopHome: Bool = false, balancedDisplay: Bool = false, displayBeforeCamera: Bool = false, mirrorOnly: Bool = false, realtimeVideo: Bool = false, genericDesktopCamera:Bool=false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
         guard server == nil else { throw ScanError("手机已经连接。") }
         do {
             connectionStage = "enumeration"
@@ -338,6 +339,15 @@ actor PhoneSession {
             recovery?.port=port;try save()
             connectionStage = "authentication"
             channel=try CameraSocket(port:port,token:r.token)
+            self.genericDesktopCamera=genericDesktopCamera
+            if genericDesktopCamera {
+                guard desktopHome,!mirrorOnly,try cameraState().desktopCameraSupported else {
+                    throw ScanError("手机服务未提供通用桌面相机，请使用完整的新版本。")
+                }
+                guard try channel?.request(26,Data([2]))==Data([1]),try cameraState().desktopCameraEnabled else {
+                    throw ScanError("手机未确认桌面相机模式。")
+                }
+            }
             if openWechatOnConnect {
                 progress("正在打开手机微信…")
                 try openWechat()
@@ -426,6 +436,24 @@ actor PhoneSession {
         _ = try channel.request(23,Self.epochBytes(epoch))
     }
     func heartbeat() throws { guard let channel else {throw ScanError("手机未连接。")};_ = try channel.request(4) }
+    static func desktopCameraBindingBody(display:Int,package:String?) throws -> Data {
+        guard display>0,display<=Int(Int32.max) else{throw ScanError("桌面相机窗口无效。")}
+        var body=Data([package == nil ? 0:1]),value=Int32(display).bigEndian
+        withUnsafeBytes(of:&value){body.append(contentsOf:$0)}
+        if let package {
+            guard package.utf8.count<=255,AndroidApplication(packageName:package,component:package+"/.Main",name:"").isValid else {
+                throw ScanError("桌面相机应用无效。")
+            }
+            body.append(Data(package.utf8))
+        }
+        return body
+    }
+    private func bindDesktopCamera(display:Int,package:String?) throws -> Bool {
+        guard genericDesktopCamera else{return false}
+        guard let channel else{throw ScanError("手机未连接。")}
+        let reply=try channel.request(26,Self.desktopCameraBindingBody(display:display,package:package))
+        return try DesktopCameraLaunch.accepted(reply,clearing:package == nil)
+    }
     func cameraState() throws -> PhoneCameraState {
         try PhoneCameraState.decode(cameraStatusSnapshot())
     }
@@ -650,49 +678,52 @@ actor PhoneSession {
             throw ScanError("应用任务没有移动到指定屏幕，已保留恢复记录。")
         }
     }
-    func launchApplication(_ app: AndroidApplication, on target: Int) throws {
+    @discardableResult
+    func launchApplication(_ app: AndroidApplication, on target: Int) throws -> Bool {
         guard let state = recovery, channel != nil, ownsDisplay(target), app.isValid else { throw ScanError("应用或屏幕不属于本次连接。") }
         try requireApplicationAccess(on:target)
         // Revalidate against the authenticated launcher catalog, never execute an arbitrary component.
         guard let channel, try catalog(channel).contains(where: { $0.canonicalComponent == app.canonicalComponent }) else { throw ScanError("手机主用户中未找到此应用入口。") }
-        let before = try tasks(requiredDisplay: target)
-        let moving = before.filter { $0.userID == 0 && $0.packageName == app.packageName && $0.display != target }
-        let groups = Dictionary(grouping: moving, by: \.rootID)
-        for root in groups.keys {
-            guard before.filter({ $0.rootID == root }).allSatisfy({ $0.userID == 0 && !$0.rootContainsOtherUsers && $0.packageName == app.packageName && $0.display != target }) else {
-                throw ScanError("此应用与其他应用共享任务容器，无法安全地单独移入窗口。")
+        return try DesktopCameraLaunch.perform(bind:{try self.bindDesktopCamera(display:target,package:app.packageName)},launch:{
+            let before = try tasks(requiredDisplay: target)
+            let moving = before.filter { $0.userID == 0 && $0.packageName == app.packageName && $0.display != target }
+            let groups = Dictionary(grouping: moving, by: \.rootID)
+            for root in groups.keys {
+                guard before.filter({ $0.rootID == root }).allSatisfy({ $0.userID == 0 && !$0.rootContainsOtherUsers && $0.packageName == app.packageName && $0.display != target }) else {
+                    throw ScanError("此应用与其他应用共享任务容器，无法安全地单独移入窗口。")
+                }
             }
-        }
-        // Record every child before moving a root once: one root move affects all children.
-        for task in moving {
-            if state.appTasks?.contains(where: { $0.id == task.id }) != true {
-                appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: task.display, packageName: task.packageName, ownedDisplay: target))
-            } else if let index = recovery?.appTasks?.firstIndex(where: { $0.id == task.id }), let old = recovery?.appTasks?[index] {
-                recovery?.appTasks?[index] = AndroidOwnedTask(id: old.id, originalDisplay: old.originalDisplay, packageName: old.packageName, ownedDisplay: target)
+            // Record every child before moving a root once: one root move affects all children.
+            for task in moving {
+                if state.appTasks?.contains(where: { $0.id == task.id }) != true {
+                    appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: task.display, packageName: task.packageName, ownedDisplay: target))
+                } else if let index = recovery?.appTasks?.firstIndex(where: { $0.id == task.id }), let old = recovery?.appTasks?[index] {
+                    recovery?.appTasks?[index] = AndroidOwnedTask(id: old.id, originalDisplay: old.originalDisplay, packageName: old.packageName, ownedDisplay: target)
+                }
             }
-        }
-        try save()
-        for root in groups.keys.sorted() {
-            guard let group = groups[root], let representative = group.first else { continue }
-            let current = try tasks().filter { $0.rootID == root }
-            guard current.allSatisfy({ task in task.userID == 0 && !task.rootContainsOtherUsers && group.contains(where: { $0.id == task.id && $0.packageName == task.packageName && $0.display == task.display }) }) else {
-                throw ScanError("应用任务在移动前发生变化，已保留恢复记录。")
+            try save()
+            for root in groups.keys.sorted() {
+                guard let group = groups[root], let representative = group.first else { continue }
+                let current = try tasks().filter { $0.rootID == root }
+                guard current.allSatisfy({ task in task.userID == 0 && !task.rootContainsOtherUsers && group.contains(where: { $0.id == task.id && $0.packageName == task.packageName && $0.display == task.display }) }) else {
+                    throw ScanError("应用任务在移动前发生变化，已保留恢复记录。")
+                }
+                try moveTask(representative.id, to: target, expectedRoot: root)
             }
-            try moveTask(representative.id, to: target, expectedRoot: root)
-        }
-        let result = try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")
-        guard !result.lowercased().contains("error:"), !result.lowercased().contains("exception") else { throw ScanError("手机应用启动失败。") }
-        for _ in 0..<8 {
-            let activityDump = try shell("dumpsys activity activities")
-            let after = try AndroidTaskSnapshot.parseChecked(activityDump, requiredDisplay: target)
-            for task in after where task.userID == 0 && !task.rootContainsOtherUsers && task.packageName == app.packageName && task.display == target && !(recovery?.appTasks?.contains(where: { $0.id == task.id }) ?? false) {
-                appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: 0, packageName: app.packageName, ownedDisplay: target))
-                try save()
+            let result = try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")
+            guard !result.lowercased().contains("error:"), !result.lowercased().contains("exception") else { throw ScanError("手机应用启动失败。") }
+            for _ in 0..<8 {
+                let activityDump = try shell("dumpsys activity activities")
+                let after = try AndroidTaskSnapshot.parseChecked(activityDump, requiredDisplay: target)
+                for task in after where task.userID == 0 && !task.rootContainsOtherUsers && task.packageName == app.packageName && task.display == target && !(recovery?.appTasks?.contains(where: { $0.id == task.id }) ?? false) {
+                    appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: 0, packageName: app.packageName, ownedDisplay: target))
+                    try save()
+                }
+                if Self.foregroundComponent(in: activityDump, display: target)?.hasPrefix(app.packageName + "/") == true { return }
+                Thread.sleep(forTimeInterval: 0.2)
             }
-            if Self.foregroundComponent(in: activityDump, display: target)?.hasPrefix(app.packageName + "/") == true { return }
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-        throw ScanError("应用未出现在指定屏幕；已保留恢复记录。")
+            throw ScanError("应用未出现在指定屏幕；已保留恢复记录。")
+        },clear:{_ = try self.bindDesktopCamera(display:target,package:nil)})
     }
     private func restoreTasks(on target: Int) throws {
         let snapshot = try tasks(requiredDisplay: target)
@@ -850,6 +881,7 @@ actor PhoneSession {
         cleanupStage="validateRecord"
         cleanupCameraStreamsBeforeSleep=nil;cleanupCameraClosureConfirmed=false;cleanupScannerBeforeSleep=false
         diagnosticLog=nil
+        genericDesktopCamera=false
         independentApplicationsWhenLocked=false
         cleaning=true;defer {cleaning=false}
         if let state = recovery {
@@ -872,7 +904,7 @@ actor PhoneSession {
                         cleanupStage="readCameraBeforeSleep"
                         let beforeSleep=try PhoneCameraState.decode(channel.request(5))
                         cleanupCameraStreamsBeforeSleep=beforeSleep.activeStreams
-                        cleanupScannerBeforeSleep=beforeSleep.scannerActivity() != nil
+                        cleanupScannerBeforeSleep=beforeSleep.captureActivity() != nil
                         cleanupStage="sleepOwnedDevice"
                         let cameraPresent=try channel.request(24)
                         guard cameraPresent==Data([0]) || cameraPresent==Data([1]) else {

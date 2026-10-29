@@ -46,6 +46,7 @@ import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
@@ -77,6 +78,7 @@ public final class LiveCameraServer {
     private static final int DISPLAY_SYSTEM_DECORATIONS = 1 << 9;
 
     private final Object cameraLock = new Object();
+    private final Object cameraPermissionLock = new Object();
     private final Object frameLock = new Object();
     private final Object stateLock = new Object();
     private final Map<Integer, String> topActivities = new HashMap<>();
@@ -126,6 +128,7 @@ public final class LiveCameraServer {
     private CameraManager.AvailabilityCallback cameraOwnerListener;
     private String virtualCameraId;
     private String cameraOwner;
+    private final DesktopCameraRouting desktopCameraRouting = new DesktopCameraRouting();
     private boolean cameraOwnerKnown;
     private long ownerGeneration;
     // A bounded reason for fail-closed camera ownership detection in CMD 5.
@@ -368,8 +371,10 @@ public final class LiveCameraServer {
 
     // Call only under stateLock.
     private int authorizedDesktopScannerLocked() {
-        return cameraOwnerKnown && !streams.isEmpty()
-                ? scannerDisplayForOwner(cameraOwner, topActivities, primaryOwnedDisplayId, appDisplays) : -1;
+        if (!cameraOwnerKnown || streams.isEmpty()) return -1;
+        return desktopCameraRouting.enabled()
+                ? desktopCameraRouting.authorizedDisplay(cameraOwner, topActivities, primaryOwnedDisplayId, appDisplays)
+                : scannerDisplayForOwner(cameraOwner, topActivities, primaryOwnedDisplayId, appDisplays);
     }
 
     private long markDesktopFrameInvalidLocked() {
@@ -441,37 +446,132 @@ public final class LiveCameraServer {
     }
 
     private void grantSupportedCameras() throws Exception {
-        Context virtualContext = context.createDeviceContext(deviceId);
-        if (virtualContext.getDeviceId() != deviceId) throw new IllegalStateException("Virtual context mismatch");
-        PackageManager pm = virtualContext.getPackageManager();
-        for (String pkg : cameraPackagesForMode(desktopHomeRequested)) {
-            try { pm.getPackageInfo(pkg, 0); }
-            catch (PackageManager.NameNotFoundException absent) { continue; }
-            pm.getClass().getMethod("grantRuntimePermission", String.class, String.class, UserHandle.class)
-                    .invoke(pm, pkg, "android.permission.CAMERA", Process.myUserHandle());
-            grantedCameraPackages.add(pkg);
-            log("camera_permission", "granted_virtual_device_only");
+        synchronized (cameraPermissionLock) {
+            Context virtualContext = context.createDeviceContext(deviceId);
+            if (virtualContext.getDeviceId() != deviceId) throw new IllegalStateException("Virtual context mismatch");
+            PackageManager pm = virtualContext.getPackageManager();
+            for (String pkg : cameraPackagesForMode(desktopHomeRequested)) {
+                try { pm.getPackageInfo(pkg, 0); }
+                catch (PackageManager.NameNotFoundException absent) { continue; }
+                pm.getClass().getMethod("grantRuntimePermission", String.class, String.class, UserHandle.class)
+                        .invoke(pm, pkg, "android.permission.CAMERA", Process.myUserHandle());
+                grantedCameraPackages.add(pkg);
+                log("camera_permission", "granted_virtual_device_only");
+            }
+
+        }
+    }
+
+    private void revokeUnusedDesktopCamera(String pkg) throws Exception {
+        synchronized (cameraPermissionLock) {
+            if (pkg == null) return;
+            synchronized (stateLock) {if (desktopCameraRouting.uses(pkg)) return;}
+            if (!grantedCameraPackages.contains(pkg)) return;
+            Context scoped=context.createDeviceContext(deviceId);
+            if (scoped.getDeviceId()!=deviceId) throw new IOException("Virtual camera permission scope changed");
+            scoped.getPackageManager().getClass().getMethod("revokeRuntimePermission",String.class,String.class,UserHandle.class)
+                    .invoke(scoped.getPackageManager(),pkg,"android.permission.CAMERA",Process.myUserHandle());
+            grantedCameraPackages.remove(pkg);
+
+        }
+    }
+
+    private void revokeUnusedDesktopCameras() throws Exception {
+        synchronized (cameraPermissionLock) {
+            Exception failure=null;
+            // Retry previously uncertain revokes even after their binding was removed.
+            Set<String> unused;
+            synchronized (stateLock) {unused=desktopCameraRouting.unusedPackages(grantedCameraPackages);}
+            for(String pkg:unused) {
+                try {revokeUnusedDesktopCamera(pkg);}
+                catch(Exception cleanup) {if(failure==null) failure=cleanup;else failure.addSuppressed(cleanup);}
+            }
+            if(failure!=null) throw failure;
+        }
+    }
+
+    private byte[] configureDesktopCamera(byte[] body) throws Exception {
+        synchronized (cameraPermissionLock) {
+            if (stopping) throw new IOException("Camera session is stopping");
+            DesktopCameraRouting.Request request=DesktopCameraRouting.Request.parse(body);
+            if (!desktopHomeRequested || mirrorOnlyRequested) throw new IOException("Desktop camera mode unavailable");
+            if (request.action==2) {
+                long invalidation;
+                synchronized (stateLock) {
+                    if (desktopCameraRouting.enabled()) return new byte[]{1};
+                    if (!streams.isEmpty()) throw new IOException("Close the current camera before selecting its source");
+                    desktopCameraRouting.enable();invalidation=markDesktopFrameInvalidLocked();
+                }
+                discardObsoleteDesktopFrame(invalidation);
+                // Retire compatibility grants before accepting dynamic selections.
+                revokeSupportedCameras();
+                return new byte[]{1};
+            }
+            ownedDisplay(request.display);
+            synchronized (stateLock) {if (!desktopCameraRouting.enabled()) throw new IOException("Desktop camera mode was not selected");}
+            boolean requested=false;
+            if (request.action==1) {
+                JSONArray catalog=new JSONArray(new String(applications(),StandardCharsets.UTF_8));
+                boolean launchable=false;
+                for (int i=0;i<catalog.length();i++) if(request.packageName.equals(catalog.getJSONObject(i).getString("packageName"))) {launchable=true;break;}
+                if (!launchable) throw new IOException("Camera application is not in the primary-user launcher catalog");
+                android.content.pm.PackageInfo info=context.getPackageManager().getPackageInfo(request.packageName,PackageManager.GET_PERMISSIONS);
+                if (info.requestedPermissions!=null) for(String permission:info.requestedPermissions)
+                    if ("android.permission.CAMERA".equals(permission)) requested=true;
+            }
+            synchronized (stateLock) {
+                if (request.action==1 && requested && request.packageName.equals(desktopCameraRouting.snapshot().get(request.display)) &&
+                        grantedCameraPackages.contains(request.packageName)) return new byte[]{1};
+            }
+            long invalidation;
+            synchronized (stateLock) {
+                desktopCameraRouting.clear(request.display);invalidation=markDesktopFrameInvalidLocked();
+            }
+            discardObsoleteDesktopFrame(invalidation);revokeUnusedDesktopCameras();
+            if (request.action==0) return new byte[]{0};
+            if (!requested) return new byte[]{2};
+            Context scoped=context.createDeviceContext(deviceId);
+            if (scoped.getDeviceId()!=deviceId) throw new IOException("Virtual camera permission scope changed");
+            PackageManager pm=scoped.getPackageManager();
+            DesktopCameraRouting.grantAndBind(() -> {
+                // Record before Binder: an uncertain reply still needs compensating revoke.
+                grantedCameraPackages.add(request.packageName);
+                pm.getClass().getMethod("grantRuntimePermission",String.class,String.class,UserHandle.class)
+                        .invoke(pm,request.packageName,"android.permission.CAMERA",Process.myUserHandle());
+            }, () -> {
+                long changed;
+                synchronized (stateLock) {
+                    if (stopping || !isOwnedActivityDisplay(request.display)) throw new IOException("Camera window is no longer owned");
+                    desktopCameraRouting.bind(request.display,request.packageName);changed=markDesktopFrameInvalidLocked();
+                }
+                discardObsoleteDesktopFrame(changed);
+            }, () -> revokeUnusedDesktopCamera(request.packageName));
+            return new byte[]{1};
+
         }
     }
 
     private void revokeSupportedCameras() throws Exception {
-        if (grantedCameraPackages.isEmpty() || deviceId <= 0) return;
-        Context virtualContext = context.createDeviceContext(deviceId);
-        if (virtualContext.getDeviceId() != deviceId) throw new IllegalStateException("Virtual context mismatch on revoke");
-        PackageManager pm = virtualContext.getPackageManager();
-        Exception firstFailure = null;
-        for (String pkg : new HashSet<>(grantedCameraPackages)) {
-            try {
-                pm.getClass().getMethod("revokeRuntimePermission", String.class, String.class, UserHandle.class)
-                        .invoke(pm, pkg, "android.permission.CAMERA", Process.myUserHandle());
-                grantedCameraPackages.remove(pkg);
-                log("camera_permission", "revoked_virtual_device_only");
-            } catch (Exception failure) {
-                if (firstFailure == null) firstFailure = failure;
-                else firstFailure.addSuppressed(failure);
+        synchronized (cameraPermissionLock) {
+            if (grantedCameraPackages.isEmpty() || deviceId <= 0) return;
+            Context virtualContext = context.createDeviceContext(deviceId);
+            if (virtualContext.getDeviceId() != deviceId) throw new IllegalStateException("Virtual context mismatch on revoke");
+            PackageManager pm = virtualContext.getPackageManager();
+            Exception firstFailure = null;
+            for (String pkg : new HashSet<>(grantedCameraPackages)) {
+                try {
+                    pm.getClass().getMethod("revokeRuntimePermission", String.class, String.class, UserHandle.class)
+                            .invoke(pm, pkg, "android.permission.CAMERA", Process.myUserHandle());
+                    grantedCameraPackages.remove(pkg);
+                    log("camera_permission", "revoked_virtual_device_only");
+                } catch (Exception failure) {
+                    if (firstFailure == null) firstFailure = failure;
+                    else firstFailure.addSuppressed(failure);
+                }
             }
+            if (firstFailure != null) throw firstFailure;
+
         }
-        if (firstFailure != null) throw firstFailure;
     }
 
     private void createVirtualCamera() throws Exception {
@@ -903,6 +1003,16 @@ public final class LiveCameraServer {
     private void releaseAppDisplay(int id) throws IOException {
         AppDisplay owned = appDisplays.get(id);
         if (owned == null) throw new IOException("Display does not belong to this session");
+        synchronized (cameraPermissionLock) {
+            boolean generic;long sourceInvalidation=-1;
+            synchronized (stateLock) {
+                generic=desktopCameraRouting.enabled();
+                if(generic) {desktopCameraRouting.clear(id);sourceInvalidation=markDesktopFrameInvalidLocked();}
+            }
+            discardObsoleteDesktopFrame(sourceInvalidation);
+            if(generic) try {revokeUnusedDesktopCameras();}
+                catch(Exception failure) {throw new IOException("Camera source cleanup failed",failure);}
+        }
         stopDirectStream(id);
         owned.close();
         long invalidation = -1;
@@ -1092,6 +1202,13 @@ public final class LiveCameraServer {
         state.put("solidCalibrationSupported", desktopHomeRequested && realtimeVideoRequested && !mirrorOnlyRequested);
         JSONArray activities = new JSONArray();
         synchronized (stateLock) {
+            state.put("desktopCameraSupported",desktopHomeRequested && !mirrorOnlyRequested);
+            state.put("desktopCameraEnabled",desktopCameraRouting.enabled());
+            state.put("desktopCameraGeneration",desktopCameraRouting.generation());
+            JSONArray bindings=new JSONArray();
+            for(Map.Entry<Integer,String> binding:desktopCameraRouting.snapshot().entrySet())
+                bindings.put(new JSONObject().put("displayId",binding.getKey()).put("packageName",binding.getValue()));
+            state.put("desktopCameraBindings",bindings);
             state.put("generation", streamGeneration).put("activeStreams", streams.size());
             state.put("cameraOwner", cameraOwner == null ? JSONObject.NULL : cameraOwner);
             state.put("ownerKnown", cameraOwnerKnown).put("ownerGeneration", ownerGeneration);
@@ -1139,6 +1256,9 @@ public final class LiveCameraServer {
                 error(output, "Invalid payload length");
                 return false;
             }
+            if (command==26 && (length<1 || length>260)) {
+                error(output,"Invalid camera source payload length");return false;
+            }
             byte[] body = new byte[length];
             input.readFully(body);
             if (command == 1) {
@@ -1157,6 +1277,9 @@ public final class LiveCameraServer {
                     reply(output, true, java.nio.ByteBuffer.allocate(Long.BYTES).putLong(processingNanos).array());
                 }
                 catch (Exception e) { error(output, e.getMessage() == null ? "Invalid camera frame" : e.getMessage()); }
+            } else if (command == 26) {
+                try {reply(output,true,configureDesktopCamera(body));}
+                catch (Exception failure) {error(output,"Desktop camera selection failed: "+failure.getClass().getSimpleName());}
             } else if (command == 25) {
                 try {
                     CalibrationFrameRequest calibration = CalibrationFrameRequest.parse(body);

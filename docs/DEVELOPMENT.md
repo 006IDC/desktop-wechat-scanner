@@ -62,7 +62,7 @@ swiftc -swift-version 5 -O -target arm64-apple-macos14.4 -module-cache-path .loc
 
 副屏 HOME 能否绘制完整原生桌面由手机系统决定。当前小米真机的 `SecondaryDisplayLauncher` 在按 HOME 后仍为纯白，因此在这部手机上该路径只作为副屏能力检测；主窗口的“手机应用”选择器使用已连接手机返回的真实可启动应用目录，不伪装成 Android 桌面或补造应用图标。选择应用后原生镜像继续提供画面和输入，目录内可拖出独立窗口。锁屏独立应用继续受既有显式选项和首次解锁条件约束；物理主屏不会被绕过。
 
-相机状态通过已认证的手机通道返回，包含当前活动、虚拟相机所有者、所有者是否可判定及代数。Mac 仅在所有者明确、有活动流、恰好一个经真机验证的扫码 Activity、并且同包没有第二个前台窗口时开始桌面采集；未知应用、普通拍照和歧义状态保持关闭。当前经真机确认的精确 Activity 为微信 `com.tencent.mm/.plugin.scanner.ui.BaseScanUI`（亦接受同组件全名）及支付宝 `com.eg.android.AlipayGphone/com.alipay.mobile.scan.as.main.MainCaptureActivity`；支付宝其他扫码类名尚未验证，不因同包名自动放行。手机端相机所有者及相机 ID 只用于内存中的路由判断，不进入遥测。build 40 的三轮双应用自动集成识别与恢复清理通过，完整 GUI 与长时间稳定性仍未验收。相机查询使用不继承 system context 的 shell ContextImpl，使内部 ContentResolver 的包身份与 UID 相符；虚拟 context 的 AttributionSource 保留 deviceId，通过显式 `getCameraCharacteristics(String, false)` 避开无关的全局桌面旋转设置，并直接读取不一定列于 `getKeys()` 的 `INFO_DEVICE_ID` 验证映射别名，不能把设备感知的 camera ID 0 当作物理相机。
+相机状态通过已认证的手机通道返回，包含当前活动、虚拟相机所有者、所有者是否可判定及代数。以下为未开启通用桌面相机时的兼容规则：Mac 仅在所有者明确、有活动流、恰好一个经真机验证的扫码 Activity、并且同包没有第二个前台窗口时开始桌面采集；未知应用、普通拍照和歧义状态保持关闭。当前经真机确认的精确 Activity 为微信 `com.tencent.mm/.plugin.scanner.ui.BaseScanUI`（亦接受同组件全名）及支付宝 `com.eg.android.AlipayGphone/com.alipay.mobile.scan.as.main.MainCaptureActivity`；支付宝其他扫码类名尚未验证，不因同包名自动放行。手机端相机所有者及相机 ID 只用于内存中的路由判断，不进入遥测。build 40 的三轮双应用自动集成识别与恢复清理通过，完整 GUI 与长时间稳定性仍未验收。相机查询使用不继承 system context 的 shell ContextImpl，使内部 ContentResolver 的包身份与 UID 相符；虚拟 context 的 AttributionSource 保留 deviceId，通过显式 `getCameraCharacteristics(String, false)` 避开无关的全局桌面旋转设置，并直接读取不一定列于 `getKeys()` 的 `INFO_DEVICE_ID` 验证映射别名，不能把设备感知的 camera ID 0 当作物理相机。
 
 任务树解析保留 Task `U` 与 Activity `u` 的用户 ID，核对父子结构、数量与根任务包含的用户。小米的无关分身任务可以出现在其他屏幕，不再使整个快照失败；实际打开、迁移、恢复仍仅允许主用户 0，拒绝混合用户根任务及自有副屏上的其他用户。空子任务的用户也计入根任务判定。`AndroidApplicationTests` 覆盖这些边界，不意味着支持控制分身应用。
 
@@ -415,3 +415,18 @@ M4/M5/M6立即退出模式有效呈现1/1/0次，不当作持续呈现验收。M
 只读导航探针只输出尺寸、像素格式、亮度抽样统计及固定导航标签，不保存任意OCR/手机图像。曾取到启动黑帧，等候后有正常导航标签；同帧锁前/锁后/物化识别未证明是CPU读取故障。探针单列`test=navigation-frame-probe/performanceMeasured=false/probeCompleted`，不混入产品测速。原始诊断和数值汇总留本地忽略目录，不上传设备标识、运行配置或手机内容。
 
 末轮结束已核对本候选进程不存在、恢复记录不存在；virtualdevice、virtual_camera、media.camera只读检查约57/47/330ms，均正常响应。全部测试沿用已有录屏授权，没有重置TCC、重新配对、修改证书/系统信任、替换安装版或发布Release。结论是处理微步骤优化成立，稳定整体开场提速尚未成立。
+
+
+## 通用桌面相机重构（2026-10-29）
+
+连接窗口增加明确选择的“桌面相机（通用）”，首次默认关闭，只在选中设备时保存该偏好。它是本次所选应用窗口的相机来源选择，涵盖扫码、拍照、视频，不能通过 CameraManager 所有者事件推断用途。未选择时保留原精确扫码页面路由；选择后跳过 NativeScannerOverlay 九帧校准、本机 QR 预检及送一帧后自动交接，原 App 镜像继续显示，另用本地透明开口持续供图。开口拖动仍由 WindowServer 显示实际桌面，发送目前为停稳 180ms 后最多 8fps；这不是手机识别响应速度或整套视频效果的保证。
+
+认证通道命令26使用有界1–260字节请求：`[2]`选择连接来源；`[1]+Int32BE(display)+UTF8(package)`绑定；`[0]+Int32BE(display)`清除。所有显示必须由本连接拥有，包必须属于已认证的主用户 launcher 目录并声明 CAMERA。绑定回复1为已绑定、2为明确未声明相机权限（普通应用仍可打开），清除回复0；其他回复拒绝。liveState 的 supported/enabled/generation/bindings 与 owner、activities 联合决定路由，同包多窗口或不明 owner 停止供图，不增加 App/page 白名单。
+
+虚拟设备范围的授权与回收在 cameraPermissionLock 串行执行；先撤销绑定、推进图像代数并清帧，再撤销无引用的临时权限。Binder grant 前记录待回收包，失败补偿；先前不确定的 revoke 保留在集合内，后续 clear 再尝试。客户端共享启动事务在绑定或应用启动失败时补偿 clear，补偿失败明确断开并保留原有恢复机制。仅成功启动且不在关闭中的独立窗口可成为采集目标。每个图像仍受 epoch/owner/generation 检查；取景位置变化丢弃旧帧，隐藏/最小化原 App 暂停供图。
+
+新增 `DesktopCameraRoutingTests.java` 验证有界解析、任意第三包/任意页面路由、错误归属/歧义拒绝、代数失效和 grant/bind 回收；`GenericDesktopCameraTests.swift` 验证相同第三包状态、无二维码图像不触发检测、旧路由隔离、双屏取景框位置、协议回复和失败补偿。隐藏窗口回归检查通用开口透明、按钮语义和未展示窗口；独立窗口夹具覆盖 pending/ready/关闭/失败回收目标，不连接真实手机。
+
+这些后台测试不能证明第三款真实 App 接受虚拟设备或性能改善。已安装 build41 保持不变，录屏授权不重置，未运行新的手机 App 或发布 Release；需要对通用路径另做真实 App 兼容与耗时验收。
+
+本轮后台验证：上述 JVM 与 Swift 通用协议/路由测试、原 PhoneCameraState 路由回归、CameraPumpMailbox 旧帧/并发回归、隐藏 LocalScanFrame 透明与控制回归、DetachedApplications 假手机生命周期回归均通过；全量 Swift warnings-as-errors 优化编译/链接、Android Java/DEX/测试 APK 构建及测试签名校验通过。独立只读复核发现并修复“legacy 关闭独立窗口误撤兼容授权”的回归，新增 disabled/共享引用/最后引用/重试策略测试后复查未发现遗留问题。未运行测试 APK、候选 App 或手机扫码。

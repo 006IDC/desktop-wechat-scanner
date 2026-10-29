@@ -952,6 +952,7 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
     private let closeButton = button("返回", tooltip: "返回真实手机应用")
     private let titleLabel = text("停稳后自动识别", size: 13, weight: .semibold, color: .white)
     private var paused = false
+    private let genericCamera:Bool
 
     var captureRect: CGRect {
         guard let frame = window?.frame else { return .zero }
@@ -959,7 +960,8 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
                       width: 320, height: 320)
     }
 
-    init() {
+    init(genericCamera:Bool=false) {
+        self.genericCamera=genericCamera
         let panel = ScanFramePanel(contentRect: NSRect(x: 0, y: 0, width: 352, height: 404),
                             styleMask: [.borderless, .nonactivatingPanel],
                             backing: .buffered, defer: false)
@@ -981,6 +983,12 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
             action();return true
         }
         buildContent(in: panel)
+        if genericCamera {
+            panel.title="桌面相机取景框"
+            pauseButton.toolTip="暂停或继续桌面相机"
+            rescanButton.title="刷新";rescanButton.toolTip="刷新框内桌面图像"
+            setMessage("由手机 App 识别")
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
@@ -995,15 +1003,15 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
         bar.wantsLayer = true
         bar.layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.95).cgColor
         bar.layer?.cornerRadius = 10
-        bar.setAccessibilityLabel("拖动扫码框")
-        bar.toolTip = "拖动这里，把透明框放在电脑二维码上"
+        bar.setAccessibilityLabel(genericCamera ? "拖动桌面相机取景框":"拖动扫码框")
+        bar.toolTip = genericCamera ? "拖动这里，选取要送入手机 App 的电脑画面":"拖动这里，把透明框放在电脑二维码上"
         frame.addSubview(bar)
         bar.onDragBegan={ [weak self] in
             guard let self else{return};self.onMoved?(self.captureRect)
         }
 
         let title = titleLabel
-        title.setAccessibilityLabel("停稳后自动识别")
+        title.setAccessibilityLabel(genericCamera ? "由手机 App 识别":"停稳后自动识别")
         for control in [pauseButton, rescanButton, closeButton] {
             control.isBordered = false
             control.contentTintColor = .white
@@ -1032,9 +1040,10 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
     func setPaused(_ value: Bool) {
         paused = value
         pauseButton.title = value ? "继续" : "暂停"
-        pauseButton.setAccessibilityLabel(value ? "继续扫码画面" : "暂停扫码画面")
-        pauseButton.toolTip = value ? "继续扫码画面" : "暂停扫码画面"
-        setMessage(value ? "扫码已暂停":"停稳后自动识别")
+        let action=(value ? "继续":"暂停")+(genericCamera ? "桌面相机":"扫码画面")
+        pauseButton.setAccessibilityLabel(action)
+        pauseButton.toolTip=action
+        setMessage(value ? "桌面相机已暂停":(genericCamera ? "由手机 App 识别":"停稳后自动识别"))
     }
 
     func setMessage(_ message:String) {
@@ -1046,12 +1055,17 @@ final class ScanFrameController: NSWindowController, NSWindowDelegate {
         onMoved?(captureRect)
     }
 
-    func show(near rect:CGRect) {
+    func show(near rect:CGRect,avoiding owner:CGRect?=nil) {
         guard let window else{return}
         let destination=AppWindowMotion.destination(for:window.frame,
             at:NSPoint(x:rect.midX,y:rect.midY),screens:NSScreen.screens.map(\.visibleFrame),
             fallback:NSScreen.main?.visibleFrame ?? window.frame)
-        window.setFrame(destination,display:false)
+        let finalFrame: CGRect
+        if let owner {
+            let screen=NSScreen.screens.first{$0.visibleFrame.intersects(owner)}?.visibleFrame ?? NSScreen.main?.visibleFrame ?? destination
+            finalFrame=DesktopCameraInput.framePlacement(size:window.frame.size,owner:owner,screen:screen)
+        } else {finalFrame=destination}
+        window.setFrame(finalFrame,display:false)
         show()
         guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else{return}
         window.alphaValue=0

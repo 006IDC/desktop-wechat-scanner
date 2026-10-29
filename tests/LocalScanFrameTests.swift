@@ -37,6 +37,20 @@ import AVFoundation
         if CommandLine.arguments.contains("--render-fixture"),let data=image.representation(using:.png,properties:[:]) {
             try data.write(to:URL(fileURLWithPath:".local/local-scan-frame-fixture.png"))
         }
+        let generic=ScanFrameController(genericCamera:true)
+        guard let genericWindow=generic.window,let genericRoot=genericWindow.contentView else{fatalError("No generic frame")}
+        defer{generic.onClose=nil;genericWindow.close()}
+        let genericButtons=buttons(genericRoot)
+        precondition(genericButtons.contains{$0.title=="刷新"} && !genericButtons.contains{$0.title=="再扫"},"Generic camera exposes scanner-only controls")
+        precondition(genericWindow.title=="桌面相机取景框" && !genericWindow.isOpaque && genericWindow.backgroundColor == .clear)
+        genericRoot.layoutSubtreeIfNeeded()
+        guard let genericImage=genericRoot.bitmapImageRepForCachingDisplay(in:genericRoot.bounds) else{fatalError("No generic bitmap")}
+        genericRoot.cacheDisplay(in:genericRoot.bounds,to:genericImage)
+        precondition((genericImage.colorAt(x:genericImage.pixelsWide/2,y:genericImage.pixelsHigh/2)?.alphaComponent ?? 1)<0.01,"Generic aperture is not transparent")
+        if CommandLine.arguments.contains("--render-fixture"),let data=genericImage.representation(using:.png,properties:[:]) {
+            try data.write(to:URL(fileURLWithPath:".local/generic-local-frame-fixture.png"))
+        }
+        precondition(!genericWindow.isVisible && !window.isVisible,"Hidden rendering test presented a window")
         print("PASS: transparent opening, matched ROI, no video surface, pause/resume/retry/return/Escape")
     }
 }

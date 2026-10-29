@@ -7,16 +7,17 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
     @MainActor private final class Entry {
         let app: AndroidApplication, ui: ControlWindowController
         let mirror = MirrorSession(), frames = MirrorVideoMailbox()
-        var display: Int?, task: Task<Void, Never>?, closing = false
+        var display: Int?, task: Task<Void, Never>?, closing = false,ready=false
         init(_ app: AndroidApplication) {
             self.app = app; ui = ControlWindowController(title: app.name, standalone: true)
             frames.reset(generation: 1)
         }
     }
+    var onCameraCleanupFailure:((Error)->Void)?
     var beforeClose: ((Int) async -> Void)?
     func cameraWindows() -> [(display:Int,window:ControlWindowController)] {
         entries.values.compactMap { entry in
-            guard !entry.closing,let display=entry.display else{return nil}
+            guard !entry.closing,entry.ready,let display=entry.display else{return nil}
             return (display,entry.ui)
         }
     }
@@ -66,11 +67,13 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
                         guard let entry, !entry.closing else { return }
                         entry.ui.update(status: "画面连接中断", detail: "请关闭此窗口后重新打开应用。", connected: false, busy: false, paused: true)
                     } })
-                try Task.checkCancellation(); try await phone.launchApplication(app, on: display.id)
-                try Task.checkCancellation()
+                try Task.checkCancellation();let cameraReady=try await phone.launchApplication(app, on: display.id)
+                try Task.checkCancellation();entry.ready=true
                 guard !entry.closing, !stopping else { return }
-                entry.ui.update(status: app.name, detail: "独立应用窗口 · 关闭后移回手机；黄色按钮使用系统程序坞动画。", connected: true, busy: false, paused: true)
+                entry.ui.update(status: app.name, detail: cameraReady ? "桌面相机已绑定；在此应用内打开相机即可取景。":"独立应用窗口 · 关闭后移回手机；黄色按钮使用系统程序坞动画。", connected: true, busy: false, paused: true)
             } catch {
+                entry.ready=false
+                if error is DesktopCameraLaunchFailure {onCameraCleanupFailure?(error)}
                 guard !entry.closing, !stopping else { return }
                 await entry.mirror.stop()
                 if let id = entry.display {

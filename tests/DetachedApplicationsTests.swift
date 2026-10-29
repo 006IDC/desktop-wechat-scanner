@@ -2,7 +2,7 @@ import AppKit
 import CoreVideo
 
 // Standalone dependency fakes: compile with AndroidApplication.swift,
-// ApplicationLibrary.swift and DetachedApplications.swift only. No real phone,
+// ApplicationLibrary.swift, DesktopCameraInput.swift and DetachedApplications.swift only. No real phone,
 // mirror, adb, capture or network implementation is linked into this binary.
 struct ScanError: LocalizedError {
     let message: String
@@ -11,11 +11,12 @@ struct ScanError: LocalizedError {
 }
 actor PhoneSession {
     struct Endpoint { let serial = "synthetic-phone" }
-    private var block = false, fail = true
+    private var block = false, fail = true,failLaunch=false
     private var gate: CheckedContinuation<Void, Never>?
     private(set) var started = false, closed = [Int]()
     func configure(block: Bool, fail: Bool) { self.block = block; self.fail = fail; started = false }
     func release() { gate?.resume(); gate = nil }
+    func configureLaunchFailure() {failLaunch=true}
     func createAppDisplay() async throws -> AndroidAppDisplay {
         started = true
         if block { await withCheckedContinuation { gate = $0 } }
@@ -24,7 +25,9 @@ actor PhoneSession {
     }
     func mirrorEndpoint(display: Int) throws -> Endpoint { Endpoint() }
     func directMirror(display: Int) throws -> DirectMirrorDescriptor? { nil }
-    func launchApplication(_ app: AndroidApplication, on display: Int) throws {}
+    func launchApplication(_ app: AndroidApplication, on display: Int) throws -> Bool {
+        if failLaunch {throw DesktopCameraLaunchFailure(original:ScanError("Synthetic cleanup uncertainty"))};return true
+    }
     func closeAppDisplay(_ display: Int) throws { closed.append(display) }
 }
 final class MirrorVideoMailbox: @unchecked Sendable {
@@ -112,6 +115,24 @@ final class MirrorSession: @unchecked Sendable {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         await manager.stop()
+        let readyPhone=PhoneSession()
+        await readyPhone.configure(block:false,fail:false)
+        let readyManager=DetachedApplications(phone:readyPhone,adb:URL(fileURLWithPath:"/synthetic/adb"),server:URL(fileURLWithPath:"/synthetic/server"))
+        require(readyManager.open(app,at:nil),"Ready fixture rejected app")
+        require(readyManager.cameraWindows().isEmpty,"Pending app became a camera target")
+        try await waitUntil{readyManager.cameraWindows().count==1}
+        guard let readyWindow=readyManager.cameraWindows().first?.window.window else{fatalError("No ready camera target")}
+        require(readyManager.windowShouldClose(readyWindow)==false && readyManager.cameraWindows().isEmpty,"Closing app remained a camera target")
+        await readyManager.stop()
+        let failedPhone=PhoneSession()
+        await failedPhone.configure(block:false,fail:false);await failedPhone.configureLaunchFailure()
+        let failedManager=DetachedApplications(phone:failedPhone,adb:URL(fileURLWithPath:"/synthetic/adb"),server:URL(fileURLWithPath:"/synthetic/server"))
+        var failures=0
+        failedManager.onCameraCleanupFailure={_ in failures+=1}
+        require(failedManager.open(app,at:nil),"Failure fixture rejected app")
+        try await waitUntil{failures==1}
+        require(failedManager.cameraWindows().isEmpty,"Uncertain binding remained a camera target")
+        await failedManager.stop()
         require(!manager.open(app, at: nil), "Stopped manager silently accepted an app")
         require(ControlWindowController.created.allSatisfy { $0.window?.isVisible == false }, "Probe ordered a window into shared UI")
         print("PASS pending presentation, failure feedback, reuse, asynchronous close, late display cleanup and stopped rejection; fake phone/mirror only; no ordered windows")

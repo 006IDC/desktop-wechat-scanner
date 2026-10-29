@@ -16,6 +16,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private let mainControl=ControlWindowController(), capture=DesktopCapture()
     private var desktopMode=false
+    private var genericDesktopCamera=false
     private var applicationPickerVisible=false
     private var cachedApplications:[AndroidApplication]?
     private var cameraWindow:ControlWindowController?
@@ -89,7 +90,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         RunLoop.main.add(timer,forMode:.common);previewTimer=timer
         control.onConnect={ [weak self] in self?.connect() }
         control.onDisconnect={ [weak self] in self?.disconnect() }
-        control.onScan={ [weak self] in self?.enterWechat(scan:true) }
+        control.onScan={ [weak self] in
+            guard let self else{return}
+            if self.genericDesktopCamera {self.requestDesktopCamera()} else {self.enterWechat(scan:true)}
+        }
         control.onPause={ [weak self] in self?.togglePause() }
         control.onBack={ [weak self] in self?.back() }
         control.onHome={ [weak self] in self?.home() }
@@ -157,7 +161,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 device=selected
             }
             let desktopDiagnostic=CommandLine.arguments.contains("--run-desktop-diagnostic")
-            connectDevice(device,adb:adb,allowLockedApplications:UserDefaults.standard.bool(forKey:"allowsLockedApplications.v1"),diagnostic:!desktopDiagnostic)
+            connectDevice(device,adb:adb,allowLockedApplications:UserDefaults.standard.bool(forKey:"allowsLockedApplications.v1"),diagnostic:!desktopDiagnostic,
+                          genericDesktopCamera:CommandLine.arguments.contains("--generic-desktop-camera"))
             await connectionTask?.value;try check()
             guard connected,!busy,!stopping else{throw ScanError("手机诊断连接未就绪。")}
             if desktopDiagnostic {await runDesktopDiagnostic()}
@@ -299,6 +304,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         value["localScanFrameVisible"]=localScanFrame?.window?.isVisible == true
         value["localCameraMode"]=localCameraMode
         value["desktopMode"]=desktopMode
+        value["genericDesktopCamera"]=genericDesktopCamera
         value["applicationPickerVisible"]=applicationPickerVisible
         if CommandLine.arguments.contains("--diagnostic-manual-navigation") {
             value["manualPhoneInput"]=mainControl.phoneInputDiagnostic
@@ -322,13 +328,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     guard let self else{return}
                     let window=self.connectionWindow
                     let allowLockedApplications=window?.allowsLockedApplications ?? false
+                    let usesDesktopCamera=window?.usesDesktopCamera ?? false
                     self.status("正在连接","正在收束连接设置…")
                     self.connectionTask=Task {
                         let clean=await window?.waitForCleanup() ?? true
                         let ownedServer=window?.takeSelectedWirelessServer()
                         guard !self.stopping,!Task.isCancelled else{await ownedServer?.stop();return}
                         self.connectionWindow=nil
-                        if clean {self.wirelessServer=ownedServer;self.connectDevice(device,adb:selected,allowLockedApplications:allowLockedApplications)}
+                        if clean {self.wirelessServer=ownedServer;self.connectDevice(device,adb:selected,allowLockedApplications:allowLockedApplications,genericDesktopCamera:usesDesktopCamera)}
                         else {
                             await ownedServer?.stop()
                             if device.serverSocket == nil,device.transport == .wireless,let endpoint=try? ADBEndpoint(device.serial).value {
@@ -352,7 +359,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } catch is CancellationError {} catch {busy=false;status("连接未完成",error.localizedDescription)}
         }
     }
-    private func connectDevice(_ device:ADBDevice,adb selected:URL,allowLockedApplications:Bool,diagnostic:Bool=false){
+    private func connectDevice(_ device:ADBDevice,adb selected:URL,allowLockedApplications:Bool,diagnostic:Bool=false,genericDesktopCamera:Bool=false){
         guard !connected,!stopping else{return}
         busy=true;status("正在连接",allowLockedApplications ? "正在确认手机的独立应用锁屏支持…" : "请保持手机解锁。")
         connectionTask=Task { [self] in
@@ -360,8 +367,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard device.serverSocket == nil || wirelessServer?.socket == device.serverSocket else {throw ScanError("无线服务已结束，请重新建立连接。")}
                 adbServerSocket=device.serverSocket
                 wirelessEndpoint=device.transport == .wireless ? (try? ADBEndpoint(device.serial).value):nil
+                self.genericDesktopCamera=genericDesktopCamera
                 adbURL=selected;phoneSession=PhoneSession(resources:Bundle.main.resourceURL!,adbURL:selected,serverSocket:adbServerSocket)
-                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial,allowLockedApplications:allowLockedApplications,desktopHome:!diagnostic,realtimeVideo:nativeScannerRequested && !diagnostic){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
+                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial,allowLockedApplications:allowLockedApplications,desktopHome:!diagnostic,realtimeVideo:nativeScannerRequested && !diagnostic && !genericDesktopCamera,genericDesktopCamera:genericDesktopCamera){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
                 try Task.checkCancellation();connected=true;mode = .phone;mirrorGeneration+=1
                 independentApplicationsWhenLocked=await phone.independentApplicationsWhenLocked
                 primaryLocked=independentApplicationsWhenLocked ? !(try await phone.primaryUserUnlocked()) : false
@@ -372,8 +380,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     try await showMirror(display:endpoint.display)
                 } else if !primaryLocked {try await showMirror(display:0)}
                 try Task.checkCancellation();busy=false
-                status(desktopMode ? "手机桌面" : (primaryLocked ? "手机主屏已锁定" : "已连接 · \(model)"),desktopMode ? "选择手机应用；微信和支付宝的扫一扫可自动读取窗口后方的电脑画面。" : "直接点击或滑动手机画面。")
+                status(desktopMode ? "手机桌面" : (primaryLocked ? "手机主屏已锁定" : "已连接 · \(model)"),desktopMode ? (genericDesktopCamera ? "桌面相机已选定；所选应用打开相机后使用透明框取景。":"选择手机应用；微信和支付宝的扫一扫可自动读取窗口后方的电脑画面。") : "直接点击或滑动手机画面。")
                 detachedApplications=DetachedApplications(phone:phone,adb:selected,server:Bundle.main.resourceURL!.appendingPathComponent("scrcpy-server"),serverSocket:adbServerSocket)
+                detachedApplications?.onCameraCleanupFailure={ [weak self] error in
+                    guard let self,self.connected,!self.stopping else{return}
+                    self.cameraSuppressed=true;self.status("桌面相机清理未确认",error.localizedDescription)
+                    self.disconnect(preserveError:true)
+                }
                 detachedApplications?.beforeClose={ [weak self] display in
                     guard let self,self.cameraDisplay==display else{return}
                     await self.clearCamera()
@@ -528,7 +541,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cameraActivity=nil;ProcessInfo.processInfo.endActivity(activity)
     }
     private func showLocalScanFrame(for owner:ControlWindowController) {
-        let frame=ScanFrameController();localScanFrame=frame;localScanRect=nil
+        let frame=ScanFrameController(genericCamera:genericDesktopCamera);localScanFrame=frame;localScanRect=nil
         frame.onClose={ [weak self] in self?.returnLocalScanToApplication(retainImage:false) }
         frame.onPause={ [weak self] in self?.toggleLocalScanPause() }
         frame.onRescan={ [weak self] in
@@ -541,8 +554,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.localScanRect=nil
             self.cameraPump?.delayCapture(until:ProcessInfo.processInfo.systemUptime+0.18)
         }
-        frame.show(near:owner.desktopCaptureRect)
-        owner.window?.orderOut(nil)
+        frame.show(near:owner.desktopCaptureRect,avoiding:genericDesktopCamera ? owner.window?.frame:nil)
+        if !genericDesktopCamera {owner.window?.orderOut(nil)}
     }
     private func dismissLocalScanFrame(restoring:Bool) {
         guard let frame=localScanFrame else{return}
@@ -759,6 +772,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         else if !primaryLocked {physicalMirror.session.key(3)}
         showMainWindow()
     }
+    private func requestDesktopCamera() {
+        guard connected,!busy,!stopping else{return}
+        cameraSuppressed=false
+        if cameraActive,paused {togglePause()}
+        else if cameraActive {localScanFrame?.show()}
+        else {status("桌面相机已选定","在所选手机应用内打开相机或扫一扫，即可使用透明取景框。")}
+    }
     private func startCamera(in requestedWindow:ControlWindowController?=nil,display requestedDisplay:Int?=nil){
         let targetWindow=requestedWindow ?? control
         let targetDisplay=requestedDisplay ?? mirrorDisplay
@@ -777,7 +797,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard connected && (desktopMode || mode == .wechat) && generation==scanGeneration else{busy=false;return}
                 if desktopMode {
                     let current=try await phone.cameraState()
-                    guard let scanner=current.scannerActivity(),scanner.displayId==targetDisplay else {
+                    guard let scanner=eligibleCameraActivity(current),scanner.displayId==targetDisplay else {
                         await capture.stop();busy=false;return
                     }
                 }
@@ -790,7 +810,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 targetWindow.onRelaunch={ [weak self] in self?.relaunch() }
                 cameraActive=true;paused=false
                 localCameraMode=desktopMode
-                if localCameraMode,nativeScannerRequested,let targetDisplay {
+                if localCameraMode,nativeScannerRequested,!genericDesktopCamera,let targetDisplay {
                     let state=try await phone.cameraState()
                     if let scanner=state.scannerActivity(),scanner.displayId==targetDisplay {
                         let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
@@ -817,7 +837,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 } else if localCameraMode {showLocalScanFrame(for:targetWindow)}
                 busy=false
                 startCameraLoop()
-                status(nativeScannerOverlay != nil ? "原生扫一扫" : (localCameraMode ? "拖动扫码框":"拖动窗口扫码"),nativeScannerOverlay != nil ? "拖动窗口对准二维码；原生手机控件和识别结果保持在此窗口。" : (localCameraMode ? "透明框直接显示桌面；停稳后送入手机，结果在原应用中显示。":"拖动窗口对准二维码，由真实手机应用识别。"))
+                status(genericDesktopCamera ? "桌面相机" : (nativeScannerOverlay != nil ? "原生扫一扫" : (localCameraMode ? "拖动扫码框":"拖动窗口扫码")),nativeScannerOverlay != nil ? "拖动窗口对准二维码；原生手机控件和识别结果保持在此窗口。" : (localCameraMode ? (genericDesktopCamera ? "透明框取景持续送入当前手机应用；识别和结果由原 App 完成。":"透明框直接显示桌面；停稳后送入手机，结果在原应用中显示。") : "拖动窗口对准二维码，由真实手机应用识别。"))
             } catch {
                 guard !stopping && connected else{return}
                 if nativeScannerOverlay != nil {_=await clearCamera()}
@@ -1334,6 +1354,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             status("流畅度检查已结束",recognized ? "测试二维码已由手机微信识别，性能数据已保存；桌面相机已暂停。" : "性能数据已保存；本轮未确认手机识别结果，桌面相机已暂停。")
         }
     }
+    private func eligibleCameraActivity(_ state:PhoneCameraState)->PhoneCameraState.Activity? {
+        guard state.desktopCameraEnabled==genericDesktopCamera else{return nil}
+        return state.captureActivity()
+    }
     private func followCameraState(_ state:PhoneCameraState) async {
         guard connected,!stopping,!busy else{return}
         if let overlay=nativeScannerOverlay,!overlay.matches(state) {
@@ -1344,14 +1368,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let mainDisplay=await phone.scannerDisplay()?.id
         if let mainDisplay {try? await followDesktopHome(state,display:mainDisplay)}
         let windows=detachedApplications?.cameraWindows() ?? []
-        guard let activity=state.scannerActivity(),
+        guard let activity=eligibleCameraActivity(state),
               let target=activity.displayId==mainDisplay ? mainControl : windows.first(where:{$0.display==activity.displayId})?.window else {
             if cameraActive {
                 await clearCamera()
                 guard connected,!stopping,!Task.isCancelled else{return}
-                status("手机桌面","在应用里打开扫一扫，桌面相机会自动出现。")
+                status("手机桌面",genericDesktopCamera ? "在所选应用里打开相机或扫一扫，桌面取景框会自动出现。":"在应用里打开扫一扫，桌面相机会自动出现。")
             }
-            if state.activeStreams==0 || !state.activities.contains(where:{DesktopScannerRoute.isScanner($0.component)}) {cameraSuppressed=false}
+            if state.activeStreams==0 || (!genericDesktopCamera && !state.activities.contains(where:{DesktopScannerRoute.isScanner($0.component)})) {cameraSuppressed=false}
             return
         }
         if cameraActive,cameraDisplay != activity.displayId {await clearCamera()}
@@ -1375,7 +1399,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             applicationPickerVisible=true
             mainControl.showApplicationPicker(apps,onOpen:{ [weak self] app in self?.openMainApplication(app) },
                 onDetach:{ [weak self] app,point in _=self?.detachedApplications?.open(app,at:point) })
-            if !cameraActive {status("手机应用","选择应用后显示真实手机画面；已适配微信与支付宝的扫一扫入口。")}
+            if !cameraActive {status("手机应用",genericDesktopCamera ? "选择应用后显示真实画面；打开相机可使用桌面取景，兼容性依应用而异。":"选择应用后显示真实手机画面；已适配微信与支付宝的扫一扫入口。")}
         } else {
             applicationPickerVisible=false;mainControl.hideApplicationPicker()
         }
@@ -1387,8 +1411,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             do {
                 try await performMainApplicationOpen(app)
             } catch {
-                guard connected,!stopping,!Task.isCancelled else{return}
-                busy=false;status("应用打开未完成",error.localizedDescription)
+                guard connected,!stopping else{return}
+                cameraSuppressed=true;busy=false;status("应用打开未完成",error.localizedDescription)
+                if error is DesktopCameraLaunchFailure {disconnect(preserveError:true)}
             }
         }
     }
@@ -1406,10 +1431,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let display=await phone.scannerDisplay()?.id else{throw ScanError("手机桌面尚未准备好。")}
         try Task.checkCancellation()
         guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
-        try await phone.launchApplication(app,on:display);try Task.checkCancellation()
+        let cameraReady=try await phone.launchApplication(app,on:display);try Task.checkCancellation()
         guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
-        applicationPickerVisible=false;mainControl.hideApplicationPicker()
-        status(app.name,"直接操作手机应用。")
+        applicationPickerVisible=false;mainControl.hideApplicationPicker();cameraSuppressed=false
+        status(app.name,genericDesktopCamera ? (cameraReady ? "桌面相机已绑定；在应用内打开相机或扫一扫即可取景。":"此应用未声明相机权限，已按普通手机应用打开。") : "直接操作手机应用。")
     }
     private func startLoop(){
         loop?.cancel()
@@ -1483,7 +1508,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func updateCameraTick(){
         guard let pump=cameraPump,cameraActive,!paused else{return}
-        let visible=localCameraMode && nativeScannerOverlay == nil ? localScanFrame?.window?.isVisible == true :
+        let visible=localCameraMode && nativeScannerOverlay == nil ? (localScanFrame?.window?.isVisible == true &&
+            (!genericDesktopCamera || (captureControl.window?.isVisible == true && captureControl.window?.isMiniaturized == false))) :
             (captureControl.window?.isVisible == true && captureControl.window?.isMiniaturized == false)
         guard visible else {
             suspendHiddenCamera();return
@@ -1514,7 +1540,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         framesSent=cameraFramesBase+stats.sent;cameraFPS=stats.fps
         captureMilliseconds=stats.captureMilliseconds;transferMilliseconds=stats.transferMilliseconds
         droppedCameraFrames=stats.dropped;maximumCameraGapMilliseconds=stats.maximumGapMilliseconds
-        if localCameraMode,pump.canHandoff(at:tick) {
+        if localCameraMode,!genericDesktopCamera,pump.canHandoff(at:tick) {
             returnLocalScanToApplication(retainImage:true)
             return
         }
@@ -1549,7 +1575,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let diagnosticQRStart=performanceCheck == nil ? Double.infinity:ProcessInfo.processInfo.systemUptime+6.2
         let saveSyntheticPattern=performanceCheck != nil && CommandLine.arguments.contains("--diagnostic-pattern")
         cameraPump=pump;cameraFramesBase=framesSent
-        let localFrameMode=localCameraMode
+        let localFrameMode=localCameraMode,genericFrameMode=genericDesktopCamera && localCameraMode
         if localFrameMode {localScanRect=nil}
         updateCameraTick()
         cameraLoop=Task.detached(priority:.userInitiated) { [capture,phone] in
@@ -1557,9 +1583,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             var measuredAt=ProcessInfo.processInfo.systemUptime,measuredFrames=0
             var transientFailureSince:TimeInterval?,lastSentAt:TimeInterval?
             var lastQRCheck=0.0,savedPattern=false
+            var lastDeliveredRevision:UInt64?
             while !Task.isCancelled,let selection=pump.selection() {
                 let target=selection.target
                 let began=ProcessInfo.processInfo.systemUptime
+                if genericFrameMode,let delivered=lastDeliveredRevision,delivered != selection.revision {
+                    do {try await phone.discardFrame(epoch:generation);lastDeliveredRevision=nil}
+                    catch {if pump.latest() != nil {pump.fail(error)};break}
+                }
                 if localFrameMode,!pump.captureReady(at:began) {
                     try? await Task.sleep(nanoseconds:25_000_000);continue
                 }
@@ -1571,12 +1602,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if localFrameMode,(!pump.captureReady(at:ProcessInfo.processInfo.systemUptime) || !pump.isCurrent(selection)) {continue}
                     var localCodeVisible=false
                     if localFrameMode {
-                        let request=VNDetectBarcodesRequest();request.symbologies=[.qr]
-                        try VNImageRequestHandler(data:image).perform([request])
-                        // Presence only: never read or follow a real QR payload.
-                        localCodeVisible = !(request.results?.isEmpty ?? true)
+                        let delivery=try DesktopCameraInput.delivery(generic:genericFrameMode) {
+                            let request=VNDetectBarcodesRequest();request.symbologies=[.qr]
+                            try VNImageRequestHandler(data:image).perform([request])
+                            // Compatibility mode only; generic input never runs this detector.
+                            return !(request.results?.isEmpty ?? true)
+                        }
+                        localCodeVisible = delivery == .thenReturn
                         if !pump.captureReady(at:ProcessInfo.processInfo.systemUptime) || !pump.isCurrent(selection) {continue}
-                        if !localCodeVisible {
+                        if !genericFrameMode,!localCodeVisible {
                             pump.update(stats)
                             try await Task.sleep(nanoseconds:250_000_000)
                             continue
@@ -1595,6 +1629,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         try await phone.discardFrame(epoch:generation)
                         stats.dropped+=1;pump.update(stats);continue
                     }
+                    if genericFrameMode {lastDeliveredRevision=selection.revision}
                     stats.sent+=1
                     if let previous=lastSentAt {stats.maximumGapMilliseconds=max(stats.maximumGapMilliseconds,(sentAt-previous)*1000)}
                     lastSentAt=sentAt;transientFailureSince=nil
@@ -1655,7 +1690,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     try? await phone.clear(epoch:generation)
                     break
                 }
-                let rest=max(0,(localFrameMode ? 0.25:1.0/30)-(ProcessInfo.processInfo.systemUptime-began))
+                let rest=max(0,(localFrameMode ? (genericFrameMode ? 0.125:0.25):1.0/30)-(ProcessInfo.processInfo.systemUptime-began))
                 if rest>0 {try? await Task.sleep(nanoseconds:UInt64(rest*1_000_000_000))}
             }
         }
@@ -1823,7 +1858,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !networkProblem.isEmpty {problem += " " + networkProblem}
             if !chooserClean {problem += " 部分未选中的无线连接未清理，请在手机关闭无线调试。"}
             wechatWindow?.window?.orderOut(nil);wechatWindow=nil;applicationLibrary?.close();applicationLibrary=nil
-            cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil;desktopMode=false;mainControl.setPhoneDesktopMode(false)
+            cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil;desktopMode=false;genericDesktopCamera=false;mainControl.setPhoneDesktopMode(false)
             applicationPickerVisible=false;cachedApplications=nil;mainControl.hideApplicationPicker()
             connected=false;busy=false;stopping=false;independentApplicationsWhenLocked=false;primaryLocked=false;mirrorDisplay=nil;latestPhoneFrame=nil;latestPresentedMirrorFrame=nil;control.setPhoneImage(nil)
             if !problem.isEmpty {status("需要重新连接以清理",problem)}
