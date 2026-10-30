@@ -882,3 +882,12 @@ B1的startCommand约227.2ms，其他轮约99.7/132.0/69.3ms；查询、系统迁
 ## build63 失败分类（2026-10-30，验证中）
 
 显式后台诊断为非固定Failure补充固定技术分类；ScreenCaptureKit只记录已核实domain的数值code，ScanError只映射白名单，其余记other，不存message/userInfo/任意domain。采集阶段另记固定操作select_target/capture/verify_own_source/send_frame/final_state。未改变正常产品采集、权限或输入行为，尚不算修复62失败。本机仍安装61，权限不变。
+
+
+### build63 签名与实际定位
+
+源码`a2cd88c872ea0b131cf2577a5c4450aa62e07f95`，ZIP SHA256 `b002df5c2b5bb8e85ee996126876c3392cfc8e0ca03d2dab7df284d25a80b244`；严格签名/相同designated requirement通过，手机JAR与62相同。固定错误分类用注入任意message、domain和userInfo的反例测试通过，完整Swift5/WAE类型检查通过。
+
+双App轮微信launch142.6ms，但导航25s内未找到合格入口，没有发送扫码tap，整轮失败且未继续支付宝。随后支付宝独立轮launch639.7ms、扫码tap→owner634.8ms，capture prepare54.9ms后在capture操作返回固定display_changed，未发送首帧，整轮失败。两轮已有录屏权限true、未请求激活、清理和恢复记录核对通过。随后只读图形会话字典明确报告screenLocked=true；这说明当前实际桌面采集受锁屏阻碍，不能追认62未分类错误的唯一根因或认定权限失效。停止重复采集，无TCC重置/权限申请，未将63替换安装61。
+
+Mac锁屏期间继续只做无Mac窗口/采集的手机镜像启动观察。私有诊断仅增加最多9次脱敏前台分类、目标任务计数和与有界Display段解析的一致性，不改变正式启动准入。微信268.8ms，1次确认；支付宝735.1ms，4次确认。支付宝确认起点21.8/152.0/276.5ms时，目标任务已经存在且无其他用户，但前台为另一项；502.8ms才变成请求包。这5次观察里有界解析与正式选择全等，没有支持Display段越界造成这次等待。当前记录未保存前3次具体组件，不能称是Home或权限页，也不能将其当作历史最早失败已复现。两次最终前台、严格任务校验、恢复清理通过；不证明物理呈现。
