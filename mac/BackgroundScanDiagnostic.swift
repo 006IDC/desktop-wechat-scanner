@@ -76,6 +76,10 @@ private final class BackgroundScanResult:@unchecked Sendable {
             state.activeStreams==0 && state.ownerKnown && state.cameraOwner==nil &&
             retry.permitsTap(at:time,frameReceivedAt:frameReceivedAt)
     }
+    static func navigationFrameIsCurrent(receivedAt:Double,startCommandIssuedAt:Double,now:Double)->Bool {
+        receivedAt.isFinite && startCommandIssuedAt.isFinite && now.isFinite && startCommandIssuedAt>=0 &&
+            receivedAt>=startCommandIssuedAt && receivedAt<=now && now-receivedAt<1
+    }
     enum Failure:String,Error {case arguments,existingSession,permission,device,application,mirror,navigation,camera,result,focus,cleanup}
     private final class BoardWindow:NSWindow {
         override var canBecomeKey:Bool {false}
@@ -113,15 +117,23 @@ private final class BackgroundScanResult:@unchecked Sendable {
     /// Only fixed, independently confirmed navigation targets are tapped.
     /// Nothing from OCR is exported, and login/consent/payment pages fail closed.
     private static func navigate(phone:PhoneSession,mirror:MirrorSession,frames:BackgroundScanFrames,
-                                 package:String,display:Int,evidence:inout [String:Any]) async throws ->Double? {
+                                 package:String,display:Int,startCommandIssuedAt:Double,evidence:inout [String:Any]) async throws ->Double? {
         let began=now,deadline=now+25
+        if let entry=frames.latest() {
+            evidence["navigationEntryFrameAgeMilliseconds"]=(began-entry.receivedAt)*1000
+            evidence["navigationEntryFrameAfterStartCommandIssue"]=entry.receivedAt>=startCommandIssuedAt
+            evidence["navigationEntryFrameBeforeNavigation"]=entry.receivedAt<began
+        }
         var lastFrame=0,lastTap=0.0,scanTap:Double?,firstScanTap:Double?,scanComponent:String?
         var plusRetry=ScannerNavigationOCR.PlusRetry(),scanRetry=ScannerNavigationOCR.PlusRetry(),discoverSelected=false
-        var fixedLabels=Set<String>(),ocrFrames=0
+        var fixedLabels=Set<String>(),ocrFrames=0,staleAfterOCR=0
+        var ocrCosts=[Double]()
         var postTapSamples=0,lastRouteKind="absent",lastOwnerEvidence="unknown",lastStreams=0
         defer {
             evidence["navigationScanTapSent"]=scanTap != nil;evidence["navigationPlusTaps"]=plusRetry.attempts
             evidence["navigationOCRFrames"]=ocrFrames;evidence["navigationKnownLabels"]=fixedLabels.sorted()
+            evidence["navigationOCRMilliseconds"]=percentiles(ocrCosts)
+            evidence["navigationFramesExpiredDuringOCR"]=staleAfterOCR
             evidence["navigationMilliseconds"]=(now-began)*1000
             evidence["navigationDiscoverTapSent"]=discoverSelected
             evidence["navigationScanTapAttempts"]=scanRetry.attempts
@@ -149,8 +161,8 @@ private final class BackgroundScanResult:@unchecked Sendable {
                 return scanTap
             }
             guard let activity=state.activities.first(where:{$0.displayId==display}),activity.package==package,
-                  let frame=frames.latest(),frame.sequence>lastFrame,frame.receivedAt>=began,
-                  now-frame.receivedAt<1,now-lastTap>0.8 else {
+                  let frame=frames.latest(),frame.sequence>lastFrame,
+                  navigationFrameIsCurrent(receivedAt:frame.receivedAt,startCommandIssuedAt:startCommandIssuedAt,now:now),now-lastTap>0.8 else {
                 try await Task.sleep(nanoseconds:60_000_000);continue
             }
             if scanTap != nil {
@@ -163,7 +175,12 @@ private final class BackgroundScanResult:@unchecked Sendable {
                 }
             }
             lastFrame=frame.sequence
+            let ocrBegan=now
             let words=try await Task.detached(priority:.userInitiated){try ScannerNavigationOCR.recognize(frame.pixels)}.value
+            ocrCosts.append((now-ocrBegan)*1000)
+            guard navigationFrameIsCurrent(receivedAt:frame.receivedAt,startCommandIssuedAt:startCommandIssuedAt,now:now) else {
+                staleAfterOCR+=1;continue
+            }
             guard now<deadline else{break}
             ocrFrames+=1
             let known:Set<String>=["首页","消息","理财","生活","我的","扫一扫","收付款","收付钱","微信","通讯录","发现","我","发起群聊","添加朋友","朋友圈","视频号","小程序","看一看"]
@@ -195,7 +212,8 @@ private final class BackgroundScanResult:@unchecked Sendable {
                 if !isPlus && !isDiscover,!scanRetry.permitsTap(at:now,frameReceivedAt:frame.receivedAt) {continue}
                 let current=try await phone.cameraState()
                 guard current.activities.first(where:{$0.displayId==display})?.component==activity.component,
-                      current.captureActivity()==nil,now-frame.receivedAt<1 else{continue}
+                      current.ownerKnown,current.cameraOwner==nil,current.activeStreams==0,
+                      navigationFrameIsCurrent(receivedAt:frame.receivedAt,startCommandIssuedAt:startCommandIssuedAt,now:now) else{continue}
                 let tap=now
                 try Task.checkCancellation();guard tap<deadline else{break}
                 if scanTap != nil {
@@ -253,6 +271,14 @@ private final class BackgroundScanResult:@unchecked Sendable {
             report["existingCapturePermission"]=true
             let devices=try await ADBConnectionManager(adbURL:adb).devices().filter{$0.transport == .usb && $0.authorization == .authorized}
             guard devices.count==1 else{throw Failure.device}
+            stage="diagnostic-preparation"
+            let preparing=Task.detached(priority:.userInitiated){try SyntheticVisionPreparation.run()}
+            let preparation=try await withTaskCancellationHandler(operation:{try await preparing.value},onCancel:{preparing.cancel()})
+            report["diagnosticPreparationTextMilliseconds"]=preparation.textMilliseconds
+            report["diagnosticPreparationBarcodeMilliseconds"]=preparation.barcodeMilliseconds
+            report["diagnosticPreparationTotalMilliseconds"]=preparation.totalMilliseconds
+            report["diagnosticPreparationScope"]="memory-only-synthetic-fixture-before-phone-session"
+            try Task.checkCancellation()
             stage="connect"
             _=try await phone.connect(openWechatOnConnect:false,selectedSerial:devices[0].serial,allowLockedApplications:true,desktopHome:true,genericDesktopCamera:true){_ in}
             guard await phone.independentApplicationsWhenLocked,let display=await phone.scannerDisplay()?.id else{throw Failure.device}
@@ -286,8 +312,10 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     item["launcherValidationMilliseconds"]=await phone.lastLauncherValidationMilliseconds
                     item["launcherQueryScoped"]=await phone.lastLauncherQueryScoped
                     item["launchStages"]=await phone.lastLaunchStages
+                    guard let startCommandIssuedAt=await phone.lastApplicationStartCommandIssuedAt,
+                          startCommandIssuedAt>=launch,startCommandIssuedAt<=now else{throw Failure.application}
                     stage="navigate"
-                    let tap=try await navigate(phone:phone,mirror:stream,frames:frames,package:package,display:display,evidence:&item)
+                    let tap=try await navigate(phone:phone,mirror:stream,frames:frames,package:package,display:display,startCommandIssuedAt:startCommandIssuedAt,evidence:&item)
                     if let tap {
                         let last=(now-tap)*1000,retry=item["navigationScanRetryDelayMilliseconds"] as? Double ?? 0
                         item["scanTapMetricOrigin"]="last-verified-navigation-tap"
@@ -304,7 +332,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     let until=now+9,blankUntil=now+(immediateQR ? 0:1.5)
                     pump.prepareRegion(at:now,immediateFirst:true)
                     var qrShownAt:Double?,firstQRACK:Double?,firstACK:Double?,sent=0,recognized=false
-                    var costs=[Double](),captures=[Double](),startTimes=[Double](),dispatchTimes=[Double](),ackTimes=[Double]()
+                    var costs=[Double](),captures=[Double](),sourceVerificationCosts=[Double](),startTimes=[Double](),dispatchTimes=[Double](),ackTimes=[Double]()
                     var resultFrameTime:Double?
                     let result=BackgroundScanResult()
                     var verifiedQRAt:Double?
@@ -353,11 +381,13 @@ private final class BackgroundScanResult:@unchecked Sendable {
                                 captureOperation="verify_own_source"
                                 // Diagnostic fixture validity only. Production
                                 // generic camera delivery never decodes QR data.
+                                let verificationBegan=now
                                 let matches=try await Task.detached(priority:.userInitiated) {
                                     let request=VNDetectBarcodesRequest();request.symbologies=[.qr]
                                     try VNImageRequestHandler(data:image).perform([request])
                                     return request.results?.contains{$0.payloadStringValue==payload} ?? false
                                 }.value
+                                sourceVerificationCosts.append((now-verificationBegan)*1000)
                                 if !matches {
                                     item[imageWasSnapshot ? "startupSnapshotSourceNotReady":"streamSourceNotReady"]=true
                                     continue
@@ -431,6 +461,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     pump.stop();try await phone.clear(epoch:epoch+20,requireConnection:true)
                     item["recognized"]=recognized;item["sentFrames"]=sent
                     item["startupSnapshotAttempted"]=snapshotAttempted
+                    item["sourceVerificationMilliseconds"]=percentiles(sourceVerificationCosts)
                     item["requestMilliseconds"]=percentiles(costs);item["captureMilliseconds"]=percentiles(captures)
                     item["loopIterationGapMilliseconds"]=percentiles(zip(startTimes.dropFirst(),startTimes).map{($0-$1)*1000})
                     item["sendStartGapMilliseconds"]=percentiles(zip(dispatchTimes.dropFirst(),dispatchTimes).map{($0-$1)*1000})

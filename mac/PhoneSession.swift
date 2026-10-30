@@ -255,6 +255,7 @@ actor PhoneSession {
     private var activityTaskDumpSupported=false,activityTaskDumpDisabled=false
     private(set) var lastLauncherValidationMilliseconds:Double?
     private(set) var lastLauncherQueryScoped:Bool?
+    private(set) var lastApplicationStartCommandIssuedAt:Double?
     private(set) var lastLaunchStages:[String:Double]=[:]
     private var recordingLaunch=false
     private func measureLaunch<T>(_ stage:String,_ operation:() throws ->T) rethrows ->T {
@@ -723,6 +724,7 @@ actor PhoneSession {
     }
     @discardableResult
     func launchApplication(_ app: AndroidApplication, on target: Int) throws -> Bool {
+        lastApplicationStartCommandIssuedAt=nil
         lastApplicationLaunchEvidence=nil
         lastLauncherValidationMilliseconds=nil;lastLauncherQueryScoped=nil
         lastLaunchStages=[:]
@@ -757,7 +759,12 @@ actor PhoneSession {
                 guard let group = groups[root] else { continue }
                 try measureLaunch("moveMilliseconds"){try moveTasks(group,to:target)}
             }
-            let result = try measureLaunch("startCommandMilliseconds"){try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")}
+            let result = try measureLaunch("startCommandMilliseconds") {
+                // Local monotonic command issue boundary, not proof of pixels
+                // belonging to an Activity or of Android's execution instant.
+                lastApplicationStartCommandIssuedAt=ProcessInfo.processInfo.systemUptime
+                return try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")
+            }
             guard !result.lowercased().contains("error:"), !result.lowercased().contains("exception") else { throw ScanError("手机应用启动失败。") }
             let confirmationBegan=ProcessInfo.processInfo.systemUptime
             let nativeGrace=activityTaskDumpSupported && !activityTaskDumpDisabled
