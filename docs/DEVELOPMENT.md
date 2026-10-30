@@ -1100,3 +1100,8 @@ CMD32 的启用、退出与只读绘制计数，CMD33 的相位校准，以及 C
 
 
 最终诊断再以`SyntheticResultFrameGate`核本轮QR启用后的本地帧：activeRoute/scannerMirror同一对象、正且匹配的mirror incarnation、receipt有限且不早于qrShownAt/不晚于本机时钟；OCR异步完成后再核连接、同一检查对象和route/incarnation。旧的精确结果帧、换路由与退休帧不可采纳；QR后收到的静态结果可复用，避免无谓等冗余帧。receipt只代表Mac本地到达，不能证明Androidpaint时点。正式与后台适配构建均启用Swift whole-module optimization，保持编译优化模式一致。
+
+
+源码`d8ca0a5`最终当前帧见证回归：微信/支付宝均严格识码，`resultFrameFromCurrentMirrorAfterQR=true`，原生层挂载约1325/1180ms、运动供图22.71/21.65fps；测试板启用QR至结果帧本地到达4259.6/1472.4ms、至文本观察4384.1/1658.0ms，区分App结果及OCR观察的波动。两应用均清图ACK通过，录屏权限true、前台未改变、无活动恢复记录。
+
+本机build71安装包为`MiraDroid-0.4.0-build71-d8ca0a5-arm64.zip`，SHA256 `030debee9ce93bb2904403c480a8d58dcae0d22c379c86a7a4dc780b9055789b`。已按原应用路径更新，指定签名要求与build69一致，保留build69签名ZIP及旧App回退；不重置TCC、不正常前台启动。安装后用正式bundle的既有后台入口做单App回归：已有录屏权限true、自有合成板源QR严格确认、支付宝随机文本结果成功（QR启用至结果帧约1820.7ms），清理完成、会话记录不存在、前台不变。该安装回归不运行AppController；完整控制器证据来自前述受限后台窗口适配，不能合并称为物理拖动验收。
