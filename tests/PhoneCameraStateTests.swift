@@ -30,6 +30,10 @@ import Foundation
 
     static func main() throws {
         let matched = try decode(basic())
+        require(matched.captureGeneration==nil && !matched.interleavedPreviewSupported,"Legacy state advertised native preview evidence")
+        var native=basic();native["captureGeneration"]=8;native["interleavedPreviewSupported"]=true
+        require(try decode(native).captureGeneration==8 && decode(native).interleavedPreviewSupported,"Native preview capability lost")
+        native["captureGeneration"] = -1;rejected(native,"Negative capture generation accepted")
         require(!matched.packageLauncherQuerySupported,"Legacy server advertised package query")
         var packageCapability=basic();packageCapability["packageLauncherQuerySupported"]=true
         require(try decode(packageCapability).packageLauncherQuerySupported,"Explicit launcher query capability lost")

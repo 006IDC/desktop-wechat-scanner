@@ -5,7 +5,7 @@ import QuartzCore
 /// Research renderer. Samples genuine native scanner observations; never draws
 /// or replaces Android controls. Not enabled by the default product path.
 final class NativeScannerMatte {
-    enum Algorithm { case blackWhite, blueWithNativeColorBias }
+    enum Algorithm { case blackWhite, blueWithNativeColorBias, spatialBlue }
     struct Unavailable: Error { let stage: String; init(_ stage: String = "gpu_resource") { self.stage = stage } }
     private let context: CIContext
     private let queue: MTLCommandQueue
@@ -59,6 +59,32 @@ final class NativeScannerMatte {
             float a = max(1.0f-t,max(c.r,c.g));
             out.write(float4(min(float3(c.r,c.g,max(0.0f,c.b-(1.0f-a))),float3(a)),a),p);
         }
+        inline float3 medianColor(float3 a,float3 b,float3 c) {
+            return max(min(a,b),min(max(a,b),c));
+        }
+        kernel void spatialCalibrate(array<texture2d<float,access::read>,9> frames [[texture(0)]],
+                                     texture2d<float,access::write> out [[texture(9)]],
+                                     uint2 p [[thread_position_in_grid]]) {
+            if(p.x>=out.get_width() || p.y>=out.get_height()) return;
+            float3 b=medianColor(frames[0].read(p).rgb,frames[1].read(p).rgb,frames[2].read(p).rgb);
+            float3 w=medianColor(frames[3].read(p).rgb,frames[4].read(p).rgb,frames[5].read(p).rgb);
+            float3 k=medianColor(frames[6].read(p).rgb,frames[7].read(p).rgb,frames[8].read(p).rgb);
+            float3 d=w-b;
+            float t=clamp(max(min(d.r,d.g),min(max(d.r,d.g),d.b)),0.0f,1.0f);
+            float bias=b.b-b.r;
+            float key=t>0.02f ? clamp((k.b-k.r-bias)/t,0.5f,1.1f):1.0f;
+            out.write(float4(bias,key,t,1),p);
+        }
+        kernel void spatialComposite(texture2d<float,access::read> b [[texture(0)]],
+                                     texture2d<float,access::read> reference [[texture(1)]],
+                                     texture2d<float,access::write> out [[texture(2)]],
+                                     uint2 p [[thread_position_in_grid]]) {
+            if(p.x>=out.get_width() || p.y>=out.get_height()) return;
+            float3 c=b.read(p).rgb;float2 r=reference.read(p).rg;
+            float t=clamp((c.b-c.r-r.r)/max(r.g,0.1f),0.0f,1.0f);
+            float a=max(1.0f-t,max(c.r,c.g));
+            out.write(float4(min(float3(c.r,c.g,max(0.0f,c.b-(1.0f-a)*r.g)),float3(a)),a),p);
+        }
         kernel void composite(texture2d<float, access::read> b [[texture(0)]],
                               texture2d<float, access::read> t [[texture(1)]],
                               texture2d<float, access::write> out [[texture(2)]],
@@ -74,10 +100,10 @@ final class NativeScannerMatte {
     private static let fusedSource = """
         #include <metal_stdlib>
         using namespace metal;
-        inline float4 nativeBluePixel(float3 c,float bias) {
-            float t=clamp(c.b-c.r-bias,0.0f,1.0f);
+        inline float4 nativeBluePixel(float3 c,float bias,float key=1.0f) {
+            float t=clamp((c.b-c.r-bias)/max(key,0.1f),0.0f,1.0f);
             float a=max(1.0f-t,max(c.r,c.g));
-            float4 value=float4(min(float3(c.r,c.g,max(0.0f,c.b-(1.0f-a))),float3(a)),a);
+            float4 value=float4(min(float3(c.r,c.g,max(0.0f,c.b-(1.0f-a)*key)),float3(a)),a);
             // Match the reference pipeline's RGBA8 intermediate before filtering.
             return rint(value*255.0f)/255.0f;
         }
@@ -99,11 +125,29 @@ final class NativeScannerMatte {
             float4 c11=nativeBluePixel(b.read(p11).rgb,bias.read(p11).r);
             out.write(mix(mix(c00,c10,f.x),mix(c01,c11,f.x),f.y),p);
         }
+        kernel void fusedSpatialComposite(texture2d<float,access::read> b [[texture(0)]],
+                                       texture2d<float,access::read> bias [[texture(1)]],
+                                       texture2d<float,access::write> out [[texture(2)]],
+                                       uint2 p [[thread_position_in_grid]]) {
+            if(p.x>=out.get_width() || p.y>=out.get_height()) return;
+            int2 limit=int2(b.get_width()-1,b.get_height()-1);
+            float2 source=(float2(p)+0.5f)*float2(b.get_width(),b.get_height())/float2(out.get_width(),out.get_height())-0.5f;
+            int2 lo=int2(floor(source));float2 f=fract(source);
+            uint2 p00=uint2(clamp(lo,int2(0),limit));
+            uint2 p10=uint2(clamp(lo+int2(1,0),int2(0),limit));
+            uint2 p01=uint2(clamp(lo+int2(0,1),int2(0),limit));
+            uint2 p11=uint2(clamp(lo+int2(1,1),int2(0),limit));
+            float4 c00=nativeBluePixel(b.read(p00).rgb,bias.read(p00).r,bias.read(p00).g);
+            float4 c10=nativeBluePixel(b.read(p10).rgb,bias.read(p10).r,bias.read(p10).g);
+            float4 c01=nativeBluePixel(b.read(p01).rgb,bias.read(p01).r,bias.read(p01).g);
+            float4 c11=nativeBluePixel(b.read(p11).rgb,bias.read(p11).r,bias.read(p11).g);
+            out.write(mix(mix(c00,c10,f.x),mix(c01,c11,f.x),f.y),p);
+        }
         """
-    private static func optionalFusedPipeline(_ device:MTLDevice)->MTLComputePipelineState? {
+    private static func optionalFusedPipeline(_ device:MTLDevice,name:String="fusedBlueComposite")->MTLComputePipelineState? {
         do {
             let library=try device.makeLibrary(source:fusedSource,options:nil)
-            guard let function=library.makeFunction(name:"fusedBlueComposite") else{return nil}
+            guard let function=library.makeFunction(name:name) else{return nil}
             return try device.makeComputePipelineState(function:function)
         } catch {return nil}
     }
@@ -112,8 +156,8 @@ final class NativeScannerMatte {
     private struct Resources {
         let device:MTLDevice,context:CIContext
         let blackWhite:MTLComputePipelineState,blue:MTLComputePipelineState,median:MTLComputePipelineState
-        let composite:MTLComputePipelineState,blueComposite:MTLComputePipelineState
-        let fusedBlue:MTLComputePipelineState?
+        let composite:MTLComputePipelineState,blueComposite:MTLComputePipelineState,spatial:MTLComputePipelineState,spatialComposite:MTLComputePipelineState
+        let fusedBlue:MTLComputePipelineState?,fusedSpatial:MTLComputePipelineState?
         init() throws {
             guard let device=MTLCreateSystemDefaultDevice() else{throw Unavailable()}
             self.device=device
@@ -124,8 +168,9 @@ final class NativeScannerMatte {
             }
             blackWhite=try pipeline("calibrate");blue=try pipeline("blueCalibrate")
             median=try pipeline("blueMedianCalibrate");composite=try pipeline("composite")
-            blueComposite=try pipeline("blueComposite")
+            blueComposite=try pipeline("blueComposite");spatial=try pipeline("spatialCalibrate");spatialComposite=try pipeline("spatialComposite")
             fusedBlue=NativeScannerMatte.optionalFusedPipeline(device)
+            fusedSpatial=NativeScannerMatte.optionalFusedPipeline(device,name:"fusedSpatialComposite")
             context=CIContext(mtlDevice:device,options:[.workingColorSpace:NSNull(),
                 .outputColorSpace:NSNull(),.cacheIntermediates:false])
             // Compile CI's solid-frame path without any screen/phone input.
@@ -145,17 +190,18 @@ final class NativeScannerMatte {
     init(black: CIImage, white: CIImage, algorithm: Algorithm = .blackWhite, blueCalibration: [CIImage] = []) throws {
         guard black.extent == white.extent, black.extent.origin == .zero,
               !black.extent.isEmpty, black.extent.width <= 4096, black.extent.height <= 4096 else { throw Unavailable("dimensions") }
-        guard blueCalibration.isEmpty || (algorithm == .blueWithNativeColorBias && blueCalibration.count == 9 &&
+        guard blueCalibration.isEmpty || ((algorithm == .blueWithNativeColorBias || algorithm == .spatialBlue) && blueCalibration.count == 9 &&
               blueCalibration.allSatisfy({ $0.extent == black.extent })) else { throw Unavailable("calibration_count") }
+        guard algorithm != .spatialBlue || blueCalibration.count==9 else{throw Unavailable("spatial_calibration_count")}
         let resources=try Self.resources.get()
         let device=resources.device
         guard let queue=device.makeCommandQueue() else{throw Unavailable()}
         extent = black.extent
         self.queue = queue;context=resources.context
-        let calibrate=algorithm == .blackWhite ? resources.blackWhite :
-            (blueCalibration.isEmpty ? resources.blue : resources.median)
-        composite=algorithm == .blackWhite ? resources.composite : resources.blueComposite
-        fusedComposite=algorithm == .blueWithNativeColorBias ? resources.fusedBlue:nil
+        let calibrate=algorithm == .spatialBlue ? resources.spatial:(algorithm == .blackWhite ? resources.blackWhite :
+            (blueCalibration.isEmpty ? resources.blue : resources.median))
+        composite=algorithm == .spatialBlue ? resources.spatialComposite:(algorithm == .blackWhite ? resources.composite : resources.blueComposite)
+        fusedComposite=algorithm == .spatialBlue ? resources.fusedSpatial:(algorithm == .blueWithNativeColorBias ? resources.fusedBlue:nil)
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
             width: Int(extent.width), height: Int(extent.height), mipmapped: false)
         descriptor.usage = [.shaderRead, .shaderWrite, .renderTarget]

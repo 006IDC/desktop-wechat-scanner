@@ -97,7 +97,9 @@ private final class PhoneWindowBackgroundView: NSView {
 private final class PhonePreviewView: NSView {
     var nativeScannerFrames:((CVPixelBuffer)->Bool)?
     var nativeScannerResize:((CGSize)->Void)?
+    var retiredNativeFrameFilter:((CVPixelBuffer)->Bool)?
     private var nativeScannerLayer:CAMetalLayer?
+    private var nativeTransitionBacking:CALayer?
     var nativeSurfaceDiagnostic:[String:Any] {
         ["phoneHidden":isHidden,"hiddenAncestor":isHiddenOrHasHiddenAncestor,
          "visibleWidth":visibleRect.width,"visibleHeight":visibleRect.height,
@@ -196,7 +198,11 @@ private final class PhonePreviewView: NSView {
     }
 
     func setPixelBuffer(_ pixels: CVPixelBuffer?) {
-        guard let pixels else { setFrame(nil); return }
+        guard let pixels else { retiredNativeFrameFilter=nil;setFrame(nil); return }
+        if let retiredNativeFrameFilter {
+            if retiredNativeFrameFilter(pixels) {return}
+            self.retiredNativeFrameFilter=nil
+        }
         if let nativeScannerFrames {
             let hideCalibration=nativeScannerFrames(pixels)
             if hideCalibration || nativeScannerLayer != nil {return}
@@ -264,6 +270,7 @@ private final class PhonePreviewView: NSView {
         if let nativeScannerLayer {
             let rect=imageRect,scale=window?.backingScaleFactor ?? 2
             if nativeScannerLayer.frame != rect {nativeScannerLayer.frame=rect}
+            nativeTransitionBacking?.frame=rect
             if nativeScannerLayer.contentsScale != scale {nativeScannerLayer.contentsScale=scale}
             let size=CGSize(width:rect.width*scale,height:rect.height*scale)
             nativeScannerResize?(size)
@@ -328,7 +335,9 @@ private final class PhonePreviewView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         if nativeScannerLayer != nil {
             NSColor.black.setFill();bounds.fill(using:.copy)
-            NSColor.clear.setFill();imageRect.fill(using:.copy)
+            // Retain the phone as the pointer target over an otherwise fully
+            // transparent camera area; taps must not leak into a web page below.
+            NSColor.black.withAlphaComponent(0.01).setFill();imageRect.fill(using:.copy)
             return
         }
         if localScanPreview {
@@ -413,7 +422,18 @@ private final class PhonePreviewView: NSView {
     }
     func setNativeScannerLayer(_ value:CAMetalLayer?) {
         cancelTouch();nativeScannerLayer?.removeFromSuperlayer();nativeScannerLayer=value
-        if let value {layer?.addSublayer(value)}
+        nativeTransitionBacking?.removeFromSuperlayer();nativeTransitionBacking=nil
+        if let value {
+            layer?.addSublayer(value)
+            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                let backing=CALayer();backing.name="phone.native-transition";backing.frame=imageRect
+                backing.backgroundColor=NSColor.black.cgColor;backing.opacity=0
+                layer?.insertSublayer(backing,below:value);nativeTransitionBacking=backing
+                let fade=CABasicAnimation(keyPath:"opacity");fade.fromValue=1;fade.toValue=0
+                fade.duration=0.12;fade.timingFunction=CAMediaTimingFunction(name:.easeOut)
+                backing.add(fade,forKey:"native-camera-reveal")
+            }
+        }
         frameLayer.isHidden=value != nil || mirrorFrame == nil
         videoLayer.isHidden=value != nil || mirrorPixels == nil
         updateLayerFrames();needsDisplay=true
@@ -823,6 +843,7 @@ final class ControlWindowController: NSWindowController {
     }
 
     func prepareNativeScanner(_ overlay:NativeScannerOverlay) {
+        holder.phone.retiredNativeFrameFilter=nil
         holder.phone.interactionEnabled=false
         holder.phone.nativeScannerFrames={ [weak overlay] in overlay?.receive($0) ?? true }
     }
@@ -844,7 +865,8 @@ final class ControlWindowController: NSWindowController {
         overlay.startPresentation()
     }
     func freezeNativeScanner() {holder.phone.interactionEnabled=false}
-    func endNativeScanner() {
+    func endNativeScanner(retiredFilter:((CVPixelBuffer)->Bool)?=nil) {
+        holder.phone.retiredNativeFrameFilter=retiredFilter
         setScannerFloating(false)
         holder.phone.nativeScannerFrames=nil;holder.phone.nativeScannerResize=nil;holder.phone.setNativeScannerLayer(nil)
         holder.phone.interactionEnabled=true;background.nativeScannerPreview=false

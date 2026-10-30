@@ -33,6 +33,7 @@ struct PhoneCameraState: Decodable, Sendable {
     }
     let version: Int
     let generation: Int
+    let captureGeneration:Int?
     let activeStreams: Int
     let activities: [Activity]
     let desktopHome: Bool
@@ -41,6 +42,7 @@ struct PhoneCameraState: Decodable, Sendable {
     let ownerKnown: Bool
     let ownerGeneration: Int
     let solidCalibrationSupported: Bool
+    let interleavedPreviewSupported:Bool
     let desktopCameraSupported:Bool
     let desktopCameraEnabled:Bool
     let desktopCameraGeneration:Int
@@ -50,9 +52,9 @@ struct PhoneCameraState: Decodable, Sendable {
     let activityTaskDumpSupported:Bool
 
     private enum CodingKeys: String, CodingKey {
-        case version, generation, activeStreams, activities, desktopHome
+        case version, generation, captureGeneration, activeStreams, activities, desktopHome
         case cameraOwner, ownerKnown, ownerGeneration, ownerStatus
-        case solidCalibrationSupported,desktopCameraSupported,desktopCameraEnabled,desktopCameraGeneration,desktopCameraBindings
+        case interleavedPreviewSupported,solidCalibrationSupported,desktopCameraSupported,desktopCameraEnabled,desktopCameraGeneration,desktopCameraBindings
         case paintTiming
         case packageLauncherQuerySupported
         case activityTaskDumpSupported
@@ -62,6 +64,7 @@ struct PhoneCameraState: Decodable, Sendable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         version = try values.decode(Int.self, forKey: .version)
         generation = try values.decode(Int.self, forKey: .generation)
+        captureGeneration = try values.decodeIfPresent(Int.self,forKey:.captureGeneration)
         activeStreams = try values.decode(Int.self, forKey: .activeStreams)
         activities = try values.decode([Activity].self, forKey: .activities)
         desktopHome = try values.decode(Bool.self, forKey: .desktopHome)
@@ -70,6 +73,7 @@ struct PhoneCameraState: Decodable, Sendable {
         ownerKnown = try values.decodeIfPresent(Bool.self, forKey: .ownerKnown) ?? false
         ownerStatus = try values.decodeIfPresent(String.self, forKey: .ownerStatus)
         ownerGeneration = try values.decodeIfPresent(Int.self, forKey: .ownerGeneration) ?? 0
+        interleavedPreviewSupported = try values.decodeIfPresent(Bool.self,forKey:.interleavedPreviewSupported) ?? false
         solidCalibrationSupported = try values.decodeIfPresent(Bool.self, forKey: .solidCalibrationSupported) ?? false
         desktopCameraSupported=try values.decodeIfPresent(Bool.self,forKey:.desktopCameraSupported) ?? false
         desktopCameraEnabled=try values.decodeIfPresent(Bool.self,forKey:.desktopCameraEnabled) ?? false
@@ -116,7 +120,7 @@ struct PhoneCameraState: Decodable, Sendable {
     static func decode(_ data: Data) throws -> Self {
         guard data.count <= 16_384 else { throw ScanError("手机相机状态过大。") }
         let state = try JSONDecoder().decode(Self.self, from: data)
-        guard state.version == 1, state.generation >= 0, (0...16).contains(state.activeStreams),
+        guard state.version == 1, state.generation >= 0,state.captureGeneration.map({$0>=0}) ?? true, (0...16).contains(state.activeStreams),
               state.desktopCameraGeneration>=0,state.desktopCameraBindings.count<=8,
               state.desktopCameraBindings.allSatisfy(\.valid),
               Set(state.desktopCameraBindings.map(\.displayId)).count==state.desktopCameraBindings.count,

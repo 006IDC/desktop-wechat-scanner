@@ -99,7 +99,7 @@ final class CameraSocket {
         try requestMeasured(command, body).data
     }
     func requestMeasured(_ command: UInt8, _ body: Data = Data()) throws -> MeasuredResponse {
-        guard body.count <= 4*1024*1024+8 else { throw ScanError("图像过大。") }
+        guard body.count <= 4*1024*1024+28 else { throw ScanError("图像过大。") }
         var request = Data([command]); var length = UInt32(body.count).bigEndian
         withUnsafeBytes(of: &length) { request.append(contentsOf: $0) }
         request.append(body)
@@ -394,20 +394,30 @@ actor PhoneSession {
     /// Android processing only, when supported; ACK round-trip remains a separate measurement.
     @discardableResult
     func frame(_ data: Data, epoch: Int, selectedAt:TimeInterval?=nil,
-               isCurrent:(@Sendable ()->Bool)?=nil) throws -> CameraFrameReceipt {
+               isCurrent:(@Sendable ()->Bool)?=nil,nativeLease:NativePreviewLease?=nil) throws -> CameraFrameReceipt {
         try Task.checkCancellation()
         if let selectedAt,ProcessInfo.processInfo.systemUptime-selectedAt>0.5 {
             throw CameraFrameExpiredError()
         }
         guard let channel else {throw ScanError("手机未连接。")}
         guard data.count <= 4*1024*1024 else {throw ScanError("图像过大。")}
-        var body = try Self.epochBytes(epoch)
+        var body:Data
+        let command:UInt8
+        if let nativeLease {
+            guard nativeLease.epoch==epoch else{throw CameraFrameExpiredError()}
+            var id=UInt32(nativeLease.display).bigEndian
+            body=withUnsafeBytes(of:&id){Data($0)}
+            for number in [UInt64(nativeLease.epoch),UInt64(nativeLease.capture),nativeLease.token] {
+                var big=number.bigEndian;withUnsafeBytes(of:&big){body.append(contentsOf:$0)}
+            }
+            command=35
+        } else {body=try Self.epochBytes(epoch);command=1}
         body.append(data)
         let started=ProcessInfo.processInfo.systemUptime
         let response:CameraSocket.MeasuredResponse
         if let isCurrent,!isCurrent() {throw CameraFrameExpiredError()}
-        do {response=try channel.requestMeasured(1,body)}
-        catch let error as ScanError where error.message=="Desktop camera has no verified scanner owner" || error.message=="Desktop camera state changed while decoding frame" {
+        do {response=try channel.requestMeasured(command,body)}
+        catch let error as ScanError where error.message=="Desktop camera has no verified scanner owner" || error.message=="Desktop camera state changed while decoding frame" || error.message=="Native source lease is no longer active" {
             // A normal scanner exit can invalidate an in-flight frame before
             // the next status poll. Drop it without displaying a transport error.
             throw CameraFrameExpiredError()
@@ -426,6 +436,45 @@ actor PhoneSession {
         body.append(blue ? 1:0)
         return body
     }
+    struct NativePreviewLease:Sendable {let display:Int,epoch:Int,capture:Int,token:UInt64}
+    private func nativePreviewRequest(display:Int,action:UInt8,epoch:Int,capture:Int,token:UInt64) throws ->[String:Any] {
+        guard ownsDisplay(display),epoch>=0,capture>=0,let channel else{throw ScanError("原生预览连接已变化。")}
+        var id=UInt32(display).bigEndian
+        var body=withUnsafeBytes(of:&id){Data($0)};body.append(action)
+        for number in [UInt64(epoch),UInt64(capture),token] {
+            var big=number.bigEndian;withUnsafeBytes(of:&big){body.append(contentsOf:$0)}
+        }
+        let data=try channel.request(32,body)
+        guard data.count<=1024,let response=try JSONSerialization.jsonObject(with:data) as? [String:Any] else{throw ScanError("原生预览状态未确认。")}
+        return response
+    }
+    func beginNativePreview(display:Int,epoch:Int,capture:Int) throws ->NativePreviewLease {
+        let response=try nativePreviewRequest(display:display,action:1,epoch:epoch,capture:capture,token:0)
+        guard response["applied"] as? Bool==true,response["enabled"] as? Bool==true,
+              let token=response["token"] as? UInt64,token>0 else{throw ScanError("原生预览状态未确认。")}
+        return NativePreviewLease(display:display,epoch:epoch,capture:capture,token:token)
+    }
+    func endNativePreview(_ lease:NativePreviewLease) throws {
+        let response=try nativePreviewRequest(display:lease.display,action:0,epoch:lease.epoch,capture:lease.capture,token:lease.token)
+        guard let applied=response["applied"] as? Bool,!applied || response["enabled"] as? Bool==false else{throw ScanError("原生预览退出未确认。")}
+    }
+    struct NativePreviewPostCounts:Sendable {let key:Int,source:Int}
+    func nativePreviewPostCounts(_ lease:NativePreviewLease) throws ->NativePreviewPostCounts {
+        let response=try nativePreviewRequest(display:lease.display,action:2,epoch:lease.epoch,capture:lease.capture,token:lease.token)
+        guard response["enabled"] as? Bool==true,let key=response["keyPosts"] as? Int,key>=0,
+              let source=response["sourcePosts"] as? Int,source>=0 else{throw ScanError("原生相机绘制计数已失效。")}
+        return NativePreviewPostCounts(key:key,source:source)
+    }
+    func nativePreviewCalibration(_ phase:UInt8,lease:NativePreviewLease) throws {
+        guard phase<=2,ownsDisplay(lease.display),let channel else{throw ScanError("原生预览校准已停止。")}
+        var id=UInt32(lease.display).bigEndian
+        var body=withUnsafeBytes(of:&id){Data($0)};body.append(phase)
+        for number in [UInt64(lease.epoch),UInt64(lease.capture),lease.token] {
+            var big=number.bigEndian;withUnsafeBytes(of:&big){body.append(contentsOf:$0)}
+        }
+        _=try channel.request(33,body)
+    }
+
     func solidCalibrationFrame(blue:Bool,epoch:Int) throws -> CameraFrameReceipt {
         try Task.checkCancellation()
         guard let channel else{throw ScanError("手机未连接。")}

@@ -174,6 +174,8 @@ final class DirectDisplayStream implements AutoCloseable {
         Class<?> inputManager = Class.forName("android.hardware.input.InputManager");
         Object manager = inputManager.getMethod("getInstance").invoke(null);
         Method inject = inputManager.getMethod("injectInputEvent", InputEvent.class, int.class);
+        // Keep delivery asynchronous, as in scrcpy. Waiting for a focused
+        // target can retain the control worker during Android input stalls.
         if (!Boolean.TRUE.equals(inject.invoke(manager, event, 0))) throw new IOException("Owned display input rejected");
     }
 

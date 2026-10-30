@@ -61,6 +61,10 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
     func cameraAvailability(display:Int?,window:ControlWindowController)->CameraWindowAvailability? {
         entries.values.first{$0.display==display && $0.ui === window && $0.acceptsInput}?.availability
     }
+    func cameraDecodedFrames(display:Int,window:ControlWindowController)->(MirrorVideoMailbox,Int)? {
+        guard let entry=entries.values.first(where:{$0.display==display && $0.ui === window && $0.acceptsInput}) else{return nil}
+        return (entry.frames,entry.epoch)
+    }
     @discardableResult func open(_ app:AndroidApplication,at point:NSPoint?)->Bool {
         guard !stopping,app.isValid else{return false}
         if let entry=entries[app.packageName] {

@@ -62,7 +62,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         CommandLine.arguments.contains("--diagnostic-prewarm-capture-metadata") && !coldCaptureMetadata
     }
     private var settleInitialGenericCapture:Bool {CommandLine.arguments.contains("--run-desktop-diagnostic") && CommandLine.arguments.contains("--diagnostic-initial-settle")}
-    private let nativeScannerRequested=CommandLine.arguments.contains("--native-camera-preview")
+    private let nativeInterleavedRequested=CommandLine.arguments.contains("--native-interleaved-preview")
+    private let nativeScannerRequested=CommandLine.arguments.contains("--native-camera-preview") || CommandLine.arguments.contains("--native-interleaved-preview")
     private var nativeScannerOverlay:NativeScannerOverlay?
     private var nextCameraDiagnostic=0.0
     private var connectionTask:Task<Void,Never>?, operationTask:Task<Void,Never>?, loop:Task<Void,Never>?, cameraLoop:Task<Void,Never>?
@@ -383,7 +384,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 wirelessEndpoint=device.transport == .wireless ? (try? ADBEndpoint(device.serial).value):nil
                 self.genericDesktopCamera=genericDesktopCamera
                 adbURL=selected;phoneSession=PhoneSession(resources:Bundle.main.resourceURL!,adbURL:selected,serverSocket:adbServerSocket)
-                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial,allowLockedApplications:allowLockedApplications,desktopHome:!diagnostic,realtimeVideo:nativeScannerRequested && !diagnostic && !genericDesktopCamera,genericDesktopCamera:genericDesktopCamera){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
+                model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial,allowLockedApplications:allowLockedApplications,desktopHome:!diagnostic,realtimeVideo:nativeScannerRequested && !diagnostic && (!genericDesktopCamera || nativeInterleavedRequested),genericDesktopCamera:genericDesktopCamera){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
                 try Task.checkCancellation();connected=true;mode = .phone;mirrorGeneration+=1
                 independentApplicationsWhenLocked=await phone.independentApplicationsWhenLocked
                 primaryLocked=independentApplicationsWhenLocked ? !(try await phone.primaryUserUnlocked()) : false
@@ -619,6 +620,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if let state=try? await phone.cameraState(),!overlay.matches(state) {break}
                     try? await Task.sleep(nanoseconds:50_000_000)
                 }
+                if overlay.interleaved {
+                    do {
+                        guard connected,!stopping,!Task.isCancelled,scanGeneration==generation,nativeScannerOverlay === overlay else{return}
+                        try await overlay.releaseSource(phone:phone)
+                    } catch {localScanClearFailed();return}
+                }
                 await stopNativeScannerOverlay()
             }
             guard connected,!stopping,!Task.isCancelled,scanGeneration==generation else{return}
@@ -687,7 +694,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let overlay=nativeScannerOverlay else{return}
         let window=cameraWindow
         nativeScannerOverlay=nil;overlay.freeze();window?.freezeNativeScanner()
-        await overlay.stop();window?.endNativeScanner()
+        try? await overlay.releaseSource(phone:phone)
+        await overlay.stop();window?.endNativeScanner(retiredFilter:overlay.retiredFrameFilter)
     }
     private func showApplications(){
         guard connected,!stopping else{return}
@@ -848,6 +856,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cameraInvalidation=(token,display,task)
         return task
     }
+    private func nativeCameraFrames(window:ControlWindowController,display:Int)->(MirrorVideoMailbox,Int)? {
+        if display==mirrorDisplay,window === mainControl {return (activeRoute.frames,activeRoute.incarnation)}
+        return detachedApplications?.cameraDecodedFrames(display:display,window:window)
+    }
     private func startCamera(in requestedWindow:ControlWindowController?=nil,display requestedDisplay:Int?=nil){
         let targetWindow=requestedWindow ?? control
         let targetDisplay=requestedDisplay ?? mirrorDisplay
@@ -901,17 +913,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     targetWindow.onRelaunch={ [weak self] in self?.relaunch() }
                     cameraActive=true;paused=false
                     localCameraMode=desktopMode
-                    if localCameraMode,nativeScannerRequested,!genericDesktopCamera,let targetDisplay {
+                    if localCameraMode,nativeScannerRequested,(!genericDesktopCamera || nativeInterleavedRequested),let targetDisplay {
                         let state=try await phone.cameraState()
-                        if let scanner=state.scannerActivity(),scanner.displayId==targetDisplay {
+                        if let scanner=genericDesktopCamera ? state.captureActivity():state.scannerActivity(),scanner.displayId==targetDisplay,
+                           !genericDesktopCamera || state.interleavedPreviewSupported {
                             let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
                                 fastCalibration:CommandLine.arguments.contains("--native-fast-calibration"),
                                 batchedCalibration:CommandLine.arguments.contains("--native-batched-calibration"),
                                 solidCalibrationEnabled:!CommandLine.arguments.contains("--native-png-calibration"),
-                                displaySyncEnabled:!CommandLine.arguments.contains("--native-unsynced-presentation"))
-                            guard mirrorDisplay==targetDisplay else{throw ScanError("扫码镜像路由已变化。")}
-                            let nativeRoute=activeRoute,nativeIncarnation=nativeRoute.incarnation
-                            try overlay.observeDecodedFrames(in:nativeRoute.frames,generation:nativeIncarnation)
+                                displaySyncEnabled:!CommandLine.arguments.contains("--native-unsynced-presentation"),
+                                interleaved:genericDesktopCamera && nativeInterleavedRequested)
+                            guard let nativeBinding=nativeCameraFrames(window:targetWindow,display:targetDisplay) else{throw ScanError("扫码镜像路由已变化。")}
+                            let nativeMailbox=nativeBinding.0,nativeIncarnation=nativeBinding.1
+                            try overlay.observeDecodedFrames(in:nativeMailbox,generation:nativeIncarnation)
                             nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
                             status("准备原生扫码预览","正在校准手机应用自己的相机背景…")
                             try await overlay.prepare(phone:phone,epoch:generation)
@@ -919,8 +933,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             try Task.checkCancellation()
                             guard connected,!stopping,generation==scanGeneration,nativeScannerOverlay === overlay else{throw CancellationError()}
                             guard overlay.matches(attachmentState) else{throw ScanError("原生扫码状态已变化，已停止挂载预览。")}
-                            guard activeRoute === nativeRoute,nativeRoute.incarnation==nativeIncarnation,
-                                  mirrorDisplay==targetDisplay,overlay.decodedFrameDelivery else{throw ScanError("扫码镜像路由已变化。")}
+                            guard let currentBinding=nativeCameraFrames(window:targetWindow,display:targetDisplay),
+                                  currentBinding.0 === nativeMailbox,currentBinding.1==nativeIncarnation,
+                                  windowAvailability?.isAvailable != false,overlay.decodedFrameDelivery else{throw ScanError("扫码镜像路由已变化。")}
                             if targetWindow === mainControl {applicationPickerVisible=false}
                             targetWindow.showNativeScanner(overlay)
                             nativeScannerAttachedUptime=ProcessInfo.processInfo.systemUptime
@@ -1712,7 +1727,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 reason:"实时手机桌面相机")
         }
         cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0
-        let availability=cameraWindowAvailability
+        let availability=cameraWindowAvailability,nativeSourceLease=nativeScannerOverlay?.sourceLease
         let pump=CameraPumpMailbox(sourceIsAvailable:{availability?.isAvailable != false}),generation=scanGeneration
         let diagnosticQRStart=performanceCheck == nil ? Double.infinity:ProcessInfo.processInfo.systemUptime+6.2
         let saveSyntheticPattern=performanceCheck != nil && CommandLine.arguments.contains("--diagnostic-pattern")
@@ -1765,7 +1780,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if localFrameMode {
                         validator={pump.isCurrent(selection) && pump.captureReady(at:ProcessInfo.processInfo.systemUptime)}
                     } else {validator=nil}
-                    let receipt=try await phone.frame(image,epoch:generation,selectedAt:target.selectedAt,isCurrent:validator)
+                    let receipt=try await phone.frame(image,epoch:generation,selectedAt:target.selectedAt,isCurrent:validator,nativeLease:nativeSourceLease)
                     let sentAt=ProcessInfo.processInfo.systemUptime
                     if localFrameMode,!pump.isCurrent(selection) {
                         try await phone.discardFrame(epoch:generation)

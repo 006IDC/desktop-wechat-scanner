@@ -140,7 +140,13 @@ public final class LiveCameraServer {
     private int ownerDeviceKeyListedCount, ownerDeviceIdPresentCount, ownerDeviceIdMatchCount;
     // Only the authenticated command reader changes this value. A clear advances
     // the epoch so a frame captured before pause cannot revive the camera.
-    private long currentEpoch;
+    private volatile long currentEpoch;
+    private final CameraPreviewInterleave previewInterleave = new CameraPreviewInterleave();
+    private long sourceAcceptedNanos; // cameraLock
+    private NativePreviewPattern previewPattern; // cameraLock
+    private final CameraSourceLease sourceLease = new CameraSourceLease();
+    private boolean nativeSourceOnly; // stateLock + cameraLock; cleared only by explicit disable
+
 
     private static void log(String key, Object value) {
         System.out.println(PREFIX + key + "=" + value);
@@ -385,6 +391,7 @@ public final class LiveCameraServer {
     }
 
     private long markDesktopFrameInvalidLocked() {
+        synchronized (cameraLock) { sourceLease.invalidate(); previewInterleave.disable(); }
         return desktopHomeRequested ? ++cameraStateGeneration : -1;
     }
 
@@ -634,7 +641,7 @@ public final class LiveCameraServer {
             // Arrival-driven drawing already supplies the active 30fps stream.
             // Only refresh idle content; otherwise an unrelated tick could post
             // an old image just before the next arrival and add camera backpressure.
-            if (System.nanoTime() - lastCameraUpdateNanos >= TimeUnit.MILLISECONDS.toNanos(66))
+            if (previewInterleaveActive() || System.nanoTime() - lastCameraUpdateNanos >= TimeUnit.MILLISECONDS.toNanos(66))
                 requestPaint();
         }, 33, 33, TimeUnit.MILLISECONDS);
     }
@@ -847,15 +854,23 @@ public final class LiveCameraServer {
         CameraPaintTiming.Ticket paintedTicket = null;
         long lockBegan = System.nanoTime(), locked = 0, drawn = 0, paintedGeneration = -1;
         boolean drewSource = false;
+        CameraPreviewInterleave.Phase previewPhase = CameraPreviewInterleave.Phase.UNCHANGED;
+        long paintedEpoch = -1;
         try {
             canvas = surface.lockCanvas(null);
             locked = System.nanoTime();
             canvas.drawColor(Color.WHITE);
             synchronized (cameraLock) {
+                boolean sourceCurrent = cameraFrame != null && cameraSolidColor == null && frameStateGeneration == cameraStateGeneration;
+                paintedEpoch = currentEpoch;
+                previewPhase = cameraSolidColor == null
+                        ? previewInterleave.next(cameraStateGeneration, paintedEpoch, sourceCurrent, sourceAcceptedNanos, System.nanoTime())
+                        : CameraPreviewInterleave.Phase.UNCHANGED;
+                boolean keyed = previewPhase == CameraPreviewInterleave.Phase.KEY;
                 boolean solid = cameraSolidColor != null && desktopHomeRequested && frameStateGeneration == cameraStateGeneration;
-                if (solid || (cameraFrame != null && (!desktopHomeRequested || frameStateGeneration == cameraStateGeneration))) {
-                    paintedTicket = cameraPaintTiming.current();
-                    paintedGeneration = frameStateGeneration;
+                if (keyed || solid || (cameraFrame != null && (!desktopHomeRequested || frameStateGeneration == cameraStateGeneration))) {
+                    paintedTicket = keyed ? null : cameraPaintTiming.current();
+                    paintedGeneration = keyed ? cameraStateGeneration : frameStateGeneration;
                     int width = canvas.getWidth();
                     int height = canvas.getHeight();
                     canvas.save();
@@ -864,20 +879,31 @@ public final class LiveCameraServer {
                     int portraitWidth = height, portraitHeight = width;
                     // Match the existing 720x1280 calibration PNG's rotation,
                     // aspect fit, rounding and white margins exactly.
-                    int sourceWidth = solid ? 720 : cameraFrame.getWidth();
-                    int sourceHeight = solid ? 1280 : cameraFrame.getHeight();
+                    int sourceWidth = keyed || solid ? 720 : cameraFrame.getWidth();
+                    int sourceHeight = keyed || solid ? 1280 : cameraFrame.getHeight();
                     float scale = Math.min((float) portraitWidth / sourceWidth, (float) portraitHeight / sourceHeight);
                     int drawWidth = Math.round(sourceWidth * scale);
                     int drawHeight = Math.round(sourceHeight * scale);
                     Rect destination = new Rect(-drawWidth / 2, -drawHeight / 2,
                             drawWidth / 2, drawHeight / 2);
                     Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
-                    if (solid) {
+                    if (keyed) {
+                        if (previewPattern == null) throw new IllegalStateException("Native preview pattern unavailable");
+                        for (int row = 0; row < NativePreviewPattern.ROWS; row++) {
+                            for (int column = 0; column < NativePreviewPattern.COLUMNS; column++) {
+                                paint.setColor(0xff000000 | previewPattern.blue(column, row));
+                                float left = -drawWidth / 2f + (float) drawWidth * column / NativePreviewPattern.COLUMNS;
+                                float top = -drawHeight / 2f + (float) drawHeight * row / NativePreviewPattern.ROWS;
+                                canvas.drawRect(left, top, -drawWidth / 2f + (float) drawWidth * (column + 1) / NativePreviewPattern.COLUMNS,
+                                        -drawHeight / 2f + (float) drawHeight * (row + 1) / NativePreviewPattern.ROWS, paint);
+                            }
+                        }
+                    } else if (solid) {
                         paint.setColor(cameraSolidColor);
                         canvas.drawRect(destination, paint);
                     } else canvas.drawBitmap(cameraFrame, null, destination, paint);
                     canvas.restore();
-                    drawn = System.nanoTime(); drewSource = true;
+                    drawn = System.nanoTime(); drewSource = !keyed;
                 }
             }
         } catch (Exception e) {
@@ -885,6 +911,7 @@ public final class LiveCameraServer {
         } finally {
             if (canvas != null) try {
                 surface.unlockCanvasAndPost(canvas);
+                synchronized (cameraLock) { previewInterleave.posted(previewPhase, paintedGeneration, paintedEpoch); }
                 if (drewSource && (!desktopHomeRequested || paintedGeneration == cameraStateGeneration))
                     cameraPaintTiming.posted(paintedTicket, lockBegan, locked, drawn, System.nanoTime());
             } catch (Exception ignored) {}
@@ -1071,16 +1098,31 @@ public final class LiveCameraServer {
         return jpeg || png;
     }
 
-    private void setCameraFrame(byte[] bytes) throws IOException {
+    private void setCameraFrame(byte[] bytes) throws IOException { setCameraFrame(bytes, 0, -1, -1, -1); }
+
+    private void setCameraFrame(byte[] bytes, long nativeToken, long nativeEpoch, long nativeCapture, int nativeDisplay) throws IOException {
         if (bytes.length == 0 || bytes.length > MAX_IMAGE_BYTES || !isSupportedImage(bytes))
             throw new IOException("Expected JPEG/PNG, 1..4 MiB");
+        long acceptedRevision;
+        synchronized (cameraLock) { acceptedRevision = sourceLease.revision(); }
         long acceptedGeneration = -1;
         int acceptedDisplay = -1;
         if (desktopHomeRequested) {
             synchronized (stateLock) {
+                // Retain the native-source requirement after an owner invalidates
+                // its lease. An old Mac source must not be re-authorized for a
+                // different, newly opened camera while its status update is in flight.
+                synchronized (cameraLock) {
+                    boolean nativeAuthorized = nativeSourceOnly && nativeToken > 0 && sourceLease.current(nativeToken, nativeEpoch, nativeCapture, currentEpoch, cameraStateGeneration)
+                            && previewInterleave.active(cameraStateGeneration, currentEpoch);
+                    if ((nativeSourceOnly && !nativeAuthorized) || (!nativeSourceOnly && nativeToken > 0))
+                        throw new IOException("Native source lease is no longer active");
+                }
                 acceptedDisplay = authorizedDesktopScannerLocked();
                 if (acceptedDisplay <= Display.DEFAULT_DISPLAY)
                     throw new IOException("Desktop camera has no verified scanner owner");
+                if (nativeToken > 0 && acceptedDisplay != nativeDisplay)
+                    throw new IOException("Native source lease is no longer active");
                 acceptedGeneration = cameraStateGeneration;
             }
         }
@@ -1099,18 +1141,26 @@ public final class LiveCameraServer {
             synchronized (stateLock) {
                 stale = cameraStateGeneration != acceptedGeneration || authorizedDesktopScannerLocked() != acceptedDisplay;
                 if (!stale) synchronized (cameraLock) {
-                    previous = cameraFrame;
-                    cameraFrame = decoded;
-                    cameraSolidColor = null;
-                    frameStateGeneration = acceptedGeneration;
-                    cameraPaintTiming.accept(System.nanoTime());
+                    stale = !sourceLease.accepts(acceptedRevision);
+                    if (!stale) {
+                        previous = cameraFrame;
+                        cameraFrame = decoded;
+                        sourceAcceptedNanos = System.nanoTime();
+                        cameraSolidColor = null;
+                        frameStateGeneration = acceptedGeneration;
+                        cameraPaintTiming.accept(System.nanoTime());
+                    }
                 }
             }
         } else synchronized (cameraLock) {
-            previous = cameraFrame;
-            cameraFrame = decoded;
-            cameraSolidColor = null;
-            cameraPaintTiming.accept(System.nanoTime());
+            stale = !sourceLease.accepts(acceptedRevision);
+            if (!stale) {
+                previous = cameraFrame;
+                cameraFrame = decoded;
+                sourceAcceptedNanos = System.nanoTime();
+                cameraSolidColor = null;
+                cameraPaintTiming.accept(System.nanoTime());
+            }
         }
         if (stale) {
             decoded.recycle();
@@ -1129,6 +1179,7 @@ public final class LiveCameraServer {
             if (authorizedDesktopScannerLocked() <= Display.DEFAULT_DISPLAY)
                 throw new IOException("Desktop camera has no verified scanner owner");
             synchronized (cameraLock) {
+                sourceLease.invalidate();
                 previous = cameraFrame;
                 cameraFrame = null;
                 cameraSolidColor = blue ? Color.BLUE : Color.BLACK;
@@ -1141,8 +1192,13 @@ public final class LiveCameraServer {
         requestPaint();
     }
 
-    private void clearCameraFrame() {
+    private void clearCameraFrame() { clearCameraFrame(false); }
+
+    private void clearCameraFrame(boolean keepPreview) {
         synchronized (cameraLock) {
+            sourceLease.invalidate();
+            if (!keepPreview || !previewInterleave.active(cameraStateGeneration, currentEpoch)) previewInterleave.disable();
+            sourceAcceptedNanos = 0;
             Bitmap previous = cameraFrame;
             cameraFrame = null;
             cameraSolidColor = null;
@@ -1152,6 +1208,77 @@ public final class LiveCameraServer {
         }
         lastCameraUpdateNanos = System.nanoTime();
         requestPaint();
+    }
+
+    private void awaitCameraPaints() throws IOException { CameraPaintBarrier.await(painter); }
+
+    private byte[] previewCalibration(byte[] body) throws Exception {
+        if (body.length != 29 || body[4] < 0 || body[4] > 2) throw new IOException("Invalid preview calibration");
+        java.nio.ByteBuffer request = java.nio.ByteBuffer.wrap(body);
+        int id = request.getInt(); int phase = request.get();
+        long epoch = request.getLong(), capture = request.getLong(), token = request.getLong();
+        ownedDisplay(id);
+        synchronized (stateLock) {
+            if (stopping || authorizedDesktopScannerLocked() != id) throw new IOException("Preview owner unavailable");
+            synchronized (cameraLock) {
+                if (!previewInterleave.active(cameraStateGeneration, currentEpoch) || epoch != currentEpoch
+                        || !sourceLease.current(token, epoch, capture, currentEpoch, cameraStateGeneration) || previewPattern == null)
+                    throw new IOException("Preview lease changed");
+                sourceLease.invalidate();
+                Bitmap old = cameraFrame; cameraFrame = null; sourceAcceptedNanos = 0;
+                cameraSolidColor = CameraPreviewInterleave.calibrationColor(phase);
+                frameStateGeneration = cameraStateGeneration;
+                if (old != null) old.recycle();
+            }
+        }
+        lastCameraUpdateNanos = System.nanoTime(); requestPaint();
+        return new byte[0];
+    }
+
+    private boolean previewInterleaveActive() {
+        synchronized (cameraLock) { return previewInterleave.active(cameraStateGeneration, currentEpoch); }
+    }
+
+    private byte[] configureNativePreview(byte[] body) throws Exception {
+        if (body.length != 29 || body[4] < 0 || body[4] > 2) throw new IOException("Invalid native preview selection");
+        java.nio.ByteBuffer request = java.nio.ByteBuffer.wrap(body);
+        int id = request.getInt(); int action = request.get(); boolean enable = action == 1;
+        long epoch = request.getLong(), capture = request.getLong(), token = request.getLong();
+        ownedDisplay(id);
+        boolean applied = false;
+        synchronized (stateLock) {
+            synchronized (cameraLock) {
+                if (action == 2) {
+                    if (!sourceLease.current(token, epoch, capture, currentEpoch, cameraStateGeneration)
+                            || authorizedDesktopScannerLocked() != id) throw new IOException("Native preview lease changed");
+                } else if (enable) {
+                    if (token != 0 || epoch != currentEpoch || capture != cameraStateGeneration || stopping
+                            || !desktopHomeRequested || !realtimeVideoRequested || mirrorOnlyRequested
+                            || !desktopCameraRouting.enabled() || streams.size() != 1 || authorizedDesktopScannerLocked() != id)
+                        throw new IOException("Native preview has no unambiguous camera owner");
+                    token = sourceLease.begin(epoch, capture);
+                    Bitmap old = cameraFrame; cameraFrame = null; sourceAcceptedNanos = 0;
+                    cameraSolidColor = Color.BLACK; frameStateGeneration = cameraStateGeneration;
+                    if (old != null) old.recycle();
+                    previewPattern = new NativePreviewPattern();
+                    previewInterleave.enable(cameraStateGeneration, currentEpoch); nativeSourceOnly = true;
+                    applied = true;
+                } else if (sourceLease.end(token, epoch, capture, currentEpoch, cameraStateGeneration)) {
+                    previewInterleave.disable(); nativeSourceOnly = false; applied = true;
+                }
+            }
+            // Clear under the same state lock as selection; a later enable
+            // cannot be cleared by a retired disable after it took ownership.
+            if (!enable && applied) clearCameraFrame();
+        }
+        // A retired overlay cannot erase a newer preview on the same display.
+        if (action != 2 && applied) awaitCameraPaints();
+        synchronized (cameraLock) {
+            return new JSONObject().put("applied", applied).put("token", token)
+                    .put("enabled", previewInterleave.active(cameraStateGeneration, currentEpoch))
+                    .put("keyPosts", previewInterleave.keyPosts()).put("sourcePosts", previewInterleave.sourcePosts())
+                    .toString().getBytes(StandardCharsets.UTF_8);
+        }
     }
 
     private String sleepFailureStage = "not_requested";
@@ -1202,6 +1329,7 @@ public final class LiveCameraServer {
 
     private byte[] liveState() throws Exception {
         JSONObject state = new JSONObject().put("version", 1).put("desktopHome", desktopHomeRequested);
+        state.put("interleavedPreviewSupported", desktopHomeRequested && realtimeVideoRequested && !mirrorOnlyRequested);
         state.put("solidCalibrationSupported", desktopHomeRequested && realtimeVideoRequested && !mirrorOnlyRequested);
         JSONArray activities = new JSONArray();
         synchronized (stateLock) {
@@ -1212,7 +1340,7 @@ public final class LiveCameraServer {
             for(Map.Entry<Integer,String> binding:desktopCameraRouting.snapshot().entrySet())
                 bindings.put(new JSONObject().put("displayId",binding.getKey()).put("packageName",binding.getValue()));
             state.put("desktopCameraBindings",bindings);
-            state.put("generation", streamGeneration).put("activeStreams", streams.size());
+            state.put("generation", streamGeneration).put("captureGeneration", cameraStateGeneration).put("activeStreams", streams.size());
             state.put("cameraOwner", cameraOwner == null ? JSONObject.NULL : cameraOwner);
             state.put("ownerKnown", cameraOwnerKnown).put("ownerGeneration", ownerGeneration);
             state.put("ownerStatus", ownerStatus)
@@ -1265,7 +1393,7 @@ public final class LiveCameraServer {
             int command;
             try { command = input.readUnsignedByte(); } catch (EOFException eof) { return false; }
             int length = input.readInt();
-            if (length < 0 || length > MAX_IMAGE_BYTES + Long.BYTES) {
+            if (length < 0 || length > MAX_IMAGE_BYTES + 28) {
                 error(output, "Invalid payload length");
                 return false;
             }
@@ -1290,6 +1418,22 @@ public final class LiveCameraServer {
                     reply(output, true, java.nio.ByteBuffer.allocate(Long.BYTES).putLong(processingNanos).array());
                 }
                 catch (Exception e) { error(output, e.getMessage() == null ? "Invalid camera frame" : e.getMessage()); }
+            } else if (command == 35) {
+                try {
+                    if (length <= 28 || mirrorOnlyRequested || !desktopHomeRequested) throw new IOException("Native source lease is no longer active");
+                    java.nio.ByteBuffer request = java.nio.ByteBuffer.wrap(body);
+                    int id = request.getInt(); long epoch = request.getLong(), capture = request.getLong(), token = request.getLong();
+                    if (id <= 0 || epoch < 0 || capture < 0 || token <= 0) throw new IOException("Native source lease is no longer active");
+                    long began = System.nanoTime();
+                    setCameraFrame(Arrays.copyOfRange(body, 28, body.length), token, epoch, capture, id);
+                    reply(output, true, java.nio.ByteBuffer.allocate(Long.BYTES).putLong(System.nanoTime() - began).array());
+                } catch (Exception failure) { error(output, failure.getMessage() == null ? "Native source lease is no longer active" : failure.getMessage()); }
+            } else if (command == 33) {
+                try { reply(output, true, previewCalibration(body)); }
+                catch (Exception failure) { error(output, "Native preview calibration was rejected"); }
+            } else if (command == 32) {
+                try { reply(output, true, configureNativePreview(body)); }
+                catch (Exception failure) { error(output, "Native preview selection was rejected"); }
             } else if (command == 26) {
                 try {reply(output,true,configureDesktopCamera(body));}
                 catch (Exception failure) {error(output,"Desktop camera selection failed: "+failure.getClass().getSimpleName());}
@@ -1339,14 +1483,16 @@ public final class LiveCameraServer {
                     currentEpoch = epoch;
                     clearCameraFrame();
                 }
-                reply(output, true, new byte[0]);
+                try { awaitCameraPaints(); reply(output, true, new byte[0]); }
+                catch (IOException failure) { error(output, "Camera clear is not yet confirmed"); }
             } else if (command == 23) {
                 if (length != Long.BYTES) { error(output, "Discard request needs an 8-byte epoch"); continue; }
                 long epoch = new DataInputStream(new ByteArrayInputStream(body)).readLong();
                 if (epoch < 0) { error(output, "Epoch must be nonnegative"); continue; }
                 // An old discard must never erase a newer capture generation.
-                if (epoch == currentEpoch) clearCameraFrame();
-                reply(output, true, new byte[0]);
+                if (epoch == currentEpoch) clearCameraFrame(true);
+                try { awaitCameraPaints(); reply(output, true, new byte[0]); }
+                catch (IOException failure) { error(output, "Camera discard is not yet confirmed"); }
             } else if (command == 4) {
                 if (length != 0) { error(output, "Heartbeat must be empty"); continue; }
                 reply(output, true, new byte[0]);

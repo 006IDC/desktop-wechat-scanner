@@ -123,6 +123,13 @@ private final class BackgroundScanResult:@unchecked Sendable {
         guard !values.isEmpty else{return [:]};let sorted=values.sorted()
         return ["count":Double(values.count),"p50":sorted[(sorted.count-1)/2],"p95":sorted[max(0,Int(ceil(Double(sorted.count)*0.95))-1)],"max":sorted.last!]
     }
+    /// A real short press, not adjacent asynchronous DOWN/UP packets. Always
+    /// release if navigation is cancelled while the Android UI is processing DOWN.
+    private static func diagnosticTap(_ mirror:MirrorSession,at point:CGPoint) async throws {
+        mirror.touch(action:0,x:point.x,y:point.y)
+        defer {mirror.touch(action:1,x:point.x,y:point.y)}
+        try await Task.sleep(nanoseconds:80_000_000)
+    }
     /// Only fixed, independently confirmed navigation targets are tapped.
     /// Nothing from OCR is exported, and login/consent/payment pages fail closed.
     private static func navigate(phone:PhoneSession,mirror:MirrorSession,frames:BackgroundScanFrames,
@@ -134,16 +141,18 @@ private final class BackgroundScanResult:@unchecked Sendable {
             evidence["navigationEntryFrameBeforeNavigation"]=entry.receivedAt<began
         }
         var lastFrame=0,lastTap=0.0,scanTap:Double?,firstScanTap:Double?,scanComponent:String?
-        var plusRetry=ScannerNavigationOCR.PlusRetry(),scanRetry=ScannerNavigationOCR.PlusRetry(),homeSelected=false
+        var plusRetry=ScannerNavigationOCR.PlusRetry(),scanRetry=ScannerNavigationOCR.PlusRetry(),homeSelected=false,ownedBacks=0
         var fixedLabels=Set<String>(),ocrFrames=0,staleAfterOCR=0
         var ocrCosts=[Double]()
         var postTapSamples=0,lastRouteKind="absent",lastOwnerEvidence="unknown",lastStreams=0
         defer {
+            evidence["navigationTapHoldMilliseconds"]=80
             evidence["navigationScanTapSent"]=scanTap != nil;evidence["navigationPlusTaps"]=plusRetry.attempts
             evidence["navigationOCRFrames"]=ocrFrames;evidence["navigationKnownLabels"]=fixedLabels.sorted()
             evidence["navigationOCRMilliseconds"]=percentiles(ocrCosts)
             evidence["navigationFramesExpiredDuringOCR"]=staleAfterOCR
             evidence["navigationMilliseconds"]=(now-began)*1000
+            evidence["navigationOwnedBackCount"]=ownedBacks
             evidence["navigationDiscoverTapSent"]=false
             evidence["navigationHomeTapSent"]=homeSelected
             evidence["navigationScanTapAttempts"]=scanRetry.attempts
@@ -165,6 +174,16 @@ private final class BackgroundScanResult:@unchecked Sendable {
                 if let activity {
                     lastRouteKind=activity.package != package ? "other":(activity.component==scanComponent ? "initial":(DesktopScannerRoute.isScanner(activity.component) ? "known-scanner":"other-target"))
                 }else{lastRouteKind="absent"}
+            }
+            if package=="com.tencent.mm",scanTap==nil,ownedBacks<2,now-lastTap>1,
+               state.activities.first(where:{$0.displayId==display})?.component=="com.tencent.mm/com.tencent.mm.plugin.profile.ui.ContactInfoUI",
+               state.ownerKnown,state.cameraOwner==nil,state.activeStreams==0,await phone.scannerDisplay()?.id==display {
+                let checked=try await phone.cameraState()
+                if checked.activities.first(where:{$0.displayId==display})?.component=="com.tencent.mm/com.tencent.mm.plugin.profile.ui.ContactInfoUI",
+                   checked.ownerKnown,checked.cameraOwner==nil,checked.activeStreams==0 {
+                    try await phone.back();ownedBacks+=1;lastTap=now
+                    continue
+                }
             }
             if state.captureActivity()?.package==package,state.captureActivity()?.displayId==display {
                 evidence["cameraAlreadyActive"] = scanTap==nil
@@ -220,6 +239,22 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     point=CGPoint(x:scan.rect.midX/720,y:scan.rect.midY/1280)
                 }
             }
+            // A restored LauncherUI can contain a chat, not the Home tab.
+            // BACK is confined to our current display, never the physical phone.
+            // Do not back out of a verified Home/menu or any active camera.
+            if point==nil,package=="com.tencent.mm",scanTap==nil,ownedBacks<2,
+               now-began>2,now-lastTap>1,
+               activity.component=="com.tencent.mm/com.tencent.mm.ui.LauncherUI",
+               Set(words.filter{$0.rect.midY>1000 && ["微信","通讯录","发现","我"].contains($0.value)}.map(\.value)).count<3 {
+                let current=try await phone.cameraState()
+                if current.activities.first(where:{$0.displayId==display})?.component==activity.component,
+                   current.ownerKnown,current.cameraOwner==nil,current.activeStreams==0,
+                   navigationFrameIsCurrent(receivedAt:frame.receivedAt,startCommandIssuedAt:startCommandIssuedAt,now:now),
+                   await phone.scannerDisplay()?.id==display {
+                    try await phone.back();ownedBacks+=1;lastTap=now
+                    continue
+                }
+            }
             if let point {
                 if scanTap != nil,(isPlus || isHome) {continue}
                 if !isPlus && !isHome,!scanRetry.permitsTap(at:now,frameReceivedAt:frame.receivedAt) {continue}
@@ -242,13 +277,14 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     if firstScanTap==nil {firstScanTap=tap;scanComponent=activity.component}
                     scanTap=tap
                 }
-                mirror.tap(x:point.x,y:point.y);lastTap=tap
+                try await diagnosticTap(mirror,at:point);lastTap=tap
             }
             try await Task.sleep(nanoseconds:60_000_000)
         }
         throw Failure.navigation
     }
     static func run() async -> Int32 {
+        let nativePreview=CommandLine.arguments.contains("--native-interleaved-preview")
         let alipayOnly=CommandLine.arguments.contains("--diagnostic-alipay-only"),wechatOnly=CommandLine.arguments.contains("--diagnostic-wechat-only")
         let supplyABBA=CommandLine.arguments.contains("--diagnostic-supply-abba")
         let snapshotABBA=CommandLine.arguments.contains("--diagnostic-snapshot-abba")
@@ -258,7 +294,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
         let expireWarmup=CommandLine.arguments.contains("--diagnostic-expire-stream-warmup")
         let probeQR=CommandLine.arguments.contains("--diagnostic-preview-timing")
         let motion=CommandLine.arguments.contains("--diagnostic-motion")
-        guard validScope(alipay:alipayOnly,wechat:wechatOnly,abba:abba),
+        guard (!nativePreview || (!motion && !abba && !snapshotABBA)),validScope(alipay:alipayOnly,wechat:wechatOnly,abba:abba),
               validExperiments(supplyABBA:supplyABBA,snapshotABBA:snapshotABBA,snapshot:initialSnapshot,expire:expireWarmup),
               validMotionScope(selected:motion,alipay:alipayOnly,wechat:wechatOnly,abba:abba,snapshot:initialSnapshot,expire:expireWarmup) else{return 2}
         guard CommandLine.arguments.contains("--diagnostic-usb"),CommandLine.arguments.contains("--locked-applications"),
@@ -274,7 +310,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
         let activity=ProcessInfo.processInfo.beginActivity(options:.userInitiatedAllowingIdleSystemSleep,
             reason:"用户请求的后台手机扫码验证")
         defer {ProcessInfo.processInfo.endActivity(activity)}
-        var report:[String:Any]=["test":"background-owned-board-scan","physicalInputMeasured":false,"appControllerTested":false,
+        var report:[String:Any]=["test":"background-owned-board-scan","nativeInterleavedPreview":nativePreview,"physicalInputMeasured":false,"appControllerTested":false,
             "captureScope":"own-synthetic-board-only","activationRequested":false,"phoneVideoQRProbeEnabled":probeQR,
             "immediateSyntheticQR":immediateQR,"forcedExpiredStreamWarmup":expireWarmup,
             "programmaticOwnBoardMotion":motion,
@@ -282,6 +318,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
             "userInitiatedActivityRequested":true,"idleSystemSleepAllowed":true]
         let adb=resources.appendingPathComponent("adb/bin/adb"),phone=PhoneSession(resources:resources,adbURL:adb)
         let capture=DesktopCapture()
+        var nativeOverlay:NativeScannerOverlay?
         var board:BoardWindow?,mirror:MirrorSession?,recognitionTask:Task<Void,Never>?,streamWarmup:Task<Void,Error>?,items=[[String:Any]](),stage="prerequisites",passed=false
         do {
             guard CGPreflightScreenCaptureAccess() else{throw Failure.permission}
@@ -297,14 +334,14 @@ private final class BackgroundScanResult:@unchecked Sendable {
             report["diagnosticPreparationScope"]="memory-only-synthetic-fixture-before-phone-session"
             try Task.checkCancellation()
             stage="connect"
-            _=try await phone.connect(openWechatOnConnect:false,selectedSerial:devices[0].serial,allowLockedApplications:true,desktopHome:true,genericDesktopCamera:true){_ in}
+            _=try await phone.connect(openWechatOnConnect:false,selectedSerial:devices[0].serial,allowLockedApplications:true,desktopHome:true,realtimeVideo:nativePreview,genericDesktopCamera:true){_ in}
             guard await phone.independentApplicationsWhenLocked,let display=await phone.scannerDisplay()?.id else{throw Failure.device}
             let apps=try await phone.applications()
             let packages=alipayOnly ? ["com.eg.android.AlipayGphone"]:(wechatOnly ? ["com.tencent.mm"]:["com.tencent.mm","com.eg.android.AlipayGphone"])
             let plans:[(String,Double,Bool)]
             if snapshotABBA {plans=[false,true,true,false].map{(packages[0],8,$0)}}
             else if supplyABBA {plans=[8.0,30.0,30.0,8.0].map{(packages[0],$0,initialSnapshot)}}
-            else {plans=packages.map{($0,8,initialSnapshot)}}
+            else {plans=packages.map{($0,nativePreview ? 30:8,initialSnapshot)}}
             for (index,plan) in plans.enumerated() {
                 let (package,cadence,snapshotBootstrap)=plan
                 var item:[String:Any]=["application":package=="com.tencent.mm" ? "wechat":"alipay","recognized":false,
@@ -318,10 +355,11 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     let window=BoardWindow(contentRect:NSRect(x:screen.visibleFrame.midX-side/2,y:screen.visibleFrame.midY-side/2,width:side,height:side),styleMask:[.borderless],backing:.buffered,defer:false)
                     window.isReleasedWhenClosed=false;window.ignoresMouseEvents=true;window.level=NSWindow.Level(rawValue:-1000)
                     window.contentView=pattern;window.orderBack(nil);pattern.displayIfNeeded();board=window
-                    let frames=BackgroundScanFrames(),stream=MirrorSession();mirror=stream
+                    let frames=BackgroundScanFrames(),stream=MirrorSession(),mailbox=MirrorVideoMailbox();mirror=stream
+                    mailbox.reset(generation:1)
                     let endpoint=try await phone.mirrorEndpoint(display:display),direct=try await phone.directMirror(display:display)
                     try await stream.startVideo(adbURL:adb,serverURL:resources.appendingPathComponent("scrcpy-server"),serial:endpoint.serial,displayID:display,direct:direct,
-                        onFrame:{frames.receive($0)},onFailure:{_ in frames.available.invalidate()})
+                        onFrame:{frames.receive($0);mailbox.publish($0,generation:1)},onFailure:{_ in frames.available.invalidate();mailbox.stop(generation:1)})
                     stage="launch"
                     let launch=now
                     guard try await phone.launchApplication(app,on:display) else{throw Failure.application}
@@ -343,6 +381,16 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     // The next application's frame epoch must advance past it.
                     let epoch=100+index*100
                     try await phone.clear(epoch:epoch,requireConnection:true)
+                    if nativePreview {
+                        stage="native-calibration"
+                        let overlay=NativeScannerOverlay(display:display,package:package,interleaved:true)
+                        nativeOverlay=overlay
+                        try overlay.observeDecodedFrames(in:mailbox,generation:1)
+                        try await overlay.prepare(phone:phone,epoch:epoch)
+                        item["nativeCalibration"]=overlay.calibrationTiming
+                        item["nativeMatteReadback"]=try await overlay.diagnosticRenderingSummary()
+                    }
+                    let sourceLease=nativeOverlay?.sourceLease
                     await capture.setDiagnosticBoard(CGWindowID(window.windowNumber))
                     stage="capture-prepare"
                     let prepare=now;try await capture.prepare();item["capturePrepareMilliseconds"]=(now-prepare)*1000
@@ -422,7 +470,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                                 if !imageWasSnapshot {streamSourceVerified=true;item["streamHandoffSourceVerified"]=true}
                             }
                             captureOperation="send_frame"
-                            let receipt=try await phone.frame(image,epoch:epoch,selectedAt:target.selectedAt,isCurrent:{pump.isCurrent(selection) && pump.captureReady(at:ProcessInfo.processInfo.systemUptime)})
+                            let receipt=try await phone.frame(image,epoch:epoch,selectedAt:target.selectedAt,isCurrent:{pump.isCurrent(selection) && pump.captureReady(at:ProcessInfo.processInfo.systemUptime)},nativeLease:sourceLease)
                             costs.append(receipt.requestMilliseconds);sent+=1;startTimes.append(iteration)
                             if let dispatch=receipt.requestStartedAt,dispatch.isFinite,dispatch>=iteration,dispatch<=now {
                                 dispatchTimes.append(dispatch);ackTimes.append(dispatch+receipt.requestMilliseconds/1000)
@@ -485,6 +533,10 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     item["mirrorRelativeBacklogP95Milliseconds"]=videoTiming.relativeBacklogP95Milliseconds
                     if let frames=await phone.encoderLatencyFrames(),frames>=0,frames<=120 {item["encoderReportedLatencyFrames"]=frames}
                     pump.stop();try await phone.clear(epoch:epoch+20,requireConnection:true)
+                    if let overlay=nativeOverlay {
+                        item["nativeFrameSelection"]=overlay.frameSelectionStatistics
+                        try await overlay.releaseSource(phone:phone);await overlay.stop();nativeOverlay=nil
+                    }
                     item["recognized"]=recognized;item["sentFrames"]=sent
                     item["startupSnapshotAttempted"]=snapshotAttempted
                     item["sourceVerificationMilliseconds"]=percentiles(sourceVerificationCosts)
@@ -532,6 +584,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
         }
         recognitionTask?.cancel();await recognitionTask?.value
         streamWarmup?.cancel();await capture.stop();_ = try? await streamWarmup?.value
+        if let overlay=nativeOverlay {try? await overlay.releaseSource(phone:phone);await overlay.stop()}
         await mirror?.stop();board?.orderOut(nil)
         let cleanup=await phone.disconnect()
         report["applications"]=items;report["cleanupSucceeded"]=cleanup.isEmpty
