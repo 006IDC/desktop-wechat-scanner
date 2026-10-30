@@ -125,7 +125,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
             evidence["navigationEntryFrameBeforeNavigation"]=entry.receivedAt<began
         }
         var lastFrame=0,lastTap=0.0,scanTap:Double?,firstScanTap:Double?,scanComponent:String?
-        var plusRetry=ScannerNavigationOCR.PlusRetry(),scanRetry=ScannerNavigationOCR.PlusRetry(),discoverSelected=false
+        var plusRetry=ScannerNavigationOCR.PlusRetry(),scanRetry=ScannerNavigationOCR.PlusRetry(),homeSelected=false
         var fixedLabels=Set<String>(),ocrFrames=0,staleAfterOCR=0
         var ocrCosts=[Double]()
         var postTapSamples=0,lastRouteKind="absent",lastOwnerEvidence="unknown",lastStreams=0
@@ -135,7 +135,8 @@ private final class BackgroundScanResult:@unchecked Sendable {
             evidence["navigationOCRMilliseconds"]=percentiles(ocrCosts)
             evidence["navigationFramesExpiredDuringOCR"]=staleAfterOCR
             evidence["navigationMilliseconds"]=(now-began)*1000
-            evidence["navigationDiscoverTapSent"]=discoverSelected
+            evidence["navigationDiscoverTapSent"]=false
+            evidence["navigationHomeTapSent"]=homeSelected
             evidence["navigationScanTapAttempts"]=scanRetry.attempts
             if let first=firstScanTap,let last=scanTap {evidence["navigationScanRetryDelayMilliseconds"]=(last-first)*1000}
             if postTapSamples>0 {
@@ -185,7 +186,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
             ocrFrames+=1
             let known:Set<String>=["首页","消息","理财","生活","我的","扫一扫","收付款","收付钱","微信","通讯录","发现","我","发起群聊","添加朋友","朋友圈","视频号","小程序","看一看"]
             fixedLabels.formUnion(words.compactMap{known.contains($0.value) ? $0.value:nil})
-            var point:CGPoint?,isPlus=false,isDiscover=false
+            var point:CGPoint?,isPlus=false,isHome=false
             if package=="com.tencent.mm" {
                 let menu=words.contains{$0.value.contains("添加朋友")} && words.contains{$0.value.contains("发起群聊")}
                 if let scan=WechatDiagnosticNavigation.scanRow(in:words) {point=scan}
@@ -195,9 +196,12 @@ private final class BackgroundScanResult:@unchecked Sendable {
                           let plus=try ScannerNavigationOCR.plusButton(in:frame.pixels,homeWords:words),
                           plusRetry.permitsTap(at:now,frameReceivedAt:frame.receivedAt) {
                     point=CGPoint(x:plus.x/720,y:plus.y/1280);isPlus=true
-                } else if !discoverSelected,let discover=WechatDiagnosticNavigation.discoverTab(in:words) {
-                    point=discover;isDiscover=true
+                } else if !homeSelected,let home=WechatDiagnosticNavigation.homeTabFromDiscover(in:words) {
+                    point=home;isHome=true
                 }
+                // A transition frame can have a title before its plus glyph is
+                // visible. Stay on Home for a later verified frame; switching
+                // to Discover here can strand navigation on a customized page.
             } else {
                 let tabs=Set(words.filter{$0.rect.midY>1000 && ["消息","理财","生活"].contains($0.value)}.map(\.value))
                 let home=(words.contains{$0.value=="首页" && $0.rect.midY>1000} || tabs.count>=2) &&
@@ -208,8 +212,8 @@ private final class BackgroundScanResult:@unchecked Sendable {
                 }
             }
             if let point {
-                if scanTap != nil,(isPlus || isDiscover) {continue}
-                if !isPlus && !isDiscover,!scanRetry.permitsTap(at:now,frameReceivedAt:frame.receivedAt) {continue}
+                if scanTap != nil,(isPlus || isHome) {continue}
+                if !isPlus && !isHome,!scanRetry.permitsTap(at:now,frameReceivedAt:frame.receivedAt) {continue}
                 let current=try await phone.cameraState()
                 guard current.activities.first(where:{$0.displayId==display})?.component==activity.component,
                       current.ownerKnown,current.cameraOwner==nil,current.activeStreams==0,
@@ -221,9 +225,9 @@ private final class BackgroundScanResult:@unchecked Sendable {
                           frameReceivedAt:frame.receivedAt,retry:scanRetry) else{continue}
                 }
                 if isPlus,!plusRetry.permitsTap(at:tap,frameReceivedAt:frame.receivedAt) {continue}
-                if !isPlus && !isDiscover,!scanRetry.permitsTap(at:tap,frameReceivedAt:frame.receivedAt) {continue}
+                if !isPlus && !isHome,!scanRetry.permitsTap(at:tap,frameReceivedAt:frame.receivedAt) {continue}
                 if isPlus {plusRetry.recordTap(at:tap,frameReceivedAt:frame.receivedAt)}
-                else if isDiscover {discoverSelected=true}
+                else if isHome {homeSelected=true}
                 else {
                     scanRetry.recordTap(at:tap,frameReceivedAt:frame.receivedAt)
                     if firstScanTap==nil {firstScanTap=tap;scanComponent=activity.component}

@@ -17,6 +17,11 @@ import CoreGraphics
         precondition(WechatDiagnosticNavigation.scanRow(in:discover.filter{$0.value != "朋友圈"})==nil)
         precondition(WechatDiagnosticNavigation.scanRow(in:discover.filter{$0.rect.midY<1000})==nil)
         precondition(WechatDiagnosticNavigation.scanRow(in:discover.map{$0.value=="扫一扫" ? word("扫一扫",30,1100):$0})==nil)
+        precondition(WechatDiagnosticNavigation.homeTabFromDiscover(in:discover.filter{$0.value != "扫一扫"}) != nil)
+        precondition(WechatDiagnosticNavigation.homeTabFromDiscover(in:home)==nil)
+        precondition(WechatDiagnosticNavigation.homeTabFromDiscover(in:tabs)==nil)
+        precondition(WechatDiagnosticNavigation.homeTabFromDiscover(in:discover.filter{$0.rect.midY<1000})==nil)
+        precondition(WechatDiagnosticNavigation.homeTabFromDiscover(in:discover.filter{$0.value != "朋友圈"})==nil)
         print("PASS guarded native Discover fallback; rejects absent Home/title/menu/tabs and wrong scan region; no device/UI")
     }
 }

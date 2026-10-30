@@ -11,6 +11,14 @@ enum WechatDiagnosticNavigation {
               let tab=words.first(where:{$0.value=="发现" && $0.rect.midY>1000}) else{return nil}
         return CGPoint(x:tab.rect.midX/720,y:tab.rect.midY/1280)
     }
+    /// A restored Discover page may hide Scan in the user's own settings.
+    /// Return to its verified Home tab instead of guessing a missing row.
+    static func homeTabFromDiscover(in words:[ScannerNavigationOCR.Text])->CGPoint? {
+        guard tabs(words),words.contains(where:{$0.value=="发现" && $0.rect.midY<260}),
+              words.contains(where:{$0.value=="朋友圈" && $0.rect.midY<1000}),
+              let tab=words.first(where:{$0.value=="微信" && $0.rect.midY>1000}) else{return nil}
+        return CGPoint(x:tab.rect.midX/720,y:tab.rect.midY/1280)
+    }
     static func scanRow(in words:[ScannerNavigationOCR.Text])->CGPoint? {
         guard tabs(words),words.contains(where:{$0.value=="发现" && $0.rect.midY<260}) else{return nil}
         let landmarks=Set(words.filter{$0.rect.midY<1000 && ["朋友圈","视频号","小程序","看一看"].contains($0.value)}.map(\.value))
