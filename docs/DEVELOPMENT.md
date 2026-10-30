@@ -871,3 +871,14 @@ build59签名包支付宝真实扫码通过；launch约777.6ms，其中3次确�
 B1的startCommand约227.2ms，其他轮约99.7/132.0/69.3ms；查询、系统迁移和启动仍有波动，不能排除相互影响或只归因App。保留慢轮，不用B2单轮外推全部App。
 
 生产62 Mac代码连接实际61手机服务另做一次隐藏启动：cap缺失按false处理，7次读取均走legacy、未发送新命令；launch1043.6ms（1个迁移root、4次确认），前台App和恢复清理通过、无记录。它只证明旧通道兼容，不能与上述暖态ABBA直接比快慢；没有采集Mac或请求激活。
+
+
+### build62 完整包与剩余失败
+
+源码`381f1e4d8d9133f8e3230c12356b8fd935833912`，ZIP SHA256 `425d3e9e638a67e5eb6b4158927cb49ef175e6c00ae29578ba00832489dd161e`；JAR、strict/deep签名和与安装61相同designated requirement通过。后台双App轮首个微信launch224.7ms（4次native、1个迁移root），扫码tap→已确认owner365.4ms，采集prepare61.8ms后在capture/send阶段以未分类backend失败，无首ACK记录，整轮失败；未继续支付宝。已有录屏权限true、未请求激活、清理通过。不能把启动变快称扫码已通过；下一候选只补固定错误类别和内部操作阶段，禁止保存原始错误/页面内容，先定位实际失败再改采集逻辑。
+
+同62生产代码的隐藏独立窗口断流恢复通过：首次launch阶段273.2ms、随后新帧门槛402.8ms；重试launch140.7ms、随后409.3ms。旧来源立即失效、clear ACK、同Mac窗口新显示/新帧、选中App前台与清理均通过。窗口始终未显示，不证明物理呈现或实际拖动。
+
+## build63 失败分类（2026-10-30，验证中）
+
+显式后台诊断为非固定Failure补充固定技术分类；ScreenCaptureKit只记录已核实domain的数值code，ScanError只映射白名单，其余记other，不存message/userInfo/任意domain。采集阶段另记固定操作select_target/capture/verify_own_source/send_frame/final_state。未改变正常产品采集、权限或输入行为，尚不算修复62失败。本机仍安装61，权限不变。

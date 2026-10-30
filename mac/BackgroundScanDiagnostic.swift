@@ -266,6 +266,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                 let (package,cadence,snapshotBootstrap)=plan
                 var item:[String:Any]=["application":package=="com.tencent.mm" ? "wechat":"alipay","recognized":false,
                     "supplyCadenceHz":cadence,"captureBootstrapMode":snapshotBootstrap ? "snapshot_then_stream":"stream_only"]
+                var captureOperation:String?
                 do {
                     guard let app=apps.first(where:{$0.packageName==package}),let screen=NSScreen.screens.first else{throw Failure.application}
                     let payload="006IDC"+UUID().uuidString.replacingOccurrences(of:"-",with:"").prefix(12)
@@ -317,11 +318,13 @@ private final class BackgroundScanResult:@unchecked Sendable {
                             pattern.showQR=true;pattern.needsDisplay=true;pattern.displayIfNeeded();qrShownAt=now
                             recognitionTask=result.observe(frames:frames,payload:String(payload),after:qrShownAt!,until:until,probeQR:probeQR)
                         }
+                        captureOperation="select_target"
                         let target=try DesktopCaptureTarget.current(for:window.frame)
                         pump.publish(target)
                         guard let selection=pump.selection() else{throw Failure.camera}
                         var imageWasSnapshot=false
                         do {
+                            captureOperation="capture"
                             let begin=now,image:Data
                             if snapshotBootstrap,!snapshotAttempted {
                                 snapshotAttempted=true;imageWasSnapshot=true
@@ -347,6 +350,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                             }
                             captures.append((now-begin)*1000)
                             if qrShownAt != nil,(verifiedQRAt==nil || (snapshotBootstrap && !imageWasSnapshot && !streamSourceVerified)) {
+                                captureOperation="verify_own_source"
                                 // Diagnostic fixture validity only. Production
                                 // generic camera delivery never decodes QR data.
                                 let matches=try await Task.detached(priority:.userInitiated) {
@@ -361,6 +365,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                                 if verifiedQRAt==nil {verifiedQRAt=now}
                                 if !imageWasSnapshot {streamSourceVerified=true;item["streamHandoffSourceVerified"]=true}
                             }
+                            captureOperation="send_frame"
                             let receipt=try await phone.frame(image,epoch:epoch,selectedAt:target.selectedAt,isCurrent:{pump.isCurrent(selection) && pump.captureReady(at:ProcessInfo.processInfo.systemUptime)})
                             costs.append(receipt.requestMilliseconds);sent+=1;startTimes.append(iteration)
                             if let dispatch=receipt.requestStartedAt,dispatch.isFinite,dispatch>=iteration,dispatch<=now {
@@ -408,6 +413,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     }
                     item["capturedExpectedQRConfirmed"] = verifiedQRAt != nil
                     if let qrShownAt,let verifiedQRAt {item["qrShownToSourceVerifiedMilliseconds"]=(verifiedQRAt-qrShownAt)*1000}
+                    captureOperation="final_state"
                     let finalState=try await phone.cameraState()
                     item["activeStreamsAtResultCheck"]=finalState.activeStreams
                     item["targetActivityAtResultCheck"]=finalState.activities.contains{$0.displayId==display && $0.package==package}
@@ -446,6 +452,8 @@ private final class BackgroundScanResult:@unchecked Sendable {
                         try await Task.sleep(nanoseconds:250_000_000)
                     }
                 } catch {
+                    if !(error is Failure) {item.merge(BackgroundDiagnosticFailure.fields(error)){_,new in new}}
+                    if stage=="capture-send-recognize",let captureOperation {item["failureOperation"]=captureOperation}
                     if stage=="launch" {
                         item["launcherValidationMilliseconds"]=await phone.lastLauncherValidationMilliseconds
                         item["launcherQueryScoped"]=await phone.lastLauncherQueryScoped
