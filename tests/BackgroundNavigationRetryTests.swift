@@ -2,6 +2,18 @@ import Foundation
 
 @main enum BackgroundNavigationRetryTests {
     @MainActor static func main() throws {
+        precondition(BackgroundScanDiagnostic.validMotionScope(selected:false,alipay:false,wechat:false,abba:true,snapshot:true,expire:true))
+        precondition(BackgroundScanDiagnostic.validMotionScope(selected:true,alipay:true,wechat:false,abba:false,snapshot:false,expire:false))
+        precondition(BackgroundScanDiagnostic.validMotionScope(selected:true,alipay:false,wechat:true,abba:false,snapshot:false,expire:false))
+        precondition(!BackgroundScanDiagnostic.validMotionScope(selected:true,alipay:false,wechat:false,abba:false,snapshot:false,expire:false))
+        precondition(!BackgroundScanDiagnostic.validMotionScope(selected:true,alipay:true,wechat:true,abba:false,snapshot:false,expire:false))
+        precondition(!BackgroundScanDiagnostic.validMotionScope(selected:true,alipay:true,wechat:false,abba:true,snapshot:false,expire:false))
+        precondition(!BackgroundScanDiagnostic.validMotionScope(selected:true,alipay:true,wechat:false,abba:false,snapshot:true,expire:false))
+        precondition(!BackgroundScanDiagnostic.validMotionScope(selected:true,alipay:true,wechat:false,abba:false,snapshot:false,expire:true))
+        func rows(_ counts:[Int])->[[String:Any]]{counts.map{["framesAcknowledgedDuringMotion":$0]}}
+        precondition(GenericMotionDiagnostic.succeeded(rows([0,1,1,0])))
+        precondition(!GenericMotionDiagnostic.succeeded(rows([0,1,0,0])) && !GenericMotionDiagnostic.succeeded(rows([1,1,1,0])))
+        precondition(!GenericMotionDiagnostic.succeeded(rows([0,1,1])))
         func frame(_ receipt:Double,_ launch:Double=1,_ now:Double=1.5)->Bool {
             BackgroundScanDiagnostic.navigationFrameIsCurrent(receivedAt:receipt,startCommandIssuedAt:launch,now:now)
         }

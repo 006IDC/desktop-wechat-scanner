@@ -573,7 +573,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frame.onMoved={ [weak self] _ in
             guard let self else{return}
             self.localScanRect=nil
-            self.cameraPump?.delayCapture(until:ProcessInfo.processInfo.systemUptime+0.18)
+            if self.genericDesktopCamera {
+                self.cameraPump?.invalidateRegion()
+            } else {
+                self.cameraPump?.delayCapture(until:ProcessInfo.processInfo.systemUptime+0.18)
+            }
         }
         frame.show(near:owner.desktopCaptureRect,avoiding:genericDesktopCamera ? owner.window?.frame:nil)
         if !genericDesktopCamera {owner.window?.orderOut(nil)}
@@ -1663,7 +1667,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let rect=localScanFrame?.captureRect ?? captureControl.desktopCaptureRect
                 if localCameraMode,localScanRect != rect {
                     localScanRect=rect
-                    pump.prepareRegion(at:tick,immediateFirst:genericDesktopCamera && !settleInitialGenericCapture)
+                    pump.prepareRegion(at:tick,immediateFirst:genericDesktopCamera && !settleInitialGenericCapture,
+                                       continuousMovement:genericDesktopCamera)
                 }
                 performanceCheck?.recordCaptureRect(rect,at:tick)
                 pump.publish(try DesktopCaptureTarget.current(for:rect))

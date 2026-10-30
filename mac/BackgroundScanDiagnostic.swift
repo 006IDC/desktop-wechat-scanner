@@ -80,6 +80,9 @@ private final class BackgroundScanResult:@unchecked Sendable {
         receivedAt.isFinite && startCommandIssuedAt.isFinite && now.isFinite && startCommandIssuedAt>=0 &&
             receivedAt>=startCommandIssuedAt && receivedAt<=now && now-receivedAt<1
     }
+    static func validMotionScope(selected:Bool,alipay:Bool,wechat:Bool,abba:Bool,snapshot:Bool,expire:Bool)->Bool {
+        !selected || ((alipay != wechat) && !abba && !snapshot && !expire)
+    }
     enum Failure:String,Error {case arguments,existingSession,permission,device,application,mirror,navigation,camera,result,focus,cleanup}
     private final class BoardWindow:NSWindow {
         override var canBecomeKey:Bool {false}
@@ -88,6 +91,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
     private final class Pattern:NSView {
         let image:CGImage
         var showQR=false
+        var motionPhase:Double?
         init(payload:String) throws {
             let filter=CIFilter(name:"CIQRCodeGenerator")!
             filter.setValue(Data(payload.utf8),forKey:"inputMessage")
@@ -98,6 +102,11 @@ private final class BackgroundScanResult:@unchecked Sendable {
         required init?(coder:NSCoder){fatalError("init(coder:) is not supported")}
         override func draw(_ dirtyRect:NSRect) {
             NSColor.white.setFill();bounds.fill()
+            if let motionPhase {
+                NSColor.systemBlue.setFill()
+                NSBezierPath(ovalIn:NSRect(x:bounds.midX+sin(motionPhase*3)*bounds.width*0.18-24,
+                                          y:bounds.midY-24,width:48,height:48)).fill()
+            }
             if showQR,let context=NSGraphicsContext.current?.cgContext {
                 context.interpolationQuality = .none
                 let side=min(bounds.width,bounds.height)*0.64
@@ -248,8 +257,10 @@ private final class BackgroundScanResult:@unchecked Sendable {
         let immediateQR=CommandLine.arguments.contains("--diagnostic-immediate-qr")
         let expireWarmup=CommandLine.arguments.contains("--diagnostic-expire-stream-warmup")
         let probeQR=CommandLine.arguments.contains("--diagnostic-preview-timing")
+        let motion=CommandLine.arguments.contains("--diagnostic-motion")
         guard validScope(alipay:alipayOnly,wechat:wechatOnly,abba:abba),
-              validExperiments(supplyABBA:supplyABBA,snapshotABBA:snapshotABBA,snapshot:initialSnapshot,expire:expireWarmup) else{return 2}
+              validExperiments(supplyABBA:supplyABBA,snapshotABBA:snapshotABBA,snapshot:initialSnapshot,expire:expireWarmup),
+              validMotionScope(selected:motion,alipay:alipayOnly,wechat:wechatOnly,abba:abba,snapshot:initialSnapshot,expire:expireWarmup) else{return 2}
         guard CommandLine.arguments.contains("--diagnostic-usb"),CommandLine.arguments.contains("--locked-applications"),
               let path=option("--background-report"),let resources=Bundle.main.resourceURL else{return 2}
         let frontBefore=NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -266,6 +277,8 @@ private final class BackgroundScanResult:@unchecked Sendable {
         var report:[String:Any]=["test":"background-owned-board-scan","physicalInputMeasured":false,"appControllerTested":false,
             "captureScope":"own-synthetic-board-only","activationRequested":false,"phoneVideoQRProbeEnabled":probeQR,
             "immediateSyntheticQR":immediateQR,"forcedExpiredStreamWarmup":expireWarmup,
+            "programmaticOwnBoardMotion":motion,
+            "responseTimingScope":motion ? "fixture-and-motion-only":"verified-native-scan-tap-and-fixture",
             "userInitiatedActivityRequested":true,"idleSystemSleepAllowed":true]
         let adb=resources.appendingPathComponent("adb/bin/adb"),phone=PhoneSession(resources:resources,adbURL:adb)
         let capture=DesktopCapture()
@@ -333,6 +346,15 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     await capture.setDiagnosticBoard(CGWindowID(window.windowNumber))
                     stage="capture-prepare"
                     let prepare=now;try await capture.prepare();item["capturePrepareMilliseconds"]=(now-prepare)*1000
+                    if motion {
+                        stage="own-board-motion"
+                        item["motionScope"]="own-nonactivating-board-only-not-physical-pointer-or-AppController"
+                        let motionRounds=try await GenericMotionDiagnostic.run(capture:capture,phone:phone,window:window,
+                            display:display,package:package,epoch:epoch,available:{frames.available.isAvailable},
+                            draw:{phase in pattern.motionPhase=phase;pattern.needsDisplay=true;pattern.displayIfNeeded()})
+                        item["motionRounds"]=motionRounds
+                        guard GenericMotionDiagnostic.succeeded(motionRounds) else{throw GenericMotionDiagnostic.Failure.comparison}
+                    }
                     let until=now+9,blankUntil=now+(immediateQR ? 0:1.5)
                     pump.prepareRegion(at:now,immediateFirst:true)
                     var qrShownAt:Double?,firstQRACK:Double?,firstACK:Double?,sent=0,recognized=false
@@ -408,7 +430,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                             if firstACK==nil {
                                 firstACK=now;item["firstACKUsedSnapshot"]=imageWasSnapshot
                                 item["firstCaptureMilliseconds"]=captures.last;item["firstImagePipelineMilliseconds"]=(now-begin)*1000
-                                if let tap {
+                                if let tap,!motion {
                                     let last=(now-tap)*1000,retry=item["navigationScanRetryDelayMilliseconds"] as? Double ?? 0
                                     item["scanTapToFirstACKMilliseconds"]=last;item["firstScanTapToFirstACKMilliseconds"]=last+retry
                                 }
@@ -420,7 +442,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                            match.received>=verifiedQRAt,match.observed<=until,now<=until,(!snapshotBootstrap || streamSourceVerified) {
                             recognized=true;resultFrameTime=match.received;item["qrShownToResultDecodedMilliseconds"]=(match.received-qrShownAt)*1000
                             item["qrShownToResultObservedMilliseconds"]=(match.observed-qrShownAt)*1000
-                            if let tap {
+                            if let tap,!motion {
                                 let last=(match.received-tap)*1000,retry=item["navigationScanRetryDelayMilliseconds"] as? Double ?? 0
                                 item["scanTapToResultDecodedMilliseconds"]=last;item["firstScanTapToResultDecodedMilliseconds"]=last+retry
                             }

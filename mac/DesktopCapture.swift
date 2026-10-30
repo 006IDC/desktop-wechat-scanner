@@ -279,6 +279,11 @@ actor DesktopCapture {
     func setDiagnosticBoard(_ id: CGWindowID?) async {
         await stop(); content=nil; diagnosticBoardID=id
     }
+    func isPreparedDiagnosticBoard(_ id:CGWindowID)->Bool {
+        diagnosticBoardID==id && content?.windows.contains(where:{
+            $0.windowID==id && $0.owningApplication?.processID==ProcessInfo.processInfo.processIdentifier
+        })==true
+    }
 
     func prepare() async throws {
         try checkPermission()

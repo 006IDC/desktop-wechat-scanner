@@ -6,6 +6,16 @@ import ScreenCaptureKit
 enum BackgroundDiagnosticFailure {
     static func fields(_ error:Error)->[String:Any] {
         if error is CancellationError {return ["backendFailureKind":"cancelled"]}
+        if let error=error as? GenericMotionDiagnostic.Failure {
+            let category:String
+            switch error {
+            case .scope:category="motion_scope"
+            case .owner:category="motion_owner"
+            case .source:category="motion_source"
+            case .comparison:category="motion_comparison"
+            }
+            return ["backendFailureKind":category]
+        }
         let system=error as NSError
         if system.domain==SCStreamErrorDomain {
             return ["backendFailureKind":"screen_capture","screenCaptureErrorCode":system.code]

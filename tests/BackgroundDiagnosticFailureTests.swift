@@ -18,6 +18,11 @@ import ScreenCaptureKit
         precondition(BackgroundDiagnosticFailure.fields(cases[3])["backendFailureKind"] as? String=="own_application_metadata")
         precondition(BackgroundDiagnosticFailure.fields(cases[4])["backendFailureKind"] as? String=="cancelled")
         precondition(BackgroundDiagnosticFailure.fields(cases[5])["backendFailureKind"] as? String=="shared_task_root")
+        let motion:[GenericMotionDiagnostic.Failure]=[.scope,.owner,.source,.comparison]
+        let categories=["motion_scope","motion_owner","motion_source","motion_comparison"]
+        for (failure,category) in zip(motion,categories) {
+            precondition(BackgroundDiagnosticFailure.fields(failure)["backendFailureKind"] as? String==category)
+        }
         print("PASS fixed diagnostic categories omit arbitrary error messages and userInfo; no screen/device access")
     }
 }

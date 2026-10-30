@@ -32,18 +32,31 @@ final class CameraPumpMailbox: @unchecked Sendable {
     private var statistics=Statistics()
     private var failure:Error?
     private var captureNotBefore:TimeInterval=0
+    private var hasRegionHistory=false
     private var revision:UInt64=0
     func delayCapture(until time:TimeInterval) {
         lock.lock();defer{lock.unlock()}
-        if admitsFrames {captureNotBefore=time;revision &+= 1}
+        if admitsFrames {hasRegionHistory=true;captureNotBefore=time;revision &+= 1}
+    }
+    /// Invalidate immediately on a move; no worker may reselect the old
+    /// rectangle before the geometry publisher supplies its replacement.
+    func invalidateRegion() {
+        lock.lock();defer{lock.unlock()}
+        guard admitsFrames else{return}
+        hasRegionHistory=true;target=nil;revision &+= 1
     }
     /// The untouched first generic region is already stationary. An earlier
     /// drag/retry fence, or any previously selected region, still requires settling.
-    func prepareRegion(at time:TimeInterval,immediateFirst:Bool) {
+    func prepareRegion(at time:TimeInterval,immediateFirst:Bool,continuousMovement:Bool=false) {
         lock.lock();defer{lock.unlock()}
         guard admitsFrames else{return}
-        let untouched=target==nil && captureNotBefore==0
-        captureNotBefore=max(captureNotBefore,time+(immediateFirst && untouched ? 0:0.18))
+        let untouched = !hasRegionHistory
+        hasRegionHistory=true
+        // Generic camera motion selects the latest ROI without waiting for the
+        // pointer to stop. Explicit pause/refresh fences still take precedence,
+        // and every region change retires an in-flight image as before.
+        let delay=untouched ? (immediateFirst ? 0.0:0.18):(continuousMovement ? 0.0:0.18)
+        captureNotBefore=max(captureNotBefore,time+delay)
         revision &+= 1
     }
     func captureReady(at time:TimeInterval)->Bool {
@@ -53,6 +66,7 @@ final class CameraPumpMailbox: @unchecked Sendable {
     func publish(_ value:DesktopCaptureTarget) {
         lock.lock();defer{lock.unlock()}
         if admitsFrames {
+            hasRegionHistory=true
             if target?.rect != value.rect || target?.displayID != value.displayID ||
                 target?.screenFrame != value.screenFrame || target?.pixelSize != value.pixelSize {revision &+= 1}
             target=value
