@@ -688,23 +688,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             endCameraActivity()
             let previousCamera=cameraLoop;cameraLoop=nil
             paused=true;cameraActive=false;scanGeneration+=1;cameraStateRefreshRequested=false;cameraPump?.stop();cameraPump=nil;previousCamera?.cancel();cameraFPS=0;refresh()
-            await stopNativeScannerOverlay()
+            await stopNativeScannerOverlay(restoringInput:false)
             await capture.stop()
             await previousCamera?.value
             let confirmed:Bool
             do {try await phone.clear(epoch:scanGeneration,requireConnection:true);confirmed=true}
             catch {confirmed=false}
+            if confirmed {cameraWindow?.setPhoneInteractionEnabled(true)}
             cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil;cameraWindowAvailability=nil
             if clearingLocal,!confirmed {localScanClearFailed()}
             return confirmed
         }
     }
-    private func stopNativeScannerOverlay() async {
+    private func stopNativeScannerOverlay(restoringInput:Bool=true) async {
         guard let overlay=nativeScannerOverlay else{return}
         let window=cameraWindow
         nativeScannerOverlay=nil;overlay.freeze();window?.freezeNativeScanner()
         try? await overlay.releaseSource(phone:phone)
-        await overlay.stop();window?.endNativeScanner(retiredFilter:overlay.retiredFrameFilter)
+        await overlay.stop();window?.endNativeScanner(retiredFilter:overlay.retiredFrameFilter,restoringInput:restoringInput)
     }
     private func showApplications(){
         guard connected,!stopping else{return}
@@ -1181,13 +1182,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             throw ScanError("原生预览已因采集或相机会话错误停止，本轮不继续切换应用。")
                         }
                         if check.qrVisible,let pixels=latestPhoneFrame {
-                            let found=try await Task.detached {
-                                try ScannerNavigationOCR.recognize(pixels).contains {
-                                    $0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)
-                                }
+                            let observation=try await Task.detached {
+                                try SyntheticPhoneFrameProbe.inspect(pixels,expected:ScanPerformanceCheck.payload,probeQR:false)
                             }.value
-                            if found {
+                            item["resultOCRChecks"]=(item["resultOCRChecks"] as? Int ?? 0)+1
+                            item["ownResultPrefixSeen"]=(item["ownResultPrefixSeen"] as? Bool == true) || observation.prefixSeen
+                            item["secondaryExactTextMatched"]=(item["secondaryExactTextMatched"] as? Bool == true) || observation.secondaryTextMatched
+                            if let distance=observation.editDistance {item["bestResultEditDistance"]=min(item["bestResultEditDistance"] as? Int ?? distance,distance)}
+                            if observation.textMatched {
                                 item["qrRecognized"]=true
+                                if let shown=check.qrShownAt {item["qrShownToNativeTextObservedMilliseconds"]=(ProcessInfo.processInfo.systemUptime-shown)*1000}
                                 item["returnedToNativeWindow"]=mainControl.window?.isVisible == true && localScanFrame == nil
                                 break
                             }
@@ -1527,6 +1531,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func eligibleCameraActivity(_ state:PhoneCameraState)->PhoneCameraState.Activity? {
         guard state.desktopCameraEnabled==genericDesktopCamera else{return nil}
         let candidate=state.captureActivity()
+        if genericDesktopCamera,nativeInterleavedRequested {
+            nativeCameraScene?.observeDeparture(in:state)
+        }
         if genericDesktopCamera,nativeInterleavedRequested,let scene=nativeCameraScene {
             if !scene.sameSource(in:state) {nativeCameraScene=nil}
             else if let candidate,!scene.permits(candidate,in:state) {return nil}
@@ -1535,10 +1542,32 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func followCameraState(_ state:PhoneCameraState) async {
         guard connected,!stopping,!busy,cameraInvalidation==nil else{return}
-        if let overlay=nativeScannerOverlay,!overlay.matches(state) {
+        if genericDesktopCamera,state.ownerStatus=="request_error" {
+            status("手机相机已暂停","手机取帧通道未完成请求，正在安全断开；重新连接后可恢复。")
+            disconnect(preserveError:true);return
+        }
+        if let overlay=nativeScannerOverlay,overlay.carrierRecoveryRequested {
+            if overlay.matches(state),!overlay.recoverySourceCleared {
+                let generation=scanGeneration
+                do {try await phone.discardFrame(epoch:generation)}
+                catch {localScanClearFailed();return}
+                guard connected,!stopping,scanGeneration==generation,nativeScannerOverlay === overlay else{return}
+                overlay.confirmRecoverySourceClear();cameraStateRefreshRequested=true
+                return // Resume requires a subsequent authenticated state snapshot.
+            }
+            switch overlay.resolveCarrierRecovery(in:state) {
+            case .waiting:return
+            case .resumed:
+                cameraWindow?.setPhoneInteractionEnabled(true);nextCameraGeometry=0;return
+            case .retire:break
+            }
+        }
+        if let overlay=nativeScannerOverlay,overlay.carrierRecoveryRequested || !overlay.matches(state) {
+            if overlay.carrierRecoveryRequested {nativeCameraScene?.interruptCarrier()}
+            nativeCameraScene?.observeDeparture(in:state)
             overlay.noteStateChange(state)
             overlay.freeze();cameraWindow?.freezeNativeScanner();cameraPump?.stop();cameraLoop?.cancel()
-            _=await clearCamera()
+            guard await clearCamera() else {localScanClearFailed();return}
             if connected,!stopping,!Task.isCancelled {status("手机应用","继续在应用内操作；返回扫一扫后会重新取景。")}
             return // Never restart from the same snapshot that retired this scene.
         }
@@ -1707,6 +1736,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             suspendHiddenCamera();return
         }
         let tick=ProcessInfo.processInfo.systemUptime
+        let recoveryWasPending=nativeScannerOverlay?.carrierRecoveryRequested==true
+        if let overlay=nativeScannerOverlay,overlay.requestCarrierRecovery() {
+            // Pause geometry admission and stale pointer input. The existing
+            // worker retires in-flight ROI; a recovered scene must republish.
+            cameraWindow?.freezeNativeScanner()
+            if pump.latest() != nil {pump.invalidateRegion()}
+            if !recoveryWasPending {cameraStateRefreshRequested=true}
+            return
+        }
         if let failure=nativeScannerOverlay?.failure {pump.fail(ScanError(failure))}
         if let previous=cameraTickAt {
             let gap=(tick-previous)*1000
@@ -1765,7 +1803,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             cameraActivity=ProcessInfo.processInfo.beginActivity(options:.userInitiatedAllowingIdleSystemSleep,
                 reason:"实时手机桌面相机")
         }
-        cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0
+        cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0;nextCameraGeometry=0
         let availability=cameraWindowAvailability,nativeSourceLease=nativeScannerOverlay?.sourceLease
         let sourceInterval:TimeInterval=nativeSourceLease != nil ? 1.0/30:0.125
         let pump=CameraPumpMailbox(sourceIsAvailable:{availability?.isAvailable != false}),generation=scanGeneration
@@ -1788,21 +1826,41 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             var lastQRCheck=0.0,savedPattern=false
             var lastDeliveredRevision:UInt64?
             var stateRefreshSent=false
-            while !Task.isCancelled,let selection=pump.selection() {
+            var nativePacer=NativeCapturePacer()
+            while !Task.isCancelled,pump.isAdmittingFrames {
+                guard let selection=pump.selection() else {
+                    try? await Task.sleep(nanoseconds:2_000_000);continue
+                }
                 let target=selection.target
                 let began=ProcessInfo.processInfo.systemUptime
-                if genericFrameMode,let delivered=lastDeliveredRevision,delivered != selection.revision {
-                    do {try await phone.discardFrame(epoch:generation);lastDeliveredRevision=nil}
-                    catch {if pump.latest() != nil {pump.fail(error)};break}
+                if nativeSourceLease != nil,!nativePacer.admit(publishedAt:target.selectedAt,now:began) {
+                    try? await Task.sleep(nanoseconds:2_000_000);continue
                 }
+                let needsDiscard=genericFrameMode && lastDeliveredRevision.map{$0 != selection.revision}==true
                 if localFrameMode,!pump.captureReady(at:began) {
+                    if needsDiscard {
+                        do {try await phone.discardFrame(epoch:generation);lastDeliveredRevision=nil}
+                        catch {if pump.isAdmittingFrames {pump.fail(error)};break}
+                    }
                     try? await Task.sleep(nanoseconds:25_000_000);continue
                 }
+                // A failed clear is fatal below, so no subsequent frame can use
+                // this pending-clear marker without an acknowledged clear.
+                if needsDiscard {lastDeliveredRevision=nil}
                 do {
-                    let image=try await capture.capture(target,maximumDimension:1280)
+                    let prepared=try await CameraFramePreparation.run(image:{
+                        try await capture.capture(target,maximumDimension:1280)
+                    },clear:{
+                        guard needsDiscard else{return 0}
+                        let began=ProcessInfo.processInfo.systemUptime
+                        try await phone.discardFrame(epoch:generation)
+                        return (ProcessInfo.processInfo.systemUptime-began)*1000
+                    })
+                    let image=prepared.image
+                    if needsDiscard {stats.previousImageClearMilliseconds=prepared.clearMilliseconds}
                     stats.captureMilliseconds=(ProcessInfo.processInfo.systemUptime-began)*1000
                     try Task.checkCancellation()
-                    guard pump.latest() != nil else{break}
+                    guard pump.isAdmittingFrames else{break}
                     if localFrameMode,(!pump.captureReady(at:ProcessInfo.processInfo.systemUptime) || !pump.isCurrent(selection)) {continue}
                     var localCodeVisible=false
                     if localFrameMode {
@@ -1831,6 +1889,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let sentAt=ProcessInfo.processInfo.systemUptime
                     if localFrameMode,!pump.isCurrent(selection) {
                         try await phone.discardFrame(epoch:generation)
+                        lastDeliveredRevision=nil
                         stats.dropped+=1;pump.update(stats);continue
                     }
                     if genericFrameMode {lastDeliveredRevision=selection.revision}
@@ -1873,14 +1932,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         while !Task.isCancelled,pump.isCurrent(selection) {
                             try await Task.sleep(nanoseconds:20_000_000)
                         }
-                        guard !Task.isCancelled,pump.latest() != nil else{break}
+                        guard !Task.isCancelled,pump.isAdmittingFrames else{break}
                         try await phone.discardFrame(epoch:generation)
                         stats.localQRSubmitted=false;stats.localSubmission=nil
                         stats.dropped+=1;pump.update(stats)
                         continue
                     }
                 } catch {
-                    guard !Task.isCancelled,pump.latest() != nil else{break}
+                    guard !Task.isCancelled,pump.isAdmittingFrames else{break}
                     if let expired=error as? CameraFrameExpiredError,expired.sourceInvalidated,!stateRefreshSent {
                         stateRefreshSent=true;requestStateRefresh()
                     }
@@ -1898,7 +1957,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     try? await phone.clear(epoch:generation)
                     break
                 }
-                let rest=max(0,(localFrameMode ? (genericFrameMode ? sourceInterval:0.25):1.0/30)-(ProcessInfo.processInfo.systemUptime-began))
+                // Native work is paced by geometry publication above. A second
+                // independent sleep would drift toward the next ROI invalidation.
+                let rest=nativeSourceLease != nil ? 0:max(0,(localFrameMode ? (genericFrameMode ? sourceInterval:0.25):1.0/30)-(ProcessInfo.processInfo.systemUptime-began))
                 if rest>0 {try? await Task.sleep(nanoseconds:UInt64(rest*1_000_000_000))}
             }
         }

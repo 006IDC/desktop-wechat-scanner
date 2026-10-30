@@ -589,24 +589,8 @@ actor PhoneSession {
     static func foregroundComponent(in dump:String,display:Int) -> String? {
         foregroundObservation(in:dump,display:display)?.component
     }
-    /// Preserve the existing foreground choice; the task tag is observation
-    /// only and never changes launch admission or ownership.
     static func foregroundObservation(in dump:String,display:Int)->(component:String,taskID:Int?)? {
-        var current:Int?,resumed:(component:String,taskID:Int?)?
-        for raw in dump.split(separator:"\n") {
-            let line=raw.trimmingCharacters(in:.whitespaces)
-            if line.hasPrefix("Display #") {
-                current=Int(line.dropFirst(9).prefix(while:{$0.isNumber}))
-            } else if current==display && (line.contains("topResumedActivity=") || line.contains("mResumedActivity:")) {
-                let fields=line.split(whereSeparator:{$0==" " || $0=="\t" || $0=="}"})
-                if let component=fields.first(where:{$0.contains("/") && !$0.contains("://")}) {
-                    let taskID=fields.first(where:{$0.hasPrefix("t") && Int($0.dropFirst()) != nil})
-                        .flatMap{Int($0.dropFirst())}.flatMap{(1...Int(Int32.max)).contains($0) ? $0:nil}
-                    resumed=(String(component),taskID)
-                }
-            }
-        }
-        return resumed
+        ForegroundActivityObservation.select(in:dump,display:display).map{($0.component,$0.taskID)}
     }
     func moveWechat(toVirtualDisplay:Bool) throws {
         guard let displayID else {throw ScanError("手机未连接。")}
@@ -830,8 +814,22 @@ actor PhoneSession {
                 }
                 let observation=Self.foregroundObservation(in:activityDump,display:target),foreground=observation?.component
                 let foregroundTask=observation.flatMap{row in row.taskID.flatMap{id in after.first(where:{$0.id==id})}}
+                let explicit=ForegroundActivityObservation.select(in:activityDump,display:target,onlyDisplayTop:true)
+                let legacyConfirmed=OwnedTaskMove.applicationIsForeground(component:foreground,taskID:observation?.taskID,
+                        in:after,packageName:app.packageName,target:target)
+                var callbackTop:String?
+                if !legacyConfirmed,explicit?.userID==0,explicit?.component.hasPrefix(app.packageName+"/")==true {
+                    callbackTop=(try? cameraState())?.activities.first(where:{$0.displayId==target})?.component
+                }
+                let corroborated=ForegroundActivityObservation.corroborates(top:explicit?.component,callback:callbackTop,package:app.packageName,topUserID:explicit?.userID) &&
+                    OwnedTaskMove.applicationIsForeground(component:explicit?.component,taskID:explicit?.taskID,
+                        in:after,packageName:app.packageName,target:target)
+
                 lastApplicationLaunchEvidence=[
                     "foregroundKind":foreground.map{$0.hasPrefix(app.packageName+"/") ? 1:2} ?? 0,
+                    "explicitDisplayTopKind":explicit.map{$0.component.hasPrefix(app.packageName+"/") ? 1:2} ?? 0,
+                    "callbackTopKind":callbackTop.map{$0.hasPrefix(app.packageName+"/") ? 1:2} ?? 0,
+                    "corroboratedDisplayTop":corroborated ? 1:0,
                     "foregroundTaskPlacementKind":foregroundTask.map{$0.display==target ? 1:2} ?? 0,
                     "foregroundTaskPackageAgreementConfirmed":foregroundTask.map{task in task.packageNames.contains(where:{foreground?.hasPrefix($0+"/")==true}) ? 1:0} ?? 0,
                     "targetTaskCount":after.filter{$0.display==target}.count,
@@ -841,9 +839,9 @@ actor PhoneSession {
                 // Preserve newly discovered task recovery before honoring a
                 // cancellation that arrived during the blocking snapshot.
                 try Task.checkCancellation()
-                if OwnedTaskMove.applicationIsForeground(component:foreground,taskID:observation?.taskID,
-                        in:after,packageName:app.packageName,target:target) {
+                if legacyConfirmed || corroborated {
                     lastLaunchStages["confirmed"]=1
+                    lastLaunchStages["corroboratedDisplayTop"]=corroborated ? 1:0
                     lastApplicationLaunchEvidence=nil
                     return
                 }

@@ -14,6 +14,7 @@ final class CameraPumpMailbox: @unchecked Sendable {
         var requestMilliseconds=0.0,actorWaitMilliseconds=0.0
         var sendMilliseconds=0.0,responseWaitMilliseconds=0.0,responseBodyMilliseconds=0.0
         var fps=0.0,captureMilliseconds=0.0,transferMilliseconds=0.0,maximumGapMilliseconds=0.0
+        var previousImageClearMilliseconds=0.0
     }
     struct Snapshot {
         let statistics:Statistics
@@ -34,6 +35,9 @@ final class CameraPumpMailbox: @unchecked Sendable {
     private var captureNotBefore:TimeInterval=0
     private var hasRegionHistory=false
     private var revision:UInt64=0
+    /// A moved ROI can temporarily be absent while this pump remains live.
+    /// Never confuse that publication gap with stop/failure/source loss.
+    var isAdmittingFrames:Bool {lock.lock();defer{lock.unlock()};return admitsFrames}
     func delayCapture(until time:TimeInterval) {
         lock.lock();defer{lock.unlock()}
         if admitsFrames {hasRegionHistory=true;captureNotBefore=time;revision &+= 1}

@@ -7,6 +7,7 @@ struct NativeCameraScene {
     enum PreparationRecovery {case stop,retryTransition,showApplication}
     private let stream:Int,owner:Int,display:Int,package:String
     private var component:String
+    private var carrierInterrupted=false
     private(set) var verified=false
     private(set) var startupTransitions=0
 
@@ -22,8 +23,14 @@ struct NativeCameraScene {
         // Global binding/capture revisions can change because another window
         // changed. Retain the scene while this binding and camera source live.
     }
+    mutating func interruptCarrier() {carrierInterrupted=true}
+    mutating func observeDeparture(in state:PhoneCameraState) {
+        guard carrierInterrupted,let activity=state.activities.first(where:{$0.displayId==display}),
+              activity.component != component else{return}
+        carrierInterrupted=false
+    }
     func permits(_ activity:PhoneCameraState.Activity,in state:PhoneCameraState)->Bool {
-        !sameSource(in:state) || (activity.displayId==display && activity.package==package && activity.component==component)
+        !sameSource(in:state) || (!carrierInterrupted && activity.displayId==display && activity.package==package && activity.component==component)
     }
     mutating func markVerified(in state:PhoneCameraState)->Bool {
         guard sameSource(in:state),let activity=state.captureActivity(),permits(activity,in:state) else{return false}
@@ -43,5 +50,18 @@ struct NativeCameraScene {
         if retryStartupTransition(in:state) {return .retryTransition}
         if verified,let activity=state.captureActivity(),!permits(activity,in:state) {return .showApplication}
         return .stop
+    }
+}
+
+/// A carrier freshness timeout is a presentation observation, not proof that
+/// camera ownership ended. Wait briefly for fresh pixels while input is gated.
+struct NativeCarrierRecovery {
+    enum Decision {case waiting,resumed,retire}
+    let began:TimeInterval
+    init(at now:TimeInterval) {began=now}
+    func decide(at now:TimeInterval,matches:Bool,freshCarrier:Bool,freshPresentation:Bool=false)->Decision {
+        guard now.isFinite,began.isFinite,now>=began,matches else{return .retire}
+        if freshCarrier && freshPresentation {return .resumed}
+        return now-began<0.6 ? .waiting:.retire
     }
 }

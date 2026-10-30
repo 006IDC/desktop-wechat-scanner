@@ -865,11 +865,11 @@ final class ControlWindowController: NSWindowController {
         overlay.startPresentation()
     }
     func freezeNativeScanner() {holder.phone.interactionEnabled=false}
-    func endNativeScanner(retiredFilter:((CVPixelBuffer)->Bool)?=nil) {
+    func endNativeScanner(retiredFilter:((CVPixelBuffer)->Bool)?=nil,restoringInput:Bool=true) {
         holder.phone.retiredNativeFrameFilter=retiredFilter
         setScannerFloating(false)
         holder.phone.nativeScannerFrames=nil;holder.phone.nativeScannerResize=nil;holder.phone.setNativeScannerLayer(nil)
-        holder.phone.interactionEnabled=true;background.nativeScannerPreview=false
+        holder.phone.interactionEnabled=restoringInput;background.nativeScannerPreview=false
         window?.titlebarAppearsTransparent=false
         window?.isOpaque=true;window?.backgroundColor = .windowBackgroundColor
     }

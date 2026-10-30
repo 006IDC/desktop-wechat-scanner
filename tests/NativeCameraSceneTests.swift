@@ -25,6 +25,13 @@ import Foundation
         precondition(attempt.recoverPreparation(in:result) == .showApplication,"A no-overlay result failure latched off automatic resume")
         precondition(attempt.permits(scanner.captureActivity()!,in:scanner))
         precondition(attempt.recoverPreparation(in:scanner) == .stop,"An unrelated failure retried forever on the same scene")
+        attempt.interruptCarrier()
+        precondition(!attempt.permits(scanner.captureActivity()!,in:scanner),"Carrier loss immediately re-probed the same opaque scene")
+        attempt.observeDeparture(in:scanner)
+        precondition(!attempt.permits(scanner.captureActivity()!,in:scanner))
+        attempt.observeDeparture(in:result)
+        precondition(!attempt.permits(result.captureActivity()!,in:result))
+        precondition(attempt.permits(scanner.captureActivity()!,in:scanner),"Returning from the original App result never resumed")
         let unrelatedBinding=try state("Result",binding:9,capture:13)
         precondition(!attempt.permits(unrelatedBinding.captureActivity()!,in:unrelatedBinding),"Another window's binding erased result suppression")
         let unrelatedForeground=try PhoneCameraState.decode(JSONSerialization.data(withJSONObject:["version":1,"generation":4,"ownerGeneration":6,
@@ -38,6 +45,14 @@ import Foundation
         }
         let manual=NativeCameraScene(state:result)!
         precondition(manual.permits(result.captureActivity()!,in:result),"An explicit new probe could not select another scene")
+        let recovery=NativeCarrierRecovery(at:10)
+        precondition(recovery.decide(at:10.1,matches:true,freshCarrier:false) == .waiting)
+        precondition(recovery.decide(at:10.1,matches:true,freshCarrier:true,freshPresentation:true) == .resumed)
+        precondition(recovery.decide(at:10.1,matches:true,freshCarrier:true) == .waiting,"Decode without presentation reopened input")
+        precondition(recovery.decide(at:10.1,matches:false,freshCarrier:true) == .retire)
+        precondition(recovery.decide(at:10.7,matches:true,freshCarrier:false) == .retire)
+        precondition(recovery.decide(at:9,matches:true,freshCarrier:true) == .retire)
+        precondition(recovery.decide(at:.nan,matches:true,freshCarrier:true) == .retire)
         print("PASS native scene result suppression, bounded startup transition, resume and source retirement")
     }
 }

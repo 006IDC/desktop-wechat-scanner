@@ -99,9 +99,43 @@ public final class LiveCameraServer {
     private final ScheduledExecutorService painter = Executors.newSingleThreadScheduledExecutor();
     private final ExecutorService acceptor = Executors.newSingleThreadExecutor();
     private final ActivityTaskDump activityTaskDump = new ActivityTaskDump();
-    // At most one queued paint besides the one currently running. Every paint,
-    // including the idle refresh, stays on this one executor: never parallel Canvas.
+    // Legacy refreshes coalesce to one queued pass. Desktop-camera paints
+    // instead follow actual capture requests, capped at 128 pending tasks.
+    // Both paths share one painter: never concurrent Canvas access.
     private final AtomicBoolean paintPending = new AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicInteger requestPaints = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger requestPeak = new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicLong cameraRequests = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong requestOverflows = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong requestPosts = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong requestIdentitySkips = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong requestPostFailures = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong requestRejected = new java.util.concurrent.atomic.AtomicLong();
+    private final Object requestTimingLock = new Object();
+    private final java.util.ArrayDeque<Double> requestPostTimes = new java.util.ArrayDeque<>();
+    private void recordRequestedPost(long began) {
+        double elapsed = (System.nanoTime() - began) / 1_000_000.0;
+        requestPosts.incrementAndGet();
+        synchronized (requestTimingLock) {
+            if (requestPostTimes.size() == 128) requestPostTimes.removeFirst();
+            requestPostTimes.addLast(elapsed);
+        }
+    }
+    private double requestPostPercentile() {
+        synchronized (requestTimingLock) {
+            if (requestPostTimes.isEmpty()) return 0;
+            double[] values = requestPostTimes.stream().mapToDouble(Double::doubleValue).toArray();
+            Arrays.sort(values);return values[(int) Math.ceil(values.length * 0.95) - 1];
+        }
+    }
+    private final AtomicBoolean requestDriverFailed = new AtomicBoolean();
+    private final CameraCallbackDispatcher cameraCallbacks = new CameraCallbackDispatcher(128, this::failRequestDriver);
+    private void failRequestDriver() {
+        if (!desktopHomeRequested || stopping || !requestDriverFailed.compareAndSet(false, true)) return;
+        long invalidation;
+        synchronized (stateLock) {invalidation = markDesktopFrameInvalidLocked();}
+        discardObsoleteDesktopFrame(invalidation);
+    }
     private final AtomicBoolean clearPending = new AtomicBoolean();
     private volatile long lastCameraUpdateNanos = System.nanoTime();
     private volatile boolean stopping;
@@ -384,7 +418,7 @@ public final class LiveCameraServer {
 
     // Call only under stateLock.
     private int authorizedDesktopScannerLocked() {
-        if (!cameraOwnerKnown || streams.isEmpty()) return -1;
+        if (!cameraOwnerKnown || requestDriverFailed.get() || streams.isEmpty()) return -1;
         return desktopCameraRouting.enabled()
                 ? desktopCameraRouting.authorizedDisplay(cameraOwner, topActivities, primaryOwnedDisplayId, appDisplays)
                 : scannerDisplayForOwner(cameraOwner, topActivities, primaryOwnedDisplayId, appDisplays);
@@ -609,6 +643,8 @@ public final class LiveCameraServer {
                         }
                         discardObsoleteDesktopFrame(invalidation);
                         requestPaint();
+                    } else if ("onProcessCaptureRequest".equals(method.getName()) && desktopHomeRequested && args != null && args.length >= 1 && args[0] instanceof Integer) {
+                        requestDesktopFrame((Integer) args[0]);
                     } else if ("onStreamClosed".equals(method.getName())) {
                         long invalidation = -1;
                         synchronized (stateLock) {
@@ -628,7 +664,9 @@ public final class LiveCameraServer {
                 1280, 720, PixelFormat.RGBA_8888, 30);
         call(builder, "setLensFacing", new Class[]{int.class}, CameraMetadata.LENS_FACING_BACK);
         call(builder, "setSensorOrientation", new Class[]{int.class}, 90);
-        call(builder, "setVirtualCameraCallback", new Class[]{Executor.class, callbackClass}, callbacks, callback);
+        // Preserve lifecycle/request order on a separate bounded serial lane;
+        // neither Canvas work nor the activity callback backlog runs here.
+        call(builder, "setVirtualCameraCallback", new Class[]{Executor.class, callbackClass}, cameraCallbacks, callback);
         Object config = call(builder, "build", new Class[]{});
         log("setup_phase", "camera_register");
         camera = call(device, "createVirtualCamera", new Class[]{configClass}, config);
@@ -832,7 +870,32 @@ public final class LiveCameraServer {
         }
     }
 
+    private void requestDesktopFrame(int streamId) {
+        Surface requested = streams.get(streamId);
+        if (stopping || requestDriverFailed.get() || requested == null) return;
+        cameraRequests.incrementAndGet();
+        int count = requestPaints.incrementAndGet();
+        if (count > 128) {requestPaints.decrementAndGet();requestOverflows.incrementAndGet();failRequestDriver();return;}
+        requestPeak.accumulateAndGet(count, Math::max);
+        long requestedAt = System.nanoTime();
+        try {
+            painter.execute(() -> {
+                try {
+                    if (stopping || streams.get(streamId) != requested) {requestIdentitySkips.incrementAndGet();return;}
+                    long before = requestPosts.get();paint(requested, requestedAt);
+                    CameraRequestOutcome.Value outcome = CameraRequestOutcome.classify(stopping,
+                            streams.get(streamId) == requested, requested.isValid(), requestPosts.get() != before);
+                    if (outcome == CameraRequestOutcome.Value.RETIRED) requestIdentitySkips.incrementAndGet();
+                    else if (outcome == CameraRequestOutcome.Value.FAILED) {requestPostFailures.incrementAndGet();failRequestDriver();}
+                } finally {requestPaints.decrementAndGet();}
+            });
+        } catch (RejectedExecutionException closed) {requestPaints.decrementAndGet();requestRejected.incrementAndGet();failRequestDriver();}
+    }
+
     private void requestPaint() {
+        // Desktop camera production follows actual Camera2 demand. Control
+        // updates invalidate memory immediately; their ACK drains prior paints.
+        if (desktopHomeRequested) return;
         if (stopping || !paintPending.compareAndSet(false, true)) return;
         try {
             painter.execute(() -> {
@@ -848,8 +911,10 @@ public final class LiveCameraServer {
         }
     }
 
-    private void paint(Surface surface) {
-        if (stopping || !surface.isValid()) return;
+    private void paint(Surface surface) {paint(surface, 0);}
+
+    private void paint(Surface surface, long requestedAt) {
+        if (stopping || (desktopHomeRequested && requestDriverFailed.get()) || !surface.isValid()) return;
         Canvas canvas = null;
         CameraPaintTiming.Ticket paintedTicket = null;
         long lockBegan = System.nanoTime(), locked = 0, drawn = 0, paintedGeneration = -1;
@@ -911,6 +976,7 @@ public final class LiveCameraServer {
         } finally {
             if (canvas != null) try {
                 surface.unlockCanvasAndPost(canvas);
+                if (requestedAt > 0) recordRequestedPost(requestedAt);
                 synchronized (cameraLock) { previewInterleave.posted(previewPhase, paintedGeneration, paintedEpoch); }
                 if (drewSource && (!desktopHomeRequested || paintedGeneration == cameraStateGeneration))
                     cameraPaintTiming.posted(paintedTicket, lockBegan, locked, drawn, System.nanoTime());
@@ -1330,6 +1396,17 @@ public final class LiveCameraServer {
     private byte[] liveState() throws Exception {
         JSONObject state = new JSONObject().put("version", 1).put("desktopHome", desktopHomeRequested);
         state.put("interleavedPreviewSupported", desktopHomeRequested && realtimeVideoRequested && !mirrorOnlyRequested);
+        state.put("requestedCameraFrames", cameraRequests.get());
+        state.put("pendingRequestedPaints", requestPaints.get());
+        state.put("requestedPaintPeak", requestPeak.get());
+        state.put("requestedPaintOverflows", requestOverflows.get());
+        state.put("requestedPaintPosts", requestPosts.get());
+        state.put("requestedPaintIdentitySkips", requestIdentitySkips.get());
+        state.put("requestedPaintFailures", requestPostFailures.get());
+        state.put("requestedPaintRejected", requestRejected.get());
+        // Rolling last 128 successful callback-to-post samples, not a phase
+        // percentile. Pending is instantaneous, not shutdown/drain evidence.
+        state.put("requestToPostP95Milliseconds", requestPostPercentile());
         state.put("solidCalibrationSupported", desktopHomeRequested && realtimeVideoRequested && !mirrorOnlyRequested);
         JSONArray activities = new JSONArray();
         synchronized (stateLock) {
@@ -1342,8 +1419,8 @@ public final class LiveCameraServer {
             state.put("desktopCameraBindings",bindings);
             state.put("generation", streamGeneration).put("captureGeneration", cameraStateGeneration).put("activeStreams", streams.size());
             state.put("cameraOwner", cameraOwner == null ? JSONObject.NULL : cameraOwner);
-            state.put("ownerKnown", cameraOwnerKnown).put("ownerGeneration", ownerGeneration);
-            state.put("ownerStatus", ownerStatus)
+            state.put("ownerKnown", cameraOwnerKnown && !requestDriverFailed.get()).put("ownerGeneration", ownerGeneration);
+            state.put("ownerStatus", requestDriverFailed.get() ? "request_error" : ownerStatus)
                     .put("ownerErrorClass", ownerErrorClass == null ? JSONObject.NULL : ownerErrorClass)
                     .put("ownerErrorDetail", ownerErrorDetail == null ? JSONObject.NULL : ownerErrorDetail)
                     .put("ownerVisibleCameraCount", ownerVisibleCameraCount)
@@ -1601,6 +1678,7 @@ public final class LiveCameraServer {
             cameraManager = null;
         } catch (Exception e) { clean = false; log("cleanup_error", "camera owner listener cleanup failed"); }
         synchronized (stateLock) { cameraOwner = null; cameraOwnerKnown = false; }
+        cameraCallbacks.close();
         painter.shutdownNow();
         for (Map.Entry<Integer, DirectDisplayStream> entry : directStreams.entrySet()) {
             DirectDisplayStream stream = entry.getValue();

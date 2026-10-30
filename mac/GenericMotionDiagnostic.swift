@@ -45,7 +45,7 @@ import AppKit
                     }
                 } catch {pump.fail(error);throw error}
             }
-            var sent=0,dropped=0,late=0,costs=[Double](),first:Double?
+            var sent=0,dropped=0,late=0,costs=[Double](),first:Double?,nativePacer=NativeCapturePacer()
             do {
                 while now<until {
                     try Task.checkCancellation();guard available() else{throw Failure.source}
@@ -54,6 +54,9 @@ import AppKit
                         try await Task.sleep(nanoseconds:10_000_000);continue
                     }
                     let iteration=now
+                    if nativeLease != nil,!nativePacer.admit(publishedAt:selection.target.selectedAt,now:iteration) {
+                        try await Task.sleep(nanoseconds:2_000_000);continue
+                    }
                     do {
                         let image=try await capture.capture(selection.target,maximumDimension:720)
                         guard now<until else{break}
@@ -65,7 +68,7 @@ import AppKit
                         }else{late+=1}
                     }catch is DesktopCaptureTransientError {dropped+=1}
                     catch is CameraFrameExpiredError {dropped+=1}
-                    let rest=(nativeLease == nil ? 0.125:1.0/30)-(now-iteration)
+                    let rest=nativeLease == nil ? 0.125-(now-iteration):0
                     if rest>0{try await Task.sleep(nanoseconds:UInt64(rest*1_000_000_000))}
                 }
             } catch {

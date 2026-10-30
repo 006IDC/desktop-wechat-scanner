@@ -1071,3 +1071,29 @@ CMD32 的启用、退出与只读绘制计数，CMD33 的相位校准，以及 C
 `CameraFrameExpiredError` 区分本机几何过期与认证相机通道的3种明确源失效。当前 worker 首次收到后者时只请求一次提前查询；MainActor 验证连接、scanGeneration 与 pump 实例一致后才接纳，旧会话的迟到错误不影响新窗口。查询仍由原状态循环完成，保持串行；清相机时清标记。普通0.25秒活动相机查询节奏不增加，没有用更高频轮询堆响应。
 
 后台运动验证现在传入实际 native lease；原生模式30Hz上限，普通模式仍8Hz。自有板在后方移动，不能接收键盘/鼠标，不激活应用；只测几何选择、实际供图与所有权，不作为物理拖动或 AppController 可见挂载证据。诊断另记首个认证源失效距测试码显示的时间，便于区分相机路由退出与最终文本结果；失效本身不能证明识码。
+
+
+## build71 移动捕获与旧图清除并行（2026-10-31）
+
+新增受限私有窗口适配器，保留完整 AppController 流程，只将自有测试窗口固定在用户窗口后方、禁止取焦点、忽略鼠标；禁用激活和悬浮框回退，测试板使用独立随机文本。70 的一次真实微信流程已自动挂载原生层、识码、返回原App并清帧，内部扫码点按到挂载约1553ms，移动供图约8.86fps。无并行编译的复测约7.00fps且在识码阶段记录pumpFailure；只缩小到720分析源后约7.35fps，仍出现同类失败，因此未把降分辨率作为修复。后置窗口的呈现时序受遮挡影响，不作为物理拖动延迟或可见流畅度验收。
+
+纯合成JPEG A/B/B/A显示：1280长边旧CGImage/ImageIO路径中位约21.7/20.1ms，CoreImage直接表示约10.8/10.3ms；两者输出595×1280，sRGB与质量0.88相同。生产保持原裁剪与白padding，改用直接JPEG表示；Retina/偏移/部分越界/全越界/白边/上下方向、取消及500ms有效期回归通过。该数值是图像编码微基准，不是整链路提速倍数。
+
+原生worker按当前不超过30Hz的几何发布时间启动捕获，只接纳新发布且不超过12ms的快照；不再加另一套独立30Hz休眠，避免漂移到下次区域失效前才开始编码。`isAdmittingFrames` 区分活跃但暂缺ROI和stop/失效；前者等2ms后重新读取，后者退出。旧revision、窗口/相机所有权、500ms帧龄与source lease围栏保留。新loop首先发布几何。直接JPEG+发布节奏的私有完整控制器回归已通过，移动约7.86fps、挂载约1273ms，结果页仍持1个相机流但正确还原；仍需继续降低串行等待。
+
+`CameraFramePreparation` 将旧图清除与本机图像生成作为两个结构化子任务并行，始终先确认clear ACK再返回图像。clear失败包装为不可重试失败，取消并等待图像子任务；图像先失败仍等clear完成。纯异步测试覆盖并行开始、clear先于图像接纳、错误优先级与子任务取消收束。post-ACK几何失效成功清帧后同步清除lastDeliveredRevision，避免下一轮重复清帧。`movementLastClearAtFrameAckP95Milliseconds` 采样于观察到的新图像ACK，表示当时最近一次清图耗时，不是全部清图操作的P95。
+
+
+71 的完整控制器后台对照将绘制请求由“定时器＋每次供图＋每次清图”改为 Android `onProcessCaptureRequest` 驱动；所有 Canvas 仍在单一 painter。早期 direct executor 仅作私有实验，正式实现使用独立有界串行 `CameraCallbackDispatcher`，保留 configure/request/close 的入队顺序，并避免 Activity 回调排队。回调与绘制队列各最多128待处理任务；溢出/拒绝/仍属当前Surface的post失败使capture generation/lease失效，状态ownerKnown为false，Mac安全断开、重连后恢复。关闭或替换后丢弃旧Surface请求属于预期退休，不将其作为新stream的故障。纯JVM验证串行顺序、饱和fail-once，以及已有clear/post、source lease和交错帧有效期契约。
+
+私有实际request实验中，微信移动约18.20fps，5.52秒窗口实际请求160次、成功post增加160、峰值pending为2；overflow/identitySkip/postFailure/rejected增量均0。旧多触发器一次相同完整控制器双App运行约微信4.68fps、支付宝7.67fps，独立33ms时钟对照约支付宝20.35fps、微信16.05fps；单次数字有波动，不等于物理拖动、视觉FPS或固定倍数提速。direct请求实验在carrier过期时仍触发旧pumpFailure，随后修复该分支后，微信约15.19fps且随机纯文本严格识别成功；支付宝约15.38fps但测试码出现前提前退出，失败记录保留，继续排查短暂载体缺失。
+
+`NativeCarrierRecovery` 将取景标记超过300ms未更新与真实来源失效区分：停止ROI发布、冻结点击，首先确认同epoch旧图discard ACK；只有随后认证状态仍匹配、标记新鲜且discard ACK后本地接收的帧已获有效drawable呈现时间，才恢复输入和几何发布。不是decode回调或GPU完成即解锁；本地receipt时间不证明Android在ACK后才生成像素，ACK也不能撤回已编码帧。最多额外等600ms；不匹配或持续缺失则清理并退回原App，不在同一不透明场景立即重校准。渲染线程此时保留生命周期，但不再提交过期标记帧；旧drawable可能暂时保留，输入保持冻结。`clearCamera` 的原生层拆卸不恢复输入，epoch clear ACK后才恢复，失败断连。纯测试覆盖decode但未呈现、零/未来时间、晚到旧drawable、认证不匹配和等待超时。
+
+
+71 新增的启动确认只在旧前台记录未通过时读取唯一display顶层记录；explicit ActivityRecord 必须有有效 taskID、u0，且手机认证Activity回调的canonical component一致，再通过原有完整任务快照的target/user/root检查。畸形、多条top、其他用户、callback不一致均拒绝。旧nested-row选择保留，后续新镜像帧readiness不变；该交叉确认不等于像素已显示。
+
+最终候选的首轮独立完整控制器双App均严格识码、原生结果与清图通过；挂载约微信1301/支付宝1296ms，移动供图约19.67/20.75fps，峰值request pending为2、运动窗口各请求/成功post增加161/162且异常计数增量均0，已有录屏权限true、前台应用不变。独立复测挂载约1265/1071ms、供图约18.68/23.17fps，均正常退出扫码但14秒内未获严格文本见证，保留为失败；后续将完整控制器的简化contains判断统一为已有SyntheticPhoneFrameProbe：同一行相邻文本组完整匹配，必要时使用独立无语言修正ASCII top-1复核，未向OCR传入预期文本，也不模糊接受近似字符。新增前缀命中布尔值及编辑距离数字（不含识别正文）和测试板启用至原生文本观察的时间，继续区分传输与识别。
+
+
+共享严格识别器后的双App两轮均通过完整流程。首轮微信/支付宝均由独立ASCII top-1完整匹配，中文通道编辑距离为1，证实简化中文单通道会误判；文本观察耗时约3593/2884ms，挂载1481/1041ms，供图15.04/20.52fps（该轮前段与合成Vision自测存在负载重叠，不作性能基准）。无并行编译/合成测试负载的独立复测两App均主通道完整精确匹配、编辑距离0，挂载约1297/1240ms、供图21.87/22.39fps、测试板启用QR至原生文本观察约2203/2099ms。两轮运动窗口request队列异常增量均0；录屏权限true、用户前台不变、清图ACK与会话清理通过。时间是内部按钮派发至层挂载、Mac合成板QR启用至OCR观察，仍不是物理鼠标延迟；未操作用户前台或登录/支付结果。

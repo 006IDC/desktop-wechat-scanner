@@ -249,12 +249,13 @@ final class DesktopFrameEncoder: @unchecked Sendable {
             : image.cropped(to:visible).composited(over:white).cropped(to:crop)
         let normalized=padded.transformed(by:CGAffineTransform(translationX:-crop.minX,y:-crop.minY))
         let scaled=normalized.transformed(by:CGAffineTransform(scaleX:size.width/crop.width,y:size.height/crop.height))
-        guard let result=context.createCGImage(scaled,from:CGRect(origin:.zero,size:size),format:.RGBA8,colorSpace:colorSpace) else {throw ScanError("无法读取扫码区域。")}
-        let data=NSMutableData()
-        guard let destination=CGImageDestinationCreateWithData(data,UTType.jpeg.identifier as CFString,1,nil) else {throw ScanError("无法编码桌面画面。")}
-        CGImageDestinationAddImage(destination,result,[kCGImageDestinationLossyCompressionQuality:0.88] as CFDictionary)
-        guard CGImageDestinationFinalize(destination) else {throw ScanError("桌面图像编码失败。")}
-        return data as Data
+        // Render directly to JPEG; avoid materializing an intermediate RGBA
+        // CGImage and copying it back into a second image encoder.
+        guard let data=context.jpegRepresentation(of:scaled.cropped(to:CGRect(origin:.zero,size:size)),colorSpace:colorSpace,
+            options:[CIImageRepresentationOption(rawValue:kCGImageDestinationLossyCompressionQuality as String):0.88]) else {
+            throw ScanError("桌面图像编码失败。")
+        }
+        return data
     }
 }
 

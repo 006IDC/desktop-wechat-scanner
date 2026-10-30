@@ -40,6 +40,29 @@ import QuartzCore
     private(set) var frozen=false
     private var hidesCalibrationFrames=false
     private var renderFailure:String?
+    // Carrier loss can mean that the original App covered/left its camera.
+    // Retire the transparent presentation, rather than classifying it as a
+    // transport/GPU failure. The controller still clears the source before input.
+    private var carrierRecovery:NativeCarrierRecovery?
+    private(set) var recoverySourceCleared=false
+    private var recoveryClearedAt:TimeInterval?
+    func confirmRecoverySourceClear() {if carrierRecovery != nil {recoveryClearedAt=ProcessInfo.processInfo.systemUptime;recoverySourceCleared=true}}
+    var carrierRecoveryRequested:Bool {carrierRecovery != nil}
+    @discardableResult
+    func requestCarrierRecovery()->Bool {
+        if carrierRecoveryRequested {return true}
+        guard interleaved,renderFailure==nil,decodedFrameDelivery,
+              !keyGate.current(at:ProcessInfo.processInfo.systemUptime) else{return false}
+        recoveryClearedAt=nil;recoverySourceCleared=false;carrierRecovery=NativeCarrierRecovery(at:ProcessInfo.processInfo.systemUptime);return true
+    }
+    func resolveCarrierRecovery(in state:PhoneCameraState)->NativeCarrierRecovery.Decision {
+        let decision=carrierRecovery?.decide(at:ProcessInfo.processInfo.systemUptime,
+            matches:matches(state) && renderFailure==nil && decodedFrameDelivery,
+            freshCarrier:recoverySourceCleared && keyGate.current(at:ProcessInfo.processInfo.systemUptime),
+            freshPresentation:recoveryClearedAt.map{statistics.hasPresentedSource(after:$0)} ?? false) ?? .retire
+        if decision == .resumed {carrierRecovery=nil}
+        return decision
+    }
     var failure:String? {
         if decodedBinding != nil,!decodedFrameDelivery {return "原生视频会话已变化。"}
         if interleaved,!keyGate.current(at:ProcessInfo.processInfo.systemUptime) {return "原生相机画面已变化，已停止透明预览。"}
@@ -67,6 +90,15 @@ import QuartzCore
         let value=error as NSError
         termination["errorDomain"]=value.domain.hasPrefix("com.apple.") || value.domain=="NSPOSIXErrorDomain" ? value.domain:"application_error"
         termination["errorCode"]=value.code
+        if let changed=error as? CameraFrameExpiredError {termination["sourceInvalidated"]=changed.sourceInvalidated}
+        if let scan=error as? ScanError {
+            switch scan.message {
+            case "原生相机画面已变化，已停止透明预览。":termination["failureKind"]="carrierExpired"
+            case "原生扫码显示中断。":termination["failureKind"]="nativeRenderer"
+            case "原生视频会话已变化。":termination["failureKind"]="decodedBinding"
+            default:break
+            }
+        }
         if let transient=error as? DesktopCaptureTransientError {
             switch transient {
             case .frameExpired:termination["transient"]=1
@@ -342,9 +374,9 @@ import QuartzCore
         layer.allowsNextDrawableTimeout=true;layer.displaySyncEnabled=displaySyncEnabled
         let input=frames,statistics=statistics,gate=keyGate
         var lastRenderedRevision=0 // Only the dedicated render run loop accesses this.
-        let driver=NativeMetalDisplayDriver(layer:layer,active:{input.latest().2 && gate.current(at:ProcessInfo.processInfo.systemUptime)},render:{drawable in
+        let driver=NativeMetalDisplayDriver(layer:layer,active:{input.latest().2},render:{drawable in
             let sample=input.latest()
-            guard sample.2,sample.0 != lastRenderedRevision,let pixels=sample.1 else{return}
+            guard gate.current(at:ProcessInfo.processInfo.systemUptime),sample.2,sample.0 != lastRenderedRevision,let pixels=sample.1 else{return}
             _=try renderer.present(black:CIImage(cvPixelBuffer:pixels),drawable:drawable,stats:statistics,
                                    sourceReceivedAt:sample.3)
             lastRenderedRevision=sample.0

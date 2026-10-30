@@ -20,6 +20,7 @@ import Dispatch
     }
     static func main() {
         let initial=CameraPumpMailbox()
+        require(initial.isAdmittingFrames && initial.selection()==nil,"An unpublished first ROI was confused with a stopped pump")
         initial.prepareRegion(at:10,immediateFirst:true)
         require(initial.captureReady(at:10),"Untouched first generic region kept an unnecessary delay")
         initial.publish(target(1));let firstSelection=initial.selection()!
@@ -43,6 +44,7 @@ import Dispatch
         continuous.prepareRegion(at:10,immediateFirst:true,continuousMovement:true)
         continuous.publish(target(1));let continuousFirst=continuous.selection()!
         continuous.invalidateRegion()
+        require(continuous.isAdmittingFrames,"A temporary move gap terminated the live producer")
         require(continuous.selection()==nil && !continuous.isCurrent(continuousFirst),"Moved window kept the old ROI until the next tick")
         for step in 1...90 {
             let time=10+Double(step)/30
@@ -58,6 +60,7 @@ import Dispatch
         settlingFirst.prepareRegion(at:10,immediateFirst:false,continuousMovement:true)
         require(!settlingFirst.captureReady(at:10.17) && settlingFirst.captureReady(at:10.19),"Continuous movement erased an explicit first-frame experiment")
         continuous.stop();continuous.prepareRegion(at:16,immediateFirst:true,continuousMovement:true)
+        require(!continuous.isAdmittingFrames,"A stopped producer remained live without a target")
         require(!continuous.captureReady(at:16),"Continuous movement revived a stopped pump")
         initial.stop();initial.prepareRegion(at:0,immediateFirst:true)
         require(!initial.captureReady(at:100),"Region update revived a stopped pump")

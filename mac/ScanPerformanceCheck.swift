@@ -24,9 +24,11 @@ import CoreImage.CIFilterBuiltins
     private var movementDuration=0.0
     private var captureCosts:[Double]=[],transferCosts:[Double]=[]
     private var processingCosts:[Double]=[],requestCosts:[Double]=[],actorWaitCosts:[Double]=[],imageSizes:[Double]=[]
+    private var previousClearCosts:[Double]=[]
     private var sendCosts:[Double]=[],responseWaitCosts:[Double]=[],responseBodyCosts:[Double]=[]
     private var presentationCosts:[String:[Double]]=[:]
     private(set) var qrVisible = false
+    private(set) var qrShownAt:TimeInterval?
     private(set) var movedPoints: CGFloat = 0
     private let reduceMotion: Bool
     private let animatedBoard:Bool
@@ -105,7 +107,7 @@ import CoreImage.CIFilterBuiltins
             if animatedBoard {pattern.phase=elapsed;pattern.needsDisplay=true}
         } else if !qrVisible {
             scanner.setFrameOrigin(center)
-            qrVisible=true; pattern.showQR=true; pattern.needsDisplay=true
+            qrVisible=true;qrShownAt=now; pattern.showQR=true; pattern.needsDisplay=true
         }
     }
 
@@ -149,6 +151,9 @@ import CoreImage.CIFilterBuiltins
             sendCosts.append(stats.sendMilliseconds);responseWaitCosts.append(stats.responseWaitMilliseconds)
             responseBodyCosts.append(stats.responseBodyMilliseconds)
             imageSizes.append(Double(stats.imageBytes))
+            // One observation per new image ACK; this is the last clear value,
+            // not a distribution of all clear operations.
+            previousClearCosts.append(stats.previousImageClearMilliseconds)
         }
     }
 
@@ -171,6 +176,7 @@ import CoreImage.CIFilterBuiltins
                 "outgoingSyntheticQRVisible":syntheticQRVisible,
                 "movementSendFPS":movementDuration>0 ? Double(movementSent)/movementDuration : 0,
                 "movementCaptureP95Milliseconds":percentile(captureCosts),
+                "movementLastClearAtFrameAckP95Milliseconds":percentile(previousClearCosts),
                 "movementTransferP95Milliseconds":percentile(transferCosts),
                 "movementPhoneProcessingSamples":processingCosts.count,
                 "movementPhoneProcessingP95Milliseconds":percentile(processingCosts),

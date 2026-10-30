@@ -322,6 +322,7 @@ final class NativeMattePresentationStats: @unchecked Sendable {
     private var submittedCount=0,completedCount=0,failedCount=0,presentedCount=0,presentationCallbacks=0,lastPresentation:Double?
     private var fusedCompositionCount=0
     private var intervals=[Double](),gpu=[Double](),longIntervals=[[Double]]()
+    private var lastPresentedSourceReceivedAt:Double?
     private var firstPresentation:Double?
     private var receivedCount=0,lastReceived:Double?
     private var receiveIntervals=[Double](),drawableWaits=[Double]()
@@ -348,9 +349,9 @@ final class NativeMattePresentationStats: @unchecked Sendable {
         presentedCount += 1
         // Mac decoded-frame arrival to actual drawable timestamp only. This
         // excludes Android capture/transport/decode and physical pointer input.
-        if let sourceReceivedAt,sourceReceivedAt.isFinite,sourceReceivedAt>0,
-           time>=sourceReceivedAt,decodedToPresentation.count<7200 {
-            decodedToPresentation.append((time-sourceReceivedAt)*1000)
+        if let sourceReceivedAt,sourceReceivedAt.isFinite,sourceReceivedAt>0,time>=sourceReceivedAt {
+            lastPresentedSourceReceivedAt=max(lastPresentedSourceReceivedAt ?? sourceReceivedAt,sourceReceivedAt)
+            if decodedToPresentation.count<7200 {decodedToPresentation.append((time-sourceReceivedAt)*1000)}
         }
         if firstPresentation == nil {firstPresentation=time}
         if let last=lastPresentation,time > last,intervals.count < 7200 {
@@ -359,6 +360,9 @@ final class NativeMattePresentationStats: @unchecked Sendable {
         }
         lastPresentation=max(lastPresentation ?? time,time)
     } }
+    func hasPresentedSource(after time:Double)->Bool {lock.withLock {
+        time.isFinite && lastPresentedSourceReceivedAt.map{$0>time} == true
+    }}
     func snapshot() -> [String:Any] { lock.withLock {
         let sorted=intervals.sorted(),g=gpu.sorted(),received=receiveIntervals.sorted(),waits=drawableWaits.sorted()
         let age=decodedToPresentation.sorted()
