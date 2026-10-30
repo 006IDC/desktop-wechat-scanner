@@ -297,7 +297,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
         let expireWarmup=CommandLine.arguments.contains("--diagnostic-expire-stream-warmup")
         let probeQR=CommandLine.arguments.contains("--diagnostic-preview-timing")
         let motion=CommandLine.arguments.contains("--diagnostic-motion")
-        guard (!nativePreview || (!motion && !abba && !snapshotABBA)),validScope(alipay:alipayOnly,wechat:wechatOnly,abba:abba),
+        guard (!nativePreview || !abba),validScope(alipay:alipayOnly,wechat:wechatOnly,abba:abba),
               validExperiments(supplyABBA:supplyABBA,snapshotABBA:snapshotABBA,snapshot:initialSnapshot,expire:expireWarmup),
               validMotionScope(selected:motion,alipay:alipayOnly,wechat:wechatOnly,abba:abba,snapshot:initialSnapshot,expire:expireWarmup) else{return 2}
         guard CommandLine.arguments.contains("--diagnostic-usb"),CommandLine.arguments.contains("--locked-applications"),
