@@ -406,7 +406,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
                         stage="own-board-motion"
                         item["motionScope"]="own-nonactivating-board-only-not-physical-pointer-or-AppController"
                         let motionRounds=try await GenericMotionDiagnostic.run(capture:capture,phone:phone,window:window,
-                            display:display,package:package,epoch:epoch,available:{frames.available.isAvailable},
+                            display:display,package:package,epoch:epoch,nativeLease:sourceLease,available:{frames.available.isAvailable},
                             draw:{phase in pattern.motionPhase=phase;pattern.needsDisplay=true;pattern.displayIfNeeded()})
                         item["motionRounds"]=motionRounds
                         guard GenericMotionDiagnostic.succeeded(motionRounds) else{throw GenericMotionDiagnostic.Failure.comparison}
@@ -493,7 +493,13 @@ private final class BackgroundScanResult:@unchecked Sendable {
                             }
                             if qrShownAt != nil,firstQRACK==nil {firstQRACK=now}
                         } catch is DesktopCaptureTransientError {item["captureTransientOccurred"]=true;if imageWasSnapshot {item["startupSnapshotFallback"]=true}}
-                        catch is CameraFrameExpiredError {item["expiredFrameOccurred"]=true}
+                        catch let expired as CameraFrameExpiredError {
+                            item["expiredFrameOccurred"]=true
+                            if expired.sourceInvalidated,let shown=qrShownAt,item["qrShownToSourceInvalidatedMilliseconds"]==nil {
+                                item["qrShownToSourceInvalidatedMilliseconds"]=(now-shown)*1000
+                                item["sourceInvalidationEvidence"]="authenticated-frame-rejection-not-recognition-proof"
+                            }
+                        }
                         if let qrShownAt,let verifiedQRAt,let match=result.snapshot(),sent>0,frames.available.isAvailable,
                            match.received>=verifiedQRAt,match.observed<=until,now<=until,(!snapshotBootstrap || streamSourceVerified) {
                             recognized=true;resultFrameTime=match.received;item["qrShownToResultDecodedMilliseconds"]=(match.received-qrShownAt)*1000

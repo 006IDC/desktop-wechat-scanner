@@ -212,9 +212,6 @@ private struct VirtualRecord {
     let owner: String
 }
 
-struct CameraFrameExpiredError: LocalizedError {
-    var errorDescription:String? {"本次桌面坐标已过时。"}
-}
 
 struct CameraFrameReceipt {
     let processingMilliseconds: Double?
@@ -417,10 +414,10 @@ actor PhoneSession {
         let response:CameraSocket.MeasuredResponse
         if let isCurrent,!isCurrent() {throw CameraFrameExpiredError()}
         do {response=try channel.requestMeasured(command,body)}
-        catch let error as ScanError where error.message=="Desktop camera has no verified scanner owner" || error.message=="Desktop camera state changed while decoding frame" || error.message=="Native source lease is no longer active" {
+        catch let error as ScanError where CameraFrameExpiredError.serverRejection(error.message) != nil {
             // A normal scanner exit can invalidate an in-flight frame before
             // the next status poll. Drop it without displaying a transport error.
-            throw CameraFrameExpiredError()
+            throw CameraFrameExpiredError(sourceInvalidated:true)
         }
         let processing=try Self.frameProcessingMilliseconds(in:response.data)
         return CameraFrameReceipt(processingMilliseconds:processing,

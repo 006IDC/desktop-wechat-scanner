@@ -13,7 +13,7 @@ import AppKit
             (rows[1]["framesAcknowledgedDuringMotion"] as? Int ?? 0)>0 &&
             (rows[2]["framesAcknowledgedDuringMotion"] as? Int ?? 0)>0
     }
-    static func run(capture:DesktopCapture,phone:PhoneSession,window:NSWindow,display:Int,package:String,epoch:Int,
+    static func run(capture:DesktopCapture,phone:PhoneSession,window:NSWindow,display:Int,package:String,epoch:Int,nativeLease:PhoneSession.NativePreviewLease?=nil,
                     available:@escaping @Sendable ()->Bool,draw:@escaping @MainActor (Double?)->Void) async throws ->[[String:Any]] {
         let original=window.frame
         guard NSApp.activationPolicy() == .prohibited,window.isVisible,!window.canBecomeKey,!window.canBecomeMain,
@@ -58,14 +58,14 @@ import AppKit
                         let image=try await capture.capture(selection.target,maximumDimension:720)
                         guard now<until else{break}
                         let receipt=try await phone.frame(image,epoch:epoch,selectedAt:selection.target.selectedAt,
-                            isCurrent:{pump.isCurrent(selection) && pump.captureReady(at:ProcessInfo.processInfo.systemUptime)})
+                            isCurrent:{pump.isCurrent(selection) && pump.captureReady(at:ProcessInfo.processInfo.systemUptime)},nativeLease:nativeLease)
                         if now<until {
                             sent+=1;costs.append(receipt.requestMilliseconds)
                             if first==nil{first=(now-began)*1000}
                         }else{late+=1}
                     }catch is DesktopCaptureTransientError {dropped+=1}
                     catch is CameraFrameExpiredError {dropped+=1}
-                    let rest=0.125-(now-iteration)
+                    let rest=(nativeLease == nil ? 0.125:1.0/30)-(now-iteration)
                     if rest>0{try await Task.sleep(nanoseconds:UInt64(rest*1_000_000_000))}
                 }
             } catch {

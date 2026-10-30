@@ -66,6 +66,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var nativeScannerRequested:Bool {CommandLine.arguments.contains("--native-camera-preview") || nativeInterleavedRequested}
     private var nativeScannerOverlay:NativeScannerOverlay?
     private var nativeCameraScene:NativeCameraScene?
+    private var cameraStateRefreshRequested=false
     private var nextCameraDiagnostic=0.0
     private var connectionTask:Task<Void,Never>?, operationTask:Task<Void,Never>?, loop:Task<Void,Never>?, cameraLoop:Task<Void,Never>?
     private var currentStatus="未连接", currentDetail="点击连接，选择 USB 手机或设置无线连接。"
@@ -686,7 +687,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             localCameraMode=false
             endCameraActivity()
             let previousCamera=cameraLoop;cameraLoop=nil
-            paused=true;cameraActive=false;scanGeneration+=1;cameraPump?.stop();cameraPump=nil;previousCamera?.cancel();cameraFPS=0;refresh()
+            paused=true;cameraActive=false;scanGeneration+=1;cameraStateRefreshRequested=false;cameraPump?.stop();cameraPump=nil;previousCamera?.cancel();cameraFPS=0;refresh()
             await stopNativeScannerOverlay()
             await capture.stop()
             await previousCamera?.value
@@ -1632,7 +1633,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             var nextActivity=Date.distantPast,nextHeartbeat=Date.distantPast,failures=0
             while connected && !Task.isCancelled {
                 let generation=scanGeneration
-                if Date()>=nextActivity && !busy && !Task.isCancelled {
+                if (Date()>=nextActivity || cameraStateRefreshRequested) && !busy && !Task.isCancelled {
+                    cameraStateRefreshRequested=false
                     do {
                         if desktopMode {
                             let state=try await phone.cameraState()
@@ -1767,6 +1769,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let availability=cameraWindowAvailability,nativeSourceLease=nativeScannerOverlay?.sourceLease
         let sourceInterval:TimeInterval=nativeSourceLease != nil ? 1.0/30:0.125
         let pump=CameraPumpMailbox(sourceIsAvailable:{availability?.isAvailable != false}),generation=scanGeneration
+        let requestStateRefresh:@Sendable ()->Void = { [weak self] in
+            Task { @MainActor in
+                guard let self,self.connected,!self.stopping,self.scanGeneration==generation,self.cameraPump === pump else{return}
+                self.cameraStateRefreshRequested=true
+            }
+        }
         let diagnosticQRStart=performanceCheck == nil ? Double.infinity:ProcessInfo.processInfo.systemUptime+6.2
         let saveSyntheticPattern=performanceCheck != nil && CommandLine.arguments.contains("--diagnostic-pattern")
         cameraPump=pump;cameraFramesBase=framesSent
@@ -1779,6 +1787,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             var transientFailureSince:TimeInterval?,lastSentAt:TimeInterval?
             var lastQRCheck=0.0,savedPattern=false
             var lastDeliveredRevision:UInt64?
+            var stateRefreshSent=false
             while !Task.isCancelled,let selection=pump.selection() {
                 let target=selection.target
                 let began=ProcessInfo.processInfo.systemUptime
@@ -1872,6 +1881,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                 } catch {
                     guard !Task.isCancelled,pump.latest() != nil else{break}
+                    if let expired=error as? CameraFrameExpiredError,expired.sourceInvalidated,!stateRefreshSent {
+                        stateRefreshSent=true;requestStateRefresh()
+                    }
                     if error is DesktopCaptureTransientError || error is CameraFrameExpiredError {
                         let now=ProcessInfo.processInfo.systemUptime
                         if transientFailureSince == nil {transientFailureSince=lastSentAt ?? began}
