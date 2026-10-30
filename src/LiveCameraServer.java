@@ -98,6 +98,7 @@ public final class LiveCameraServer {
     private final ExecutorService callbacks = Executors.newSingleThreadExecutor();
     private final ScheduledExecutorService painter = Executors.newSingleThreadScheduledExecutor();
     private final ExecutorService acceptor = Executors.newSingleThreadExecutor();
+    private final ActivityTaskDump activityTaskDump = new ActivityTaskDump();
     // At most one queued paint besides the one currently running. Every paint,
     // including the idle refresh, stays on this one executor: never parallel Canvas.
     private final AtomicBoolean paintPending = new AtomicBoolean();
@@ -1231,6 +1232,7 @@ public final class LiveCameraServer {
         }
         state.put("activities", activities);
         state.put("packageLauncherQuerySupported",true);
+        state.put("activityTaskDumpSupported",activityTaskDump.available());
         CameraPaintTiming.Snapshot timing = cameraPaintTiming.snapshot();
         state.put("paintTiming", new JSONObject().put("samples", timing.samples)
                 .put("lastAcceptedToPostMilliseconds", timing.lastAcceptedToPost)
@@ -1352,6 +1354,13 @@ public final class LiveCameraServer {
                 if (length != 0) { error(output, "Live state request must be empty"); continue; }
                 try { reply(output, true, liveState()); }
                 catch (Exception failure) { error(output, "Live state unavailable"); }
+            } else if (command == 30) {
+                if (length != 0) { error(output, "Activity task dump request must be empty"); continue; }
+                try { reply(output, true, activityTaskDump.read()); }
+                catch (IOException failure) {
+                    error(output, ActivityTaskDump.TIMEOUT.equals(failure.getMessage())
+                            ? ActivityTaskDump.TIMEOUT : ActivityTaskDump.UNAVAILABLE);
+                }
             } else if (command == 10 || command == 11 || command == 12) {
                 if ((command == 12 && length != Integer.BYTES) || (command == 11 && length != 0) || (command == 10 && length > 255)) {
                     error(output, "Invalid app command payload"); continue;
@@ -1423,6 +1432,7 @@ public final class LiveCameraServer {
     private synchronized void close() {
         if (stopping) return;
         stopping = true;
+        activityTaskDump.close();
         boolean clean = true;
         boolean deviceClosed = false;
         if (client != null) try { client.close(); } catch (Exception e) { clean = false; log("cleanup_error", e); }

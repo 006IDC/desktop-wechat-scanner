@@ -47,6 +47,7 @@ struct PhoneCameraState: Decodable, Sendable {
     let desktopCameraBindings:[CameraBinding]
     let paintTiming:PaintTiming?
     let packageLauncherQuerySupported:Bool
+    let activityTaskDumpSupported:Bool
 
     private enum CodingKeys: String, CodingKey {
         case version, generation, activeStreams, activities, desktopHome
@@ -54,6 +55,7 @@ struct PhoneCameraState: Decodable, Sendable {
         case solidCalibrationSupported,desktopCameraSupported,desktopCameraEnabled,desktopCameraGeneration,desktopCameraBindings
         case paintTiming
         case packageLauncherQuerySupported
+        case activityTaskDumpSupported
     }
 
     init(from decoder: Decoder) throws {
@@ -77,6 +79,7 @@ struct PhoneCameraState: Decodable, Sendable {
         if let timing=try? values.decode(PaintTiming.self,forKey:.paintTiming),timing.isValid {paintTiming=timing}
         else {paintTiming=nil}
         packageLauncherQuerySupported=try values.decodeIfPresent(Bool.self,forKey:.packageLauncherQuerySupported) ?? false
+        activityTaskDumpSupported=try values.decodeIfPresent(Bool.self,forKey:.activityTaskDumpSupported) ?? false
     }
 
     func scannerActivity() -> Activity? {

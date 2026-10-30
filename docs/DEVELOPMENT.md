@@ -825,3 +825,49 @@ build59签名包支付宝真实扫码通过；launch约777.6ms，其中3次确�
 |实际安装，视频QR探针开|支付宝|730.4|1003.8|2399.5|
 
 两轮选项、冷暖和任务迁移不同（安装轮微信movingRoots=1），不是提速ABBA；不报稳定百分比，完整等待仍波动。ACK包含自有源验证/捕获，结果帧包含采样遗漏，不是物理点击到识别完成。安装轮微信确认独立QR视频帧先于原生文字约1303.6ms；支付宝只送1帧后相机关闭，严格结果匹配但未采样到中间QR视频帧，不能称预览验证失败或推断所有中间帧都已看见。四个App记录均只实际scan tap一次，无放宽结果条件。
+
+## 保留原任务树的直接读取（build62，2026-10-30，验证中）
+
+先排除两个候选方向。原生`am task focus`仅对刚验证已迁入自有显示的单任务做交叉四轮，四次均保留原前台/新帧门槛且清理成功；launch为498.8/476.2/387.1/373.9ms，未见稳定优势，不采用。Android16的RootTaskInfo查询约3–9ms，但9个叶任务里4个返回unknown且不出现在RunningTaskInfo；官方实现也不提供完整活动栈，不能代替现有混合包/活动记录核对，放弃这种数据替换。参考[AOSP根任务信息构造](https://github.com/aosp-mirror/platform_frameworks_base/blob/android-16.0.0_r1/services/core/java/com/android/server/wm/RootWindowContainer.java)及[活动计数/过滤](https://github.com/aosp-mirror/platform_frameworks_base/blob/android-16.0.0_r1/services/core/java/com/android/server/wm/ActivityTaskSupervisor.java)。
+
+改走同一`activity`服务、固定`activities`参数的Binder dump，只替换读取通道。独立只读ABBA中直接dump约6.12/7.11ms、dumpsys子进程35.76/130.01ms，31条原始Display/Task/Fragment/Hist结构行组内全等；不是整个文本逐字一致或全场景等价证明。正式helper独立首次78.62ms、暖次10.43ms，两次legacy134.45/139.81ms，仍为31条结构行一致；保留初始化成本，不用暖态数称整体提速。
+
+认证命令30必须空体；服务名和参数不可由客户端改变。两条daemon worker并行写/读私有管道，限2MiB/约2s等待，超时/错误/close关闭管道并退休helper，不再建立新任务；无法打断的Binder worker不复用，最终随本次服务进程退出回收，不声称同步join完成。完整任务文本只在本机认证连接和解析内存使用，不记录/发布。Mac继续使用原parseChecked和foreground规则；旧cap字段缺失默认false。只有固定unavailable允许一次旧通道回退；timeout、UTF-8/大小错误和传输失败不立即降级，本会话latch禁止反复尝试。断开时先关闭新通道能力，恢复继续走原路径。
+
+因为读得更快可能让原8次采样过早结束，cap有效时允许第9次最终观察，尽量保留confirmation起点2s时点的机会；这不是总启动2s上限。若此前已latch则不安排额外轮；第9次本身返回unavailable仍沿既有一次legacy回退。每段等待最多100ms便检查取消。旧服务仍8次。ShellCommand新增入口取消检查：准确旧61基线在预取消后仍尝试启动不存在程序而报非取消错误，62直接返回CancellationError；不取消的清理路径保留。
+
+### 主窗口就绪消费者
+
+只读复核发现主窗口曾在启动确认后立即隐藏picker，与独立窗口不同。62以MainApplicationReadiness串起launch、连接/route代数核验、新帧呈现、再次核验和ready，等待时保留列表和“正在打开”反馈；先同步结束视图中已按下的触控，再关源级输入门禁，防其他相机视图暂时重开交互。只有ready恢复新输入；失败可由Home/列表重试，重连在有效镜像后重置门禁。显示计时器若已消费静帧，可复用同route/incarnation、receipt晚于本次launch起点的呈现记录。此证据仍不证明像素非空、属于目标App最终页面或物理屏幕呈现。沿用原生界面与已有反馈，没有新建视觉规范；本轮按机主“不切换应用”的约束未做完整AppController/前台视觉验收。
+
+### 已完成的窄范围检查
+
+完整Java构建和Swift5/WAE类型检查通过。Android真实PFD假源9项覆盖重复新读、等限/超限、空体、异常脱敏、阻塞超时、并发拒绝、close竞态及失败后不可复用；没有调用相机或ActivityManager。Mac reader覆盖同一TaskFragment解析、固定回退、超时/损坏/传输拒绝、旧cap默认false；主窗口状态测试覆盖旧/错代帧、已消费静帧、超时/取消/route退休及普通无相机App。取消和恢复测试通过。独立源代码复核未见权限、归属或锁序放宽；后续完整包和主流程验收另列。
+
+### 同会话、同任务的微信传输对照
+
+内部试验仅为同一PhoneSession加测试用legacy开关，未把试验开关加入产品；同一62手机服务、相同镜像解码负载和已有任务，旧/新/新/旧四轮都迁移1个root/1个task，分别实际使用4次legacy或4次native读取，无native失败/隐式回退，启动、新解码帧和逐轮/最终清理均通过。
+
+|轮次|通道|launch确认(ms)|同代新解码帧门槛(ms)|
+|---|---|---:|---:|
+|A1|legacy|337.0|382.3|
+|B1|native|243.3|258.6|
+|B2|native|237.5|252.8|
+|A2|legacy|350.6|350.7|
+
+这是已准备会话的任务迁移测试，未构造AppController、注入物理输入或采集Mac。准备阶段的一次启动仍为1049.7ms（5次确认、sleep622.5ms、8次native读取），不能丢弃后称首次打开稳定更快。新帧门槛不是目标App首像素/实际屏幕呈现；这些数值不能替代扫码、无线、第三App或视频同效验收。安装61及其录屏授权保持不变，62完整签名包仍待复测。
+
+### 支付宝反例与旧服务兼容
+
+相同试验方式的支付宝四轮也均为1个root/1个task，实际选择4次对应读取通道，启动/新帧/恢复通过。但不能称整体稳定提速：
+
+|轮次|通道|launch确认(ms)|同代新解码帧门槛(ms)|
+|---|---|---:|---:|
+|A1|legacy|430.4|460.5|
+|B1|native|513.9|514.0|
+|B2|native|307.1|307.2|
+|A2|legacy|347.5|347.6|
+
+B1的startCommand约227.2ms，其他轮约99.7/132.0/69.3ms；查询、系统迁移和启动仍有波动，不能排除相互影响或只归因App。保留慢轮，不用B2单轮外推全部App。
+
+生产62 Mac代码连接实际61手机服务另做一次隐藏启动：cap缺失按false处理，7次读取均走legacy、未发送新命令；launch1043.6ms（1个迁移root、4次确认），前台App和恢复清理通过、无记录。它只证明旧通道兼容，不能与上述暖态ABBA直接比快慢；没有采集Mac或请求激活。

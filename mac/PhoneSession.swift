@@ -10,6 +10,7 @@ struct ScanError: LocalizedError {
 enum ShellCommand {
     static func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval = 15, cancellable:Bool = true,
                     cancellationRequested:(@Sendable ()->Bool)? = nil) throws -> String {
+        if (cancellable && Task.isCancelled) || cancellationRequested?()==true {throw CancellationError()}
         let process = Process(), pipe = Pipe(), done = DispatchSemaphore(value: 0)
         let readerDone = DispatchSemaphore(value: 0)
         var outputData = Data()
@@ -251,9 +252,11 @@ actor PhoneSession {
     private(set) var independentApplicationsWhenLocked=false
     private var genericDesktopCamera=false
     private var packageLauncherQuerySupported=false
+    private var activityTaskDumpSupported=false,activityTaskDumpDisabled=false
     private(set) var lastLauncherValidationMilliseconds:Double?
     private(set) var lastLauncherQueryScoped:Bool?
     private(set) var lastLaunchStages:[String:Double]=[:]
+    private var recordingLaunch=false
     private func measureLaunch<T>(_ stage:String,_ operation:() throws ->T) rethrows ->T {
         let began=ProcessInfo.processInfo.systemUptime
         defer{lastLaunchStages[stage,default:0]+=(ProcessInfo.processInfo.systemUptime-began)*1000}
@@ -290,6 +293,7 @@ actor PhoneSession {
         }
         do {
             packageLauncherQuerySupported=false
+            activityTaskDumpSupported=false;activityTaskDumpDisabled=false
             connectionStage = "enumeration"
             progress("正在检查手机连接…")
             let listing = try adb(["devices","-l"])
@@ -476,6 +480,7 @@ actor PhoneSession {
     func cameraState() throws -> PhoneCameraState {
         let state=try PhoneCameraState.decode(cameraStatusSnapshot())
         packageLauncherQuerySupported=state.packageLauncherQuerySupported
+        activityTaskDumpSupported=state.activityTaskDumpSupported && !activityTaskDumpDisabled
         return state
     }
     /// Authenticated bounded technical status; callers must not persist app activity history.
@@ -688,8 +693,25 @@ actor PhoneSession {
         if independentApplicationsWhenLocked && target>0 && ownsDisplay(target) && confirmed {return}
         guard try primaryUserUnlocked() else {throw ScanError("手机已锁定。请解锁，或重新连接并开启“手机锁屏时继续使用独立应用”。")}
     }
+    private func activityTaskDump() throws ->String {
+        if !cleaning {try Task.checkCancellation()}
+        let native:(() throws ->Data)?
+        if activityTaskDumpSupported,!activityTaskDumpDisabled,let channel {
+            native={
+                if self.recordingLaunch {self.lastLaunchStages["taskDumpNativeRequests",default:0]+=1}
+                return try channel.request(30)
+            }
+        }else{native=nil}
+        return try ActivityTaskDumpReader.read(native:native,legacy:{
+            if self.recordingLaunch {self.lastLaunchStages["taskDumpLegacyRequests",default:0]+=1}
+            return try self.shell("dumpsys activity activities")
+        },nativeFailed:{
+            self.activityTaskDumpDisabled=true;self.activityTaskDumpSupported=false
+            if self.recordingLaunch {self.lastLaunchStages["taskDumpNativeFailures",default:0]+=1}
+        })
+    }
     private func tasks(requiredDisplay: Int? = nil) throws -> [AndroidTaskSnapshot] {
-        let dump = try shell("dumpsys activity activities")
+        let dump = try activityTaskDump()
         return try AndroidTaskSnapshot.parseChecked(dump, requiredDisplay: requiredDisplay)
     }
     private func moveTasks(_ expected:[AndroidTaskSnapshot], to display:Int) throws {
@@ -704,8 +726,9 @@ actor PhoneSession {
         lastApplicationLaunchEvidence=nil
         lastLauncherValidationMilliseconds=nil;lastLauncherQueryScoped=nil
         lastLaunchStages=[:]
+        recordingLaunch=true
         let launchBegan=ProcessInfo.processInfo.systemUptime
-        defer{lastLaunchStages["totalMilliseconds"]=(ProcessInfo.processInfo.systemUptime-launchBegan)*1000}
+        defer{lastLaunchStages["totalMilliseconds"]=(ProcessInfo.processInfo.systemUptime-launchBegan)*1000;recordingLaunch=false}
         guard let state = recovery, channel != nil, ownsDisplay(target), app.isValid else { throw ScanError("应用或屏幕不属于本次连接。") }
         try measureLaunch("accessMilliseconds"){try requireApplicationAccess(on:target)}
         // Revalidate against the authenticated launcher catalog, never execute an arbitrary component.
@@ -741,11 +764,15 @@ actor PhoneSession {
             }
             let result = try measureLaunch("startCommandMilliseconds"){try shell("am start --user 0 --display \(target) -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n '\(app.component)'")}
             guard !result.lowercased().contains("error:"), !result.lowercased().contains("exception") else { throw ScanError("手机应用启动失败。") }
-            for check in 0..<ApplicationLaunchConfirmation.maximumChecks {
+            let confirmationBegan=ProcessInfo.processInfo.systemUptime
+            let nativeGrace=activityTaskDumpSupported && !activityTaskDumpDisabled
+            let maximumChecks=nativeGrace ? ApplicationLaunchConfirmation.nativeMaximumChecks:ApplicationLaunchConfirmation.maximumChecks
+            for check in 0..<maximumChecks {
+                if check>=ApplicationLaunchConfirmation.maximumChecks,activityTaskDumpDisabled {break}
                 try Task.checkCancellation()
                 lastLaunchStages["confirmationReads",default:0]+=1
                 let (activityDump,after)=try measureLaunch("confirmationSnapshotMilliseconds") {
-                    let dump=try shell("dumpsys activity activities")
+                    let dump=try activityTaskDump()
                     return (dump,try AndroidTaskSnapshot.parseChecked(dump,requiredDisplay:target))
                 }
                 for task in after where task.userID == 0 && !task.rootContainsOtherUsers && task.packageName == app.packageName && task.display == target && !(recovery?.appTasks?.contains(where: { $0.id == task.id }) ?? false) {
@@ -770,8 +797,9 @@ actor PhoneSession {
                     lastApplicationLaunchEvidence=nil
                     return
                 }
-                if let delay=ApplicationLaunchConfirmation.delay(afterCheck:check) {
-                    measureLaunch("confirmationSleepMilliseconds"){Thread.sleep(forTimeInterval:delay)}
+                if let delay=ApplicationLaunchConfirmation.delay(afterCheck:check,nativeGrace:nativeGrace && !activityTaskDumpDisabled,
+                        elapsed:ProcessInfo.processInfo.systemUptime-confirmationBegan) {
+                    try measureLaunch("confirmationSleepMilliseconds"){try ApplicationLaunchConfirmation.pause(delay)}
                 }
             }
             throw ScanError("应用未出现在指定屏幕；已保留恢复记录。")
@@ -931,6 +959,7 @@ actor PhoneSession {
         diagnosticLog=nil
         genericDesktopCamera=false
         packageLauncherQuerySupported=false
+        activityTaskDumpSupported=false;activityTaskDumpDisabled=false
         independentApplicationsWhenLocked=false
         cleaning=true;defer {cleaning=false}
         if let state = recovery {

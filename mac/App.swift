@@ -18,6 +18,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var desktopMode=false
     private var genericDesktopCamera=false
     private var applicationPickerVisible=false
+    private var mainApplicationInputReady=true
     private var cachedApplications:[AndroidApplication]?
     private var cameraWindow:ControlWindowController?
     private var cameraDisplay:Int?
@@ -115,15 +116,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         control.onPermissionSettings={ [weak self] in self?.permissionSettings() }
         control.onRelaunch={ [weak self] in self?.relaunch() }
         control.onTouch={ [weak self] action,x,y in
-            guard let self,self.connected,!self.stopping,(self.desktopMode || !self.primaryLocked) else{return}
+            guard let self,self.connected,!self.stopping,self.mainApplicationInputReady,(self.desktopMode || !self.primaryLocked) else{return}
             self.lastUserInput=Date();self.activeRoute.session.touch(action:action,x:x,y:y)
         }
         control.onTap={ [weak self] x,y in
-            guard let self,self.connected,!self.stopping,(self.desktopMode || !self.primaryLocked) else{return}
+            guard let self,self.connected,!self.stopping,self.mainApplicationInputReady,(self.desktopMode || !self.primaryLocked) else{return}
             self.lastUserInput=Date();self.activeRoute.session.tap(x:x,y:y)
         }
         control.onSwipe={ [weak self] x1,y1,x2,y2 in
-            guard let self,self.connected,!self.busy,(self.desktopMode || !self.primaryLocked) else{return}
+            guard let self,self.connected,!self.busy,self.mainApplicationInputReady,(self.desktopMode || !self.primaryLocked) else{return}
             self.lastUserInput=Date();self.activeRoute.session.swipe(x1:x1,y1:y1,x2:x2,y2:y2)
         }
         control.showWindow(nil);refresh();writeDiagnosticState()
@@ -392,6 +393,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let endpoint=try await phone.mirrorEndpoint()
                     try await showMirror(display:endpoint.display)
                 } else if !primaryLocked {try await showMirror(display:0)}
+                mainApplicationInputReady=true;mainControl.setPhoneInteractionEnabled(true)
                 try Task.checkCancellation();busy=false
                 status(desktopMode ? "手机桌面" : (primaryLocked ? "手机主屏已锁定" : "已连接 · \(model)"),desktopMode ? (genericDesktopCamera ? "桌面相机已选定；所选应用打开相机后使用透明框取景。":"选择手机应用；微信和支付宝的扫一扫可自动读取窗口后方的电脑画面。") : "直接点击或滑动手机画面。")
                 detachedApplications=DetachedApplications(phone:phone,adb:selected,server:Bundle.main.resourceURL!.appendingPathComponent("scrcpy-server"),serverSocket:adbServerSocket)
@@ -501,24 +503,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             throw error
         }
     }
-    private func showMirror(display:Int, after:TimeInterval?=nil) async throws {
+    private func showMirror(display:Int, after:TimeInterval?=nil,timeout:TimeInterval=10) async throws {
         if mirrorDisplay==display,latestPhoneFrame != nil,after==nil {return}
         let generation=mirrorGeneration,route=display==0 ? physicalMirror:scannerMirror
         try await prepareMirror(display:display)
-        let deadline=ProcessInfo.processInfo.systemUptime+10
+        let deadline=ProcessInfo.processInfo.systemUptime+timeout
         // Keep displaying the previous route until the target has a fresh frame.
         // A warm empty virtual screen must not flash over the real WeChat page.
         while ProcessInfo.processInfo.systemUptime<deadline {
             try Task.checkCancellation()
             guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
             if let failure=route.failure {throw ScanError(failure)}
+            // The display timer may already have consumed a static new frame.
+            // Reuse only that same route/incarnation's post-launch presentation.
+            if let after,mirrorDisplay==display,let observed=latestPresentedMirrorFrame,
+               observed.route === route,observed.frame.generation==route.incarnation,
+               observed.frame.receivedAt>=after {return}
             if let frame=route.frames.takeLatest(),frame.generation==route.incarnation,
                after == nil || frame.receivedAt >= after! {
                 mirrorDisplay=display;present(frame,route:route);return
             }
             try await Task.sleep(nanoseconds:16_000_000)
         }
-        throw ScanError("手机镜像首帧未就绪，请解锁手机后重新连接。")
+        throw ScanError(after==nil ? "手机镜像首帧未就绪，请解锁手机后重新连接。":"应用已启动，但新画面尚未就绪；请返回应用列表重试。")
     }
     /// Poll only the primary user's state. Never dismiss keyguard or inject an unlock.
     private func updatePrimaryLock() async throws {
@@ -1536,6 +1543,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         try Task.checkCancellation()
         guard connected,!stopping else{throw ScanError("手机暂时无法打开应用。")}
         let generation=mirrorGeneration
+        // End an accepted gesture before closing the source-level input gate.
+        mainControl.setPhoneInteractionEnabled(false);mainApplicationInputReady=false
         busy=true;status("正在打开 \(app.name)","应用在手机运行，画面保留在当前窗口。")
         defer {if connected,!stopping,mirrorGeneration==generation {busy=false;refresh()}}
         guard await clearCamera() else {throw ScanError("手机未确认清除旧相机画面，暂不打开其他应用。")}
@@ -1544,11 +1553,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let display=await phone.scannerDisplay()?.id else{throw ScanError("手机桌面尚未准备好。")}
         try Task.checkCancellation()
         guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
-        let cameraReady=try await phone.launchApplication(app,on:display);try Task.checkCancellation()
-        guard connected,!stopping,mirrorGeneration==generation else{throw CancellationError()}
-        applicationPickerVisible=false;mainControl.hideApplicationPicker();cameraSuppressed=false
-        if cameraReady {beginCaptureMetadataWarmup()}
-        status(app.name,genericDesktopCamera ? (cameraReady ? "桌面相机已绑定；在应用内打开相机或扫一扫即可取景。":"此应用未声明相机权限，已按普通手机应用打开。") : "直接操作手机应用。")
+        let incarnation=scannerMirror.incarnation
+        try await MainApplicationReadiness.open(launch:{try await self.phone.launchApplication(app,on:display)},validate:{
+            guard self.connected,!self.stopping,self.mirrorGeneration==generation,
+                  self.scannerMirror.incarnation==incarnation else{throw CancellationError()}
+            if let failure=self.scannerMirror.failure {throw ScanError(failure)}
+        },presentFreshFrame:{since in
+            try await self.showMirror(display:display,after:since,timeout:5)
+        },ready:{cameraReady in
+            self.applicationPickerVisible=false;self.mainControl.hideApplicationPicker();self.cameraSuppressed=false
+            // Discard any UI-only gesture created while another camera surface
+            // temporarily reenabled its view. Its DOWN never passed the gate.
+            self.mainControl.setPhoneInteractionEnabled(false)
+            self.mainApplicationInputReady=true;self.mainControl.setPhoneInteractionEnabled(true)
+            if cameraReady {self.beginCaptureMetadataWarmup()}
+            self.status(app.name,self.genericDesktopCamera ? (cameraReady ? "桌面相机已绑定；在应用内打开相机或扫一扫即可取景。":"此应用未声明相机权限，已按普通手机应用打开。") : "直接操作手机应用。")
+        })
     }
     private func startLoop(){
         loop?.cancel()

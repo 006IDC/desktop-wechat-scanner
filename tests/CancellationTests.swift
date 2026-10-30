@@ -1,7 +1,23 @@
 import Foundation
 
+private actor CancellationStartGate {
+    private var released=false
+    private var waiter:CheckedContinuation<Void,Never>?
+    func wait() async {if released{return};await withCheckedContinuation{waiter=$0}}
+    func release(){released=true;waiter?.resume();waiter=nil}
+}
+
 @main struct CancellationTests {
     static func main() async throws {
+        let beforeStart=CancellationStartGate()
+        let preCancelled=Task.detached {() throws ->String in
+            await beforeStart.wait()
+            // A cancelled operation must not even try starting an executable.
+            return try ShellCommand.run(URL(fileURLWithPath:"/nonexistent/pre-cancelled-program"),[])
+        }
+        preCancelled.cancel();await beforeStart.release()
+        do {_ = try await preCancelled.value;fatalError("Pre-cancelled command started")}
+        catch is CancellationError {}
         let clock=Date()
         let command=Task.detached {try ShellCommand.run(URL(fileURLWithPath:"/bin/sleep"),["8"])}
         try await Task.sleep(nanoseconds:150_000_000)

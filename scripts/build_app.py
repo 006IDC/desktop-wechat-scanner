@@ -119,7 +119,7 @@ info={
     'CFBundleIdentifier':'com.idc006.DesktopWeChatScanner',
     'CFBundleName':'MiraDroid','CFBundleDisplayName':'MiraDroid',
     'CFBundleExecutable':'DesktopWeChatScanner','CFBundlePackageType':'APPL',
-    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'61',
+    'CFBundleShortVersionString':'0.4.0','CFBundleVersion':'62',
     'DesktopScannerRelease':'0.4.0-preview.5',
     'CFBundleIconFile':'AppIcon.icns',
     'LSMinimumSystemVersion':'14.4','NSHighResolutionCapable':True,
