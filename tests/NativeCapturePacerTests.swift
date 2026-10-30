@@ -16,4 +16,3 @@ import Foundation
         print("PASS native capture follows fresh publications, skips late slots and never duplicates a publication")
     }
 }
-
