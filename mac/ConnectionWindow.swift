@@ -1,5 +1,11 @@
 import AppKit
 
+enum NativePreviewSelection {
+    // Preferences populate the chooser; only its connection snapshot (or an
+    // explicit CLI flag) selects the runtime route. Diagnostics have no snapshot.
+    static func enabled(commandLine:Bool,selection:Bool?)->Bool {commandLine || (selection ?? false)}
+}
+
 @MainActor
 private final class ConnectionDocumentView: NSView {
     override var isFlipped: Bool { true }
@@ -14,6 +20,8 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     var onCancel: (() -> Void)?
     var allowsLockedApplications: Bool { lockedApplicationsCheckbox.state == .on }
     var usesDesktopCamera:Bool {desktopCameraCheckbox.state == .on}
+    var usesNativeScanPreview:Bool {usesDesktopCamera && nativeScanCheckbox.state == .on}
+    private let preferences:UserDefaults
     private let onSelect: (ADBDevice) -> Void
     private let manager: ADBConnectionManager
     private let adbURL: URL
@@ -42,13 +50,15 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     private let selectButton = NSButton(title: "连接所选手机", target: nil, action: nil)
     private let lockedApplicationsCheckbox = NSButton(checkboxWithTitle: "手机锁屏时继续使用独立应用", target: nil, action: nil)
     private let desktopCameraCheckbox=NSButton(checkboxWithTitle:"桌面相机（通用）",target:nil,action:nil)
+    private let nativeScanCheckbox=NSButton(checkboxWithTitle:"原生扫码界面（试用）",target:nil,action:nil)
     private let pairButton = NSButton(title: "配对", target: nil, action: nil)
     private let connectButton = NSButton(title: "建立无线连接", target: nil, action: nil)
     private let discoverButton = NSButton(title: "查找无线设备", target: nil, action: nil)
 
-    init(adbURL: URL, onSelect: @escaping (ADBDevice) -> Void) {
+    init(adbURL: URL, preferences:UserDefaults = .standard, onSelect: @escaping (ADBDevice) -> Void) {
         let manager = ADBConnectionManager(adbURL: adbURL)
         self.manager = manager
+        self.preferences=preferences
         self.adbURL = adbURL
         self.onSelect = onSelect
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 710),
@@ -58,9 +68,12 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 640, height: 560)
         window.delegate = self
-        lockedApplicationsCheckbox.state = UserDefaults.standard.bool(forKey: Self.lockedApplicationsPreferenceKey) ? .on : .off
-        desktopCameraCheckbox.state=UserDefaults.standard.bool(forKey:"desktopCameraSource.v1") ? .on:.off
+        lockedApplicationsCheckbox.state = preferences.bool(forKey: Self.lockedApplicationsPreferenceKey) ? .on : .off
+        desktopCameraCheckbox.state=preferences.bool(forKey:"desktopCameraSource.v1") ? .on:.off
+        nativeScanCheckbox.state=preferences.bool(forKey:"nativeInterleavedPreview.v1") ? .on:.off
+        desktopCameraCheckbox.target=self;desktopCameraCheckbox.action=#selector(desktopCameraChanged)
         buildContent(window)
+        updateEnabled()
         window.center()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -143,6 +156,8 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         lockedApplicationsCheckbox.setAccessibilityLabel("手机锁屏时继续使用独立应用")
         let lockedApplicationsHint = note("开启后，本次连接的独立应用窗口可在手机主屏锁定时使用；手机主屏仍需正常解锁。仅在你信任这台 Mac 时开启。首次连接或手机重启后，需先解锁手机一次。")
         desktopCameraCheckbox.setAccessibilityLabel("桌面相机，适用于本次连接中所选应用的相机功能")
+        nativeScanCheckbox.setAccessibilityLabel("在原手机窗口显示应用自己的扫码界面")
+        let nativeScanHint=note("保留手机 App 自己的扫码控件，直接透出 Mac 桌面。仅用于扫码；拍照和录像请关闭此项。")
         let desktopCameraHint=note("开启后，所选应用窗口打开相机时，以框选电脑桌面作输入，包括扫码、拍照和视频。仅对本次临时应用窗口生效；手机 App 自行识别，兼容性依应用而异。")
 
         pairEndpoint.placeholderString = "例如 192.168.1.20:37123"
@@ -193,7 +208,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let stack = NSStackView(views: [title, intro, deviceTitle, scroll, devicesActions, chooseHint,
-                                        lockedApplicationsCheckbox, lockedApplicationsHint, desktopCameraCheckbox,desktopCameraHint,box])
+                                        lockedApplicationsCheckbox, lockedApplicationsHint, desktopCameraCheckbox,desktopCameraHint,nativeScanCheckbox,nativeScanHint,box])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         let page = NSScrollView()
@@ -292,6 +307,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         guard devices.indices.contains(table.selectedRow), devices[table.selectedRow].authorization == .authorized else { return nil }
         return devices[table.selectedRow]
     }
+    @objc private func desktopCameraChanged() {updateEnabled()}
     private func updateEnabled() {
         for button in [refreshButton, pairButton, connectButton, discoverButton] { button.isEnabled = !busy }
         for field in [pairEndpoint, pairingCode, connectEndpoint] { field.isEnabled = !busy }
@@ -300,6 +316,7 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
         selectButton.isEnabled = !busy && selectedDevice != nil
         lockedApplicationsCheckbox.isEnabled = !busy
         desktopCameraCheckbox.isEnabled = !busy
+        nativeScanCheckbox.isEnabled = !busy && usesDesktopCamera
         if busy { progress.startAnimation(nil) } else { progress.stopAnimation(nil) }
     }
 
@@ -422,8 +439,9 @@ final class ConnectionWindowController: NSWindowController, NSWindowDelegate, NS
     @objc private func selectDevice() {
         guard !busy, !closed, let device = selectedDevice else { return }
         didSelect = true
-        UserDefaults.standard.set(allowsLockedApplications, forKey: Self.lockedApplicationsPreferenceKey)
-        UserDefaults.standard.set(usesDesktopCamera,forKey:"desktopCameraSource.v1")
+        preferences.set(allowsLockedApplications, forKey: Self.lockedApplicationsPreferenceKey)
+        preferences.set(usesDesktopCamera,forKey:"desktopCameraSource.v1")
+        preferences.set(nativeScanCheckbox.state == .on,forKey:"nativeInterleavedPreview.v1")
         if device.transport == .wireless && device.serverSocket != nil {
             reconnectStore.save(selectedSerial: device.serial, services: services)
         }

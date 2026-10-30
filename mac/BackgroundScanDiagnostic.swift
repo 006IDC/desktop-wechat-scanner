@@ -237,6 +237,9 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     words.contains{["收付款","收付钱"].contains($0.value) && $0.rect.midY<400}
                 if home,let scan=words.first(where:{$0.value=="扫一扫" && $0.rect.midY<400}) {
                     point=CGPoint(x:scan.rect.midX/720,y:scan.rect.midY/1280)
+                } else if !homeSelected,tabs.count>=2,words.contains(where:{$0.value=="我的" && $0.rect.midY>1000}),
+                          let homeTab=words.first(where:{$0.value=="首页" && $0.rect.midY>1000}) {
+                    point=CGPoint(x:homeTab.rect.midX/720,y:homeTab.rect.midY/1280);isHome=true
                 }
             }
             // A restored LauncherUI can contain a chat, not the Home tab.
@@ -332,6 +335,11 @@ private final class BackgroundScanResult:@unchecked Sendable {
             report["diagnosticPreparationBarcodeMilliseconds"]=preparation.barcodeMilliseconds
             report["diagnosticPreparationTotalMilliseconds"]=preparation.totalMilliseconds
             report["diagnosticPreparationScope"]="memory-only-synthetic-fixture-before-phone-session"
+            if nativePreview {
+                let nativeBegan=now
+                try await Task.detached(priority:.userInitiated){try NativeScannerMatte.prewarm()}.value
+                report["nativeResourcePreparationMilliseconds"]=(now-nativeBegan)*1000
+            }
             try Task.checkCancellation()
             stage="connect"
             _=try await phone.connect(openWechatOnConnect:false,selectedSerial:devices[0].serial,allowLockedApplications:true,desktopHome:true,realtimeVideo:nativePreview,genericDesktopCamera:true){_ in}

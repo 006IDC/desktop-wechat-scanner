@@ -62,9 +62,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         CommandLine.arguments.contains("--diagnostic-prewarm-capture-metadata") && !coldCaptureMetadata
     }
     private var settleInitialGenericCapture:Bool {CommandLine.arguments.contains("--run-desktop-diagnostic") && CommandLine.arguments.contains("--diagnostic-initial-settle")}
-    private let nativeInterleavedRequested=CommandLine.arguments.contains("--native-interleaved-preview")
-    private let nativeScannerRequested=CommandLine.arguments.contains("--native-camera-preview") || CommandLine.arguments.contains("--native-interleaved-preview")
+    private var nativeInterleavedRequested=CommandLine.arguments.contains("--native-interleaved-preview")
+    private var nativeScannerRequested:Bool {CommandLine.arguments.contains("--native-camera-preview") || nativeInterleavedRequested}
     private var nativeScannerOverlay:NativeScannerOverlay?
+    private var nativeCameraScene:NativeCameraScene?
     private var nextCameraDiagnostic=0.0
     private var connectionTask:Task<Void,Never>?, operationTask:Task<Void,Never>?, loop:Task<Void,Never>?, cameraLoop:Task<Void,Never>?
     private var currentStatus="未连接", currentDetail="点击连接，选择 USB 手机或设置无线连接。"
@@ -320,6 +321,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         value["localCameraMode"]=localCameraMode
         value["desktopMode"]=desktopMode
         value["genericDesktopCamera"]=genericDesktopCamera
+        value["nativeScanPreviewSelected"]=genericDesktopCamera && nativeInterleavedRequested
+        value["nativeScanPreviewAttached"]=nativeScannerOverlay?.interleaved==true && cameraWindow?.nativeScannerVisible==true
+        value["nativeScanFrameSelection"]=nativeScannerOverlay?.frameSelectionStatistics
+        value["nativeScanPreparation"]=nativeScannerOverlay?.calibrationTiming
         value["applicationPickerVisible"]=applicationPickerVisible
         if CommandLine.arguments.contains("--diagnostic-manual-navigation") {
             value["manualPhoneInput"]=mainControl.phoneInputDiagnostic
@@ -344,13 +349,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let window=self.connectionWindow
                     let allowLockedApplications=window?.allowsLockedApplications ?? false
                     let usesDesktopCamera=window?.usesDesktopCamera ?? false
+                    let usesNativePreview=window?.usesNativeScanPreview ?? false
                     self.status("正在连接","正在收束连接设置…")
                     self.connectionTask=Task {
                         let clean=await window?.waitForCleanup() ?? true
                         let ownedServer=window?.takeSelectedWirelessServer()
                         guard !self.stopping,!Task.isCancelled else{await ownedServer?.stop();return}
                         self.connectionWindow=nil
-                        if clean {self.wirelessServer=ownedServer;self.connectDevice(device,adb:selected,allowLockedApplications:allowLockedApplications,genericDesktopCamera:usesDesktopCamera)}
+                        if clean {self.wirelessServer=ownedServer;self.connectDevice(device,adb:selected,allowLockedApplications:allowLockedApplications,genericDesktopCamera:usesDesktopCamera,nativePreview:usesNativePreview)}
                         else {
                             await ownedServer?.stop()
                             if device.serverSocket == nil,device.transport == .wireless,let endpoint=try? ADBEndpoint(device.serial).value {
@@ -374,7 +380,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } catch is CancellationError {} catch {busy=false;status("连接未完成",error.localizedDescription)}
         }
     }
-    private func connectDevice(_ device:ADBDevice,adb selected:URL,allowLockedApplications:Bool,diagnostic:Bool=false,genericDesktopCamera:Bool=false){
+    private func connectDevice(_ device:ADBDevice,adb selected:URL,allowLockedApplications:Bool,diagnostic:Bool=false,genericDesktopCamera:Bool=false,nativePreview:Bool?=nil){
         guard !connected,!stopping else{return}
         busy=true;status("正在连接",allowLockedApplications ? "正在确认手机的独立应用锁屏支持…" : "请保持手机解锁。")
         connectionTask=Task { [self] in
@@ -383,6 +389,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 adbServerSocket=device.serverSocket
                 wirelessEndpoint=device.transport == .wireless ? (try? ADBEndpoint(device.serial).value):nil
                 self.genericDesktopCamera=genericDesktopCamera
+                nativeInterleavedRequested=NativePreviewSelection.enabled(commandLine:CommandLine.arguments.contains("--native-interleaved-preview"),selection:nativePreview)
+                if nativeScannerRequested {Task.detached(priority:.utility) {try? NativeScannerMatte.prewarm();try? NativeCalibrationImages.prewarm()}}
                 adbURL=selected;phoneSession=PhoneSession(resources:Bundle.main.resourceURL!,adbURL:selected,serverSocket:adbServerSocket)
                 model=try await phone.connect(openWechatOnConnect:false,selectedSerial:device.serial,allowLockedApplications:allowLockedApplications,desktopHome:!diagnostic,realtimeVideo:nativeScannerRequested && !diagnostic && (!genericDesktopCamera || nativeInterleavedRequested),genericDesktopCamera:genericDesktopCamera){ [weak self] value in Task { @MainActor in self?.status("正在连接",value) } }
                 try Task.checkCancellation();connected=true;mode = .phone;mirrorGeneration+=1
@@ -823,7 +831,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func requestDesktopCamera() {
         guard connected,!busy,!stopping,cameraInvalidation==nil else{return}
-        cameraSuppressed=false
+        cameraSuppressed=false;nativeCameraScene=nil
         if cameraActive,paused {togglePause()}
         else if cameraActive {localScanFrame?.show()}
         else {status("桌面相机已选定","在所选手机应用内打开相机或扫一扫，即可使用透明取景框。")}
@@ -915,8 +923,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     localCameraMode=desktopMode
                     if localCameraMode,nativeScannerRequested,(!genericDesktopCamera || nativeInterleavedRequested),let targetDisplay {
                         let state=try await phone.cameraState()
-                        if let scanner=genericDesktopCamera ? state.captureActivity():state.scannerActivity(),scanner.displayId==targetDisplay,
-                           !genericDesktopCamera || state.interleavedPreviewSupported {
+                        guard let scanner=eligibleCameraActivity(state),scanner.displayId==targetDisplay else {
+                            throw ScanError("原生相机界面已变化。")
+                        }
+                        if !genericDesktopCamera || (state.interleavedPreviewSupported && state.activeStreams==1) {
                             let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
                                 fastCalibration:CommandLine.arguments.contains("--native-fast-calibration"),
                                 batchedCalibration:CommandLine.arguments.contains("--native-batched-calibration"),
@@ -926,6 +936,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             guard let nativeBinding=nativeCameraFrames(window:targetWindow,display:targetDisplay) else{throw ScanError("扫码镜像路由已变化。")}
                             let nativeMailbox=nativeBinding.0,nativeIncarnation=nativeBinding.1
                             try overlay.observeDecodedFrames(in:nativeMailbox,generation:nativeIncarnation)
+                            if overlay.interleaved,nativeCameraScene?.sameSource(in:state) != true {nativeCameraScene=NativeCameraScene(state:state)}
                             nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
                             status("准备原生扫码预览","正在校准手机应用自己的相机背景…")
                             try await overlay.prepare(phone:phone,epoch:generation)
@@ -937,6 +948,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                   currentBinding.0 === nativeMailbox,currentBinding.1==nativeIncarnation,
                                   windowAvailability?.isAvailable != false,overlay.decodedFrameDelivery else{throw ScanError("扫码镜像路由已变化。")}
                             if targetWindow === mainControl {applicationPickerVisible=false}
+                            if overlay.interleaved,nativeCameraScene?.markVerified(in:attachmentState) != true {throw ScanError("原生相机界面已变化。")}
                             targetWindow.showNativeScanner(overlay)
                             nativeScannerAttachedUptime=ProcessInfo.processInfo.systemUptime
                         } else {showLocalScanFrame(for:targetWindow)}
@@ -948,10 +960,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if let tap=diagnosticScannerTapUptime,startupBegan>=tap {cameraStartupStages["tapToDetectionMilliseconds"]=(startupBegan-tap)*1000}
                     status(genericDesktopCamera ? "桌面相机" : (nativeScannerOverlay != nil ? "原生扫一扫" : (localCameraMode ? "拖动扫码框":"拖动窗口扫码")),nativeScannerOverlay != nil ? "拖动窗口对准二维码；原生手机控件和识别结果保持在此窗口。" : (localCameraMode ? (genericDesktopCamera ? "透明框取景持续送入当前手机应用；识别和结果由原 App 完成。":"透明框直接显示桌面；停稳后送入手机，结果在原应用中显示。") : "拖动窗口对准二维码，由真实手机应用识别。"))
                 } catch {
-                    guard !stopping && connected else{return}
-                    if nativeScannerOverlay != nil {_=await clearCamera()}
-                    busy=false;cameraSuppressed=true
-                    status("桌面相机未开启",error.localizedDescription)
+                    guard !stopping,connected,cameraPreparation?.token==preparationToken else{return}
+                    var retryStartup=false,showingResult=false
+                    let observedOverlay=nativeScannerOverlay
+                    let refreshNativeState=observedOverlay?.interleaved==true ||
+                        (genericDesktopCamera && nativeInterleavedRequested && nativeCameraScene != nil)
+                    let fresh = !Task.isCancelled && refreshNativeState ? try? await phone.cameraState():nil
+                    guard connected,!stopping,cameraPreparation?.token==preparationToken,nativeScannerOverlay === observedOverlay else{return}
+                    if let fresh {
+                        if nativeCameraScene?.sameSource(in:fresh)==true {
+                            switch nativeCameraScene?.recoverPreparation(in:fresh) {
+                            case .retryTransition:retryStartup=true
+                            case .showApplication:showingResult=true
+                            default:break
+                            }
+                        }
+                        else {nativeCameraScene=nil;retryStartup=fresh.captureActivity() != nil}
+                    }
+                    if cameraActive || observedOverlay != nil {_=await clearCamera()}
+                    guard connected,!stopping,cameraPreparation?.token==preparationToken else{return}
+                    busy=false;cameraSuppressed = !(retryStartup || showingResult)
+                    if showingResult {status("手机应用","继续在应用内操作；返回扫一扫后会重新取景。")}
+                    else {status(retryStartup ? "等待相机界面稳定":"桌面相机未开启",retryStartup ? "正在重新确认应用自己的相机画面…":error.localizedDescription)}
                     if await capture.permissionBlocked {
                         status("等待屏幕录制授权","请允许当前版本，随后点“授权后重启 App”。本次运行不会重复申请。")
                         targetWindow.showPermissionHelp(true)
@@ -1495,14 +1525,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     private func eligibleCameraActivity(_ state:PhoneCameraState)->PhoneCameraState.Activity? {
         guard state.desktopCameraEnabled==genericDesktopCamera else{return nil}
-        return state.captureActivity()
+        let candidate=state.captureActivity()
+        if genericDesktopCamera,nativeInterleavedRequested,let scene=nativeCameraScene {
+            if !scene.sameSource(in:state) {nativeCameraScene=nil}
+            else if let candidate,!scene.permits(candidate,in:state) {return nil}
+        }
+        return candidate
     }
     private func followCameraState(_ state:PhoneCameraState) async {
         guard connected,!stopping,!busy,cameraInvalidation==nil else{return}
         if let overlay=nativeScannerOverlay,!overlay.matches(state) {
             overlay.noteStateChange(state)
+            overlay.freeze();cameraWindow?.freezeNativeScanner();cameraPump?.stop();cameraLoop?.cancel()
             _=await clearCamera()
-            guard connected,!stopping,!Task.isCancelled else{return}
+            if connected,!stopping,!Task.isCancelled {status("手机应用","继续在应用内操作；返回扫一扫后会重新取景。")}
+            return // Never restart from the same snapshot that retired this scene.
         }
         let mainDisplay=await phone.scannerDisplay()?.id
         if let mainDisplay {try? await followDesktopHome(state,display:mainDisplay)}
@@ -1728,6 +1765,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0
         let availability=cameraWindowAvailability,nativeSourceLease=nativeScannerOverlay?.sourceLease
+        let sourceInterval:TimeInterval=nativeSourceLease != nil ? 1.0/30:0.125
         let pump=CameraPumpMailbox(sourceIsAvailable:{availability?.isAvailable != false}),generation=scanGeneration
         let diagnosticQRStart=performanceCheck == nil ? Double.infinity:ProcessInfo.processInfo.systemUptime+6.2
         let saveSyntheticPattern=performanceCheck != nil && CommandLine.arguments.contains("--diagnostic-pattern")
@@ -1848,7 +1886,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     try? await phone.clear(epoch:generation)
                     break
                 }
-                let rest=max(0,(localFrameMode ? (genericFrameMode ? 0.125:0.25):1.0/30)-(ProcessInfo.processInfo.systemUptime-began))
+                let rest=max(0,(localFrameMode ? (genericFrameMode ? sourceInterval:0.25):1.0/30)-(ProcessInfo.processInfo.systemUptime-began))
                 if rest>0 {try? await Task.sleep(nanoseconds:UInt64(rest*1_000_000_000))}
             }
         }
@@ -2018,7 +2056,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !networkProblem.isEmpty {problem += " " + networkProblem}
             if !chooserClean {problem += " 部分未选中的无线连接未清理，请在手机关闭无线调试。"}
             wechatWindow?.window?.orderOut(nil);wechatWindow=nil;applicationLibrary?.close();applicationLibrary=nil
-            cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil;desktopMode=false;genericDesktopCamera=false;mainControl.setPhoneDesktopMode(false)
+            cameraWindow?.setCameraActive(false);cameraWindow=nil;cameraDisplay=nil;desktopMode=false;genericDesktopCamera=false;nativeCameraScene=nil;mainControl.setPhoneDesktopMode(false)
             applicationPickerVisible=false;cachedApplications=nil;mainControl.hideApplicationPicker()
             connected=false;busy=false;stopping=false;independentApplicationsWhenLocked=false;primaryLocked=false;mirrorDisplay=nil;latestPhoneFrame=nil;latestPresentedMirrorFrame=nil;control.setPhoneImage(nil)
             if !problem.isEmpty {status("需要重新连接以清理",problem)}

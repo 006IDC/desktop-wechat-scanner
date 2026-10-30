@@ -145,7 +145,7 @@ public final class LiveCameraServer {
     private long sourceAcceptedNanos; // cameraLock
     private NativePreviewPattern previewPattern; // cameraLock
     private final CameraSourceLease sourceLease = new CameraSourceLease();
-    private boolean nativeSourceOnly; // stateLock + cameraLock; cleared only by explicit disable
+    private boolean nativeSourceOnly; // stateLock + cameraLock; cleared by explicit disable or a new capture epoch
 
 
     private static void log(String key, Object value) {
@@ -1479,9 +1479,15 @@ public final class LiveCameraServer {
                 if (length != Long.BYTES) { error(output, "Clear request needs an 8-byte epoch"); continue; }
                 long epoch = new DataInputStream(new ByteArrayInputStream(body)).readLong();
                 if (epoch < 0) { error(output, "Epoch must be nonnegative"); continue; }
-                if (epoch > currentEpoch) {
-                    currentEpoch = epoch;
-                    clearCameraFrame();
+                synchronized (stateLock) {
+                    if (epoch > currentEpoch) {
+                        currentEpoch = epoch;
+                        // An explicit new capture operation may select ordinary
+                        // camera input again. Retired native packets still carry
+                        // their old epoch/token and cannot enter this operation.
+                        synchronized (cameraLock) {nativeSourceOnly = false;}
+                        clearCameraFrame();
+                    }
                 }
                 try { awaitCameraPaints(); reply(output, true, new byte[0]); }
                 catch (IOException failure) { error(output, "Camera clear is not yet confirmed"); }

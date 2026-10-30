@@ -295,10 +295,11 @@ import QuartzCore
             guard let sourceLease else{throw CancellationError()}
             try await phone.nativePreviewCalibration(phase,lease:sourceLease)
             let deadline=CACurrentMediaTime()+2
-            var observed=before,lastAccepted=0.0,accepted=0
+            var observed=before,lastAccepted=0.0,accepted=0,nextStateCheck=CACurrentMediaTime()+0.08
             while accepted<3 {
                 let sample=try await nextCalibrationFrame(after:observed,notBefore:lastAccepted>0 ? lastAccepted+0.04:0,deadline:deadline)
                 observed=sample.revision
+                if CACurrentMediaTime()>=nextStateCheck {try await requireCurrent(phone);nextStateCheck=CACurrentMediaTime()+0.08}
                 let ready=phase==0 ? NativeCalibrationReadiness.blackVisible(sample.pixels):
                     (phase==1 ? Self.whiteVisible(sample.pixels):Self.isBlue(sample.pixels))
                 guard ready else{continue}
