@@ -891,3 +891,24 @@ B1的startCommand约227.2ms，其他轮约99.7/132.0/69.3ms；查询、系统迁
 双App轮微信launch142.6ms，但导航25s内未找到合格入口，没有发送扫码tap，整轮失败且未继续支付宝。随后支付宝独立轮launch639.7ms、扫码tap→owner634.8ms，capture prepare54.9ms后在capture操作返回固定display_changed，未发送首帧，整轮失败。两轮已有录屏权限true、未请求激活、清理和恢复记录核对通过。随后只读图形会话字典明确报告screenLocked=true；这说明当前实际桌面采集受锁屏阻碍，不能追认62未分类错误的唯一根因或认定权限失效。停止重复采集，无TCC重置/权限申请，未将63替换安装61。
 
 Mac锁屏期间继续只做无Mac窗口/采集的手机镜像启动观察。私有诊断仅增加最多9次脱敏前台分类、目标任务计数和与有界Display段解析的一致性，不改变正式启动准入。微信268.8ms，1次确认；支付宝735.1ms，4次确认。支付宝确认起点21.8/152.0/276.5ms时，目标任务已经存在且无其他用户，但前台为另一项；502.8ms才变成请求包。这5次观察里有界解析与正式选择全等，没有支持Display段越界造成这次等待。当前记录未保存前3次具体组件，不能称是Home或权限页，也不能将其当作历史最早失败已复现。两次最终前台、严格任务校验、恢复清理通过；不证明物理呈现。
+
+
+### 回调先到、resumed后到的隔离研究（不接入正式准入）
+
+精确小米SecondaryDisplayLauncher才允许聚焦的off/on/on/off四轮均通过，但前3次dump前台均缺失，没有一轮触发聚焦，所以不能报聚焦效果；launch633.8/603.5/608.8/588.6ms，无迁移root。随后只增加每次确认的认证活动回调观察，两轮支付宝434.4/121.7ms：慢轮28.7/160.3ms处listener已经报告请求包而dump仍无resumed，308.5ms处才有请求包；完整任务树始终存在请求包任务。两个信号并非原始component字串全等，不把同包当成同页面证据。
+
+进一步私有实验在launch前观察顶部非请求包、launch后回调转成请求包、dump foreground恰缺失、目标全部非HOME任务均为请求包/user0/无混用户时，仅在隔离测试提前返回；必须另等确认后的同代新解码帧，且测试结束仍等真实resumed包后才清理。没有注入输入、显示Mac窗口或测试扫码；正式PhoneSession完全未采用提前返回。
+
+|轮次|条件|内部launch(ms)|确认后新解码帧门槛(ms)|
+|---|---|---:|---:|
+|A1|原resumed|664.0|713.1|
+|B1|私有回调条件|116.2|131.3|
+|B2|私有回调条件|132.6|147.7|
+|A2|原resumed|608.6|643.7|
+
+四轮均无迁移root，两轮B确触发，最终resumed、清理和无恢复记录通过。这只说明潜在等待来自信号时点差，不证明目标App像素、物理可见或可操作；当前缓存不带userId、事件序号和launch epoch，独立复核不支持据此开放输入或宣称目标界面就绪。保持正式resumed门槛；Detached既有starting显示镜像的行为也不是额外身份证明。
+
+参考准确Android16 AOSP：[ActivityListener定义](https://github.com/aosp-mirror/platform_frameworks_base/blob/android-16.0.0_r1/core/java/android/companion/virtual/VirtualDeviceManager.java)、[控制器异步派发](https://github.com/aosp-mirror/platform_frameworks_base/blob/android-16.0.0_r1/services/companion/java/com/android/server/companion/virtual/GenericWindowPolicyController.java)。下一窄对照检查单次启动的`--activity-no-animation`，该参数对应[Intent.FLAG_ACTIVITY_NO_ANIMATION](https://github.com/aosp-mirror/platform_frameworks_base/blob/android-16.0.0_r1/core/java/android/content/Intent.java)，并不保证后续其他Activity不会再使用动画；不修改手机全局动画比例。
+
+
+该单次no-animation支付宝off/on/on/off四轮保留正式resumed、任务/恢复检查，并且双方均额外等待确认后的新解码帧；无迁移root，最终resumed、清理通过。launch611.1/619.4/137.8/615.5ms，新帧门槛626.4/715.0/153.0/626.7ms。B1仍慢，不能用B2单轮认定系统过渡是统一根因，不合入产品、不提高默认频率、不放宽启动准入。所有这些私有变体和运行数据未纳入公开源码或候选二进制，当前候选仍为63、安装61不变；Mac锁屏解除后才能继续实际桌面扫码验收。
