@@ -1181,17 +1181,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         if nativeOverlay?.termination["reason"] as? String == "pumpFailure" {
                             throw ScanError("原生预览已因采集或相机会话错误停止，本轮不继续切换应用。")
                         }
-                        if check.qrVisible,let pixels=latestPhoneFrame {
+                        if let shown=check.qrShownAt,let observed=latestPresentedMirrorFrame,
+                           SyntheticResultFrameGate.admits(currentRoute:observed.route === activeRoute && observed.route === scannerMirror,
+                            frameGeneration:observed.frame.generation,currentGeneration:observed.route.incarnation,
+                            receivedAt:observed.frame.receivedAt,shownAt:shown,now:ProcessInfo.processInfo.systemUptime) {
+                            let pixels=observed.frame.pixelBuffer
                             let observation=try await Task.detached {
                                 try SyntheticPhoneFrameProbe.inspect(pixels,expected:ScanPerformanceCheck.payload,probeQR:false)
                             }.value
+                            try Task.checkCancellation()
+                            guard connected,!stopping,performanceCheck === check,observed.route === activeRoute,
+                                  observed.frame.generation==observed.route.incarnation else{continue}
                             item["resultOCRChecks"]=(item["resultOCRChecks"] as? Int ?? 0)+1
                             item["ownResultPrefixSeen"]=(item["ownResultPrefixSeen"] as? Bool == true) || observation.prefixSeen
                             item["secondaryExactTextMatched"]=(item["secondaryExactTextMatched"] as? Bool == true) || observation.secondaryTextMatched
                             if let distance=observation.editDistance {item["bestResultEditDistance"]=min(item["bestResultEditDistance"] as? Int ?? distance,distance)}
                             if observation.textMatched {
                                 item["qrRecognized"]=true
-                                if let shown=check.qrShownAt {item["qrShownToNativeTextObservedMilliseconds"]=(ProcessInfo.processInfo.systemUptime-shown)*1000}
+                                item["qrShownToNativeTextObservedMilliseconds"]=(ProcessInfo.processInfo.systemUptime-shown)*1000
+                                item["qrShownToResultFrameReceiptMilliseconds"]=(observed.frame.receivedAt-shown)*1000
+                                item["resultFrameFromCurrentMirrorAfterQR"]=true
                                 item["returnedToNativeWindow"]=mainControl.window?.isVisible == true && localScanFrame == nil
                                 break
                             }
@@ -1481,14 +1490,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 while ProcessInfo.processInfo.systemUptime-started<14 {
                     try Task.checkCancellation()
                     try await Task.sleep(nanoseconds:200_000_000)
-                    if check.qrVisible,let pixels=latestPhoneFrame {
+                    if let shown=check.qrShownAt,let observed=latestPresentedMirrorFrame,
+                       SyntheticResultFrameGate.admits(currentRoute:observed.route === activeRoute && observed.route === scannerMirror,
+                        frameGeneration:observed.frame.generation,currentGeneration:observed.route.incarnation,
+                        receivedAt:observed.frame.receivedAt,shownAt:shown,now:ProcessInfo.processInfo.systemUptime) {
+                        let pixels=observed.frame.pixelBuffer
                         let result=try await Task.detached {
-                            let words=try Self.textIn(pixels)
-                            let barcode=VNDetectBarcodesRequest();barcode.symbologies=[.qr]
-                            try VNImageRequestHandler(cvPixelBuffer:pixels).perform([barcode])
-                            let visible=barcode.results?.contains{$0.payloadStringValue==ScanPerformanceCheck.payload} ?? false
-                            return (words.contains{$0.value.replacingOccurrences(of:" ",with:"").contains(ScanPerformanceCheck.payload)},visible)
+                            let observation=try SyntheticPhoneFrameProbe.inspect(pixels,expected:ScanPerformanceCheck.payload,probeQR:true)
+                            return (observation.textMatched,observation.qrVisible)
                         }.value
+                        try Task.checkCancellation()
+                        guard connected,!stopping,performanceCheck === check,observed.route === activeRoute,
+                              observed.frame.generation==observed.route.incarnation else{continue}
                         report["phoneSyntheticQRVisible"]=(report["phoneSyntheticQRVisible"] as? Bool == true) || result.1
                         // A plain-text result can stay in the scanner activity.
                         // The exact payload is never printed on the Mac test board.

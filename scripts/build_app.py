@@ -139,7 +139,7 @@ if (resources/'adb').exists():
     shutil.rmtree(resources/'adb')
 shutil.copytree(ROOT/'.local/adb-bundle',resources/'adb',copy_function=copy_without_metadata)
 (resources/'SOURCE-REVISION.txt').write_text(revision+'\n')
-subprocess.run(['swiftc','-swift-version','5','-O','-target','arm64-apple-macos14.4',
+subprocess.run(['swiftc','-swift-version','5','-O','-whole-module-optimization','-target','arm64-apple-macos14.4',
                 '-file-prefix-map',str(ROOT)+'=/source/desktop-wechat-scanner',
                 '-debug-prefix-map',str(ROOT)+'=/source/desktop-wechat-scanner',
                 '-module-cache-path',str(ROOT/'.local/swift-cache'),*map(str,sorted((ROOT/'mac').glob('*.swift'))),'-o',str(binary/'DesktopWeChatScanner')],check=True)

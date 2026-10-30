@@ -1097,3 +1097,6 @@ CMD32 的启用、退出与只读绘制计数，CMD33 的相位校准，以及 C
 
 
 共享严格识别器后的双App两轮均通过完整流程。首轮微信/支付宝均由独立ASCII top-1完整匹配，中文通道编辑距离为1，证实简化中文单通道会误判；文本观察耗时约3593/2884ms，挂载1481/1041ms，供图15.04/20.52fps（该轮前段与合成Vision自测存在负载重叠，不作性能基准）。无并行编译/合成测试负载的独立复测两App均主通道完整精确匹配、编辑距离0，挂载约1297/1240ms、供图21.87/22.39fps、测试板启用QR至原生文本观察约2203/2099ms。两轮运动窗口request队列异常增量均0；录屏权限true、用户前台不变、清图ACK与会话清理通过。时间是内部按钮派发至层挂载、Mac合成板QR启用至OCR观察，仍不是物理鼠标延迟；未操作用户前台或登录/支付结果。
+
+
+最终诊断再以`SyntheticResultFrameGate`核本轮QR启用后的本地帧：activeRoute/scannerMirror同一对象、正且匹配的mirror incarnation、receipt有限且不早于qrShownAt/不晚于本机时钟；OCR异步完成后再核连接、同一检查对象和route/incarnation。旧的精确结果帧、换路由与退休帧不可采纳；QR后收到的静态结果可复用，避免无谓等冗余帧。receipt只代表Mac本地到达，不能证明Androidpaint时点。正式与后台适配构建均启用Swift whole-module optimization，保持编译优化模式一致。
