@@ -59,19 +59,28 @@ struct AndroidOwnedTask: Codable, Equatable {
 struct AndroidTaskSnapshot: Equatable {
     let id: Int
     let display: Int
-    let packageName: String
+    let packageNames: Set<String>
+    /// A cross-app activity stack has no single package identity.
+    var packageName: String? {packageNames.count==1 ? packageNames.first:nil}
     let rootID: Int
     let userID: Int
     let rootContainsOtherUsers: Bool
+    let rootContainsUnknownTasks: Bool
     let isHome: Bool
     init(id: Int, display: Int, packageName: String, rootID: Int, isHome: Bool = false,
-         userID: Int = 0, rootContainsOtherUsers: Bool = false) {
+         userID: Int = 0, rootContainsOtherUsers: Bool = false,rootContainsUnknownTasks:Bool=false) {
+        self.init(id:id,display:display,packageNames:[packageName],rootID:rootID,isHome:isHome,
+                  userID:userID,rootContainsOtherUsers:rootContainsOtherUsers,rootContainsUnknownTasks:rootContainsUnknownTasks)
+    }
+    init(id:Int,display:Int,packageNames:Set<String>,rootID:Int,isHome:Bool=false,
+         userID:Int=0,rootContainsOtherUsers:Bool=false,rootContainsUnknownTasks:Bool=false) {
         self.id = id
         self.display = display
-        self.packageName = packageName
+        self.packageNames = packageNames
         self.rootID = rootID
         self.userID = userID
         self.rootContainsOtherUsers = rootContainsOtherUsers
+        self.rootContainsUnknownTasks = rootContainsUnknownTasks
         self.isHome = isHome
     }
     /// Convenience for historical fixtures; production must use parseChecked.
@@ -89,6 +98,7 @@ struct AndroidTaskSnapshot: Equatable {
         let indent: Int
         let display:Int
         let id: Int
+        let rootID:Int
         let size: Int?
         let isHome: Bool
         let userID: Int?
@@ -103,6 +113,7 @@ struct AndroidTaskSnapshot: Equatable {
     private static func scan(_ dump: String, strict: Bool, requiredDisplay: Int?) throws -> [Self] {
         var display: Int?, displayIndent = -1, tasks: [Int: Self] = [:]
         var displays = Set<Int>(), containerDiagnostics = false
+        var taskHeaders=Set<Int>()
         var nodes: [TaskNode] = [], roots: [Int] = []
         var rootUsers: [RootKey: Set<Int>] = [:]
         let displayPattern = try! NSRegularExpression(pattern: "^Display #([0-9]+) \\(activities from top to bottom\\):$")
@@ -133,6 +144,9 @@ struct AndroidTaskSnapshot: Equatable {
             if indent <= displayIndent { display = nil; roots.removeAll(); continue }
             while let last = roots.last, nodes[last].indent >= indent { roots.removeLast() }
             if let match = taskPattern.firstMatch(in: line, range: range), let id = Int(ns.substring(with: match.range(at: 1))), id > 0 {
+                // Multiple Hist records may share an id; real Task headers
+                // may not. Do not let the activity aggregation hide reuse.
+                if strict,!taskHeaders.insert(id).inserted {throw ValidationError(reason:.conflictingTask)}
                 let size = sizePattern.firstMatch(in: line, range: range).flatMap { Int(ns.substring(with: $0.range(at: 1))) }
                 let userID = taskUserPattern.firstMatch(in: line, range: range).flatMap { Int(ns.substring(with: $0.range(at: 1))) }
                 // Only the authoritative Task header after its numeric ID may
@@ -145,7 +159,7 @@ struct AndroidTaskSnapshot: Equatable {
                 let rootKey = RootKey(display: currentDisplay, id: roots.first.map { nodes[$0].id } ?? id)
                 if let userID { rootUsers[rootKey, default: []].insert(userID) }
                 if let parent = roots.last { nodes[parent].childTasks += 1 }
-                nodes.append(TaskNode(indent: indent, display:currentDisplay, id: id, size: size, isHome: isHome, userID: userID)); roots.append(nodes.count - 1); continue
+                nodes.append(TaskNode(indent: indent, display:currentDisplay, id: id,rootID:rootKey.id, size: size, isHome: isHome, userID: userID)); roots.append(nodes.count - 1); continue
             }
             if fragmentPattern.firstMatch(in:line,range:range) != nil {
                 // Android 16 TaskFragment.dump recursively nests activities but
@@ -156,7 +170,7 @@ struct AndroidTaskSnapshot: Equatable {
                 }
                 nodes[parent].childTasks+=1
                 let task=nodes[owner]
-                nodes.append(TaskNode(indent:indent,display:currentDisplay,id:task.id,size:nil,isHome:task.isHome,userID:task.userID,isFragment:true))
+                nodes.append(TaskNode(indent:indent,display:currentDisplay,id:task.id,rootID:task.rootID,size:nil,isHome:task.isHome,userID:task.userID,isFragment:true))
                 roots.append(nodes.count-1);continue
             }
             if strict && line.hasPrefix("*") && line.dropFirst().trimmingCharacters(in: .whitespaces).hasPrefix("Task") {
@@ -178,8 +192,11 @@ struct AndroidTaskSnapshot: Equatable {
             rootUsers[rootKey, default: []].insert(user)
             let entry = Self(id: id, display: currentDisplay, packageName: ns.substring(with: match.range(at: 2)),
                              rootID: nodes[root].id, isHome: nodes[root].isHome, userID: user)
-            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID || old.isHome != entry.isHome || old.userID != entry.userID || old.packageName != entry.packageName { throw ValidationError(reason:.conflictingTask) }
-            tasks[id] = entry
+            if strict, let old = tasks[id], old.display != entry.display || old.rootID != entry.rootID || old.isHome != entry.isHome || old.userID != entry.userID { throw ValidationError(reason:.conflictingTask) }
+            // Hist records are activities, not task owners. Android can keep
+            // activities from several packages in one otherwise coherent task.
+            tasks[id] = Self(id:id,display:entry.display,packageNames:(tasks[id]?.packageNames ?? []).union(entry.packageNames),
+                             rootID:entry.rootID,isHome:entry.isHome,userID:entry.userID)
         }
         if strict {
             guard !displays.isEmpty, requiredDisplay.map({ displays.contains($0) }) ?? true else { throw ValidationError(reason:.missingDisplay) }
@@ -194,10 +211,15 @@ struct AndroidTaskSnapshot: Equatable {
                 }
             }
         }
+        // Empty real leaf Tasks have no package identity. They must not be
+        // hidden when another activity-bearing task in that root is moved.
+        let unknownRoots=Set(nodes.filter{!$0.isFragment && $0.childTasks==0 && $0.histories==0}
+            .map{RootKey(display:$0.display,id:$0.rootID)})
         return tasks.values.map { entry in
-            Self(id: entry.id, display: entry.display, packageName: entry.packageName,
+            Self(id: entry.id, display: entry.display, packageNames: entry.packageNames,
                  rootID: entry.rootID, isHome: entry.isHome, userID: entry.userID,
-                 rootContainsOtherUsers: rootUsers[RootKey(display: entry.display, id: entry.rootID)]?.contains(where: { $0 != 0 }) == true)
+                 rootContainsOtherUsers: rootUsers[RootKey(display: entry.display, id: entry.rootID)]?.contains(where: { $0 != 0 }) == true,
+                 rootContainsUnknownTasks:unknownRoots.contains(RootKey(display:entry.display,id:entry.rootID)))
         }.sorted { $0.id < $1.id }
     }
 }

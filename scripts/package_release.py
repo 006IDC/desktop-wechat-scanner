@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE = '0.4.0-preview.5'
-APP_BUILD = '63'
+APP_BUILD = '64'
 APP_NAME = 'MiraDroid.app'
 STEM = f'MiraDroid-{RELEASE}-macOS-arm64'
 OUT = ROOT / 'build/release' / RELEASE

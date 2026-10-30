@@ -85,6 +85,67 @@ struct ScanError:LocalizedError {
         let tainted=try AndroidTaskSnapshot.parseChecked(emptyOtherUser,requiredDisplay:0)
         require(tainted.contains{$0.id==11 && $0.rootContainsOtherUsers})
         rejects{_ = try OwnedTaskMove.rootToMove(expected:[task(11)],current:tainted,destination:7)}
+        let unrelatedMixed=AndroidTaskSnapshot(id:80,display:0,packageNames:["org.example.first","org.example.second"],rootID:80)
+        require(try OwnedTaskMove.applicationTasks(in:expected+[unrelatedMixed],packageName:"org.example.selected",target:7)==expected)
+        for package in unrelatedMixed.packageNames {
+            rejects{_ = try OwnedTaskMove.applicationTasks(in:expected+[unrelatedMixed],packageName:package,target:7)}
+        }
+        rejects{_ = try OwnedTaskMove.applicationTasks(in:expected+[task(13,pkg:"org.example.other")],packageName:"org.example.selected",target:7)}
+        rejects{_ = try OwnedTaskMove.applicationTasks(in:[task(11,home:true)],packageName:"org.example.selected",target:7)}
+        rejects{_ = try OwnedTaskMove.applicationTasks(in:tainted,packageName:"org.example.selected",target:7)}
+        let ownedMixed=AndroidTaskSnapshot(id:81,display:7,packageNames:["org.example.selected","org.example.result"],rootID:81)
+        let mixedMoved=AndroidTaskSnapshot(id:81,display:3,packageNames:ownedMixed.packageNames,rootID:81)
+        let oldRecord=AndroidOwnedTask(id:81,originalDisplay:3,packageName:"org.example.selected",ownedDisplay:7)
+        require(OwnedTaskMove.originalDisplay(for:ownedMixed,recorded:[oldRecord])==3)
+        require(OwnedTaskMove.originalDisplay(for:ownedMixed,recorded:[])==0)
+        require(try OwnedTaskMove.rootToMove(expected:[ownedMixed],current:[ownedMixed],destination:3)==81)
+        try OwnedTaskMove.requireArrival(expected:[ownedMixed],current:[mixedMoved],destination:3)
+        for packages:Set<String> in [["org.example.selected"],["org.example.selected","org.example.result","org.example.new"]] {
+            let changed=AndroidTaskSnapshot(id:81,display:3,packageNames:packages,rootID:81)
+            rejects{try OwnedTaskMove.requireArrival(expected:[ownedMixed],current:[changed],destination:3)}
+        }
+        let embeddedMixed="""
+        Display #0 (activities from top to bottom):
+          * Task{mixed #82 U=0 sz=1 type=standard}
+            * TaskFragment{a1 mode=fullscreen}
+              * Hist #1: ActivityRecord{a u0 org.example.other/.Main t82}
+              * Hist #0: ActivityRecord{b u0 org.example.selected/.Result t82}
+        """
+        let fragmentTasks=try AndroidTaskSnapshot.parseChecked(embeddedMixed,requiredDisplay:0)
+        require(fragmentTasks[0].packageNames==["org.example.other","org.example.selected"])
+        rejects{_ = try OwnedTaskMove.applicationTasks(in:fragmentTasks,packageName:"org.example.selected",target:7)}
+        let sameUserEmpty=emptyOtherUser.replacingOccurrences(of:"U=10",with:"U=0")
+        let unknownSibling=try AndroidTaskSnapshot.parseChecked(sameUserEmpty,requiredDisplay:0)
+        require(unknownSibling.count==1 && unknownSibling[0].rootContainsUnknownTasks)
+        rejects{_ = try OwnedTaskMove.applicationTasks(in:unknownSibling,packageName:"org.example.selected",target:7)}
+        rejects{_ = try OwnedTaskMove.rootToMove(expected:[task(11)],current:unknownSibling,destination:7)}
+        // Root-level unions stay the same if task package sets are exchanged.
+        // Per-task identity must still reject that change.
+        let pair=[ownedMixed,AndroidTaskSnapshot(id:83,display:7,packageNames:["org.example.third"],rootID:81)]
+        let swapped=[AndroidTaskSnapshot(id:81,display:3,packageNames:["org.example.third"],rootID:81),
+                     AndroidTaskSnapshot(id:83,display:3,packageNames:ownedMixed.packageNames,rootID:81)]
+        rejects{try OwnedTaskMove.requireArrival(expected:pair,current:swapped,destination:3)}
+        let twoRoots=[task(11),task(84,root:84)]
+        require(try OwnedTaskMove.applicationTasks(in:twoRoots+[unrelatedMixed],packageName:"org.example.selected",target:7)==twoRoots)
+        rejects{_ = try OwnedTaskMove.applicationTasks(in:[task(11),task(12,display:3)],packageName:"org.example.selected",target:7)}
+        let component="org.example.selected/.Main"
+        require(OwnedTaskMove.applicationIsForeground(component:component,taskID:11,in:arrived,packageName:"org.example.selected",target:7))
+        for id:Int? in [nil,0,90] {
+            require(!OwnedTaskMove.applicationIsForeground(component:component,taskID:id,in:arrived,packageName:"org.example.selected",target:7))
+        }
+        require(!OwnedTaskMove.applicationIsForeground(component:component,taskID:11,in:expected,packageName:"org.example.selected",target:7))
+        require(!OwnedTaskMove.applicationIsForeground(component:component,taskID:11,in:arrived+[task(11)],packageName:"org.example.selected",target:7))
+        require(!OwnedTaskMove.applicationIsForeground(component:"org.example.other/.Main",taskID:11,in:arrived,packageName:"org.example.selected",target:7))
+        let unknownTarget=try AndroidTaskSnapshot.parseChecked(sameUserEmpty.replacingOccurrences(of:"Display #0",with:"Display #7"),requiredDisplay:7)
+        // The production caller runs this plan before its recovery-write loop.
+        rejects{_ = try OwnedTaskMove.applicationTasksOnTarget(in:unknownTarget,packageName:"org.example.selected",target:7)}
+        require(!OwnedTaskMove.applicationIsForeground(component:component,taskID:11,in:unknownTarget,packageName:"org.example.selected",target:7))
+        for invalid in [[task(11,display:7,home:true)],[task(11,display:7,user:10)],[task(11,display:7,mixed:true)]] {
+            rejects{_ = try OwnedTaskMove.applicationTasksOnTarget(in:invalid,packageName:"org.example.selected",target:7)}
+            require(!OwnedTaskMove.applicationIsForeground(component:component,taskID:11,in:invalid,packageName:"org.example.selected",target:7))
+        }
+        require(try OwnedTaskMove.applicationTasksOnTarget(in:[ownedMixed],packageName:"org.example.selected",target:7)==[ownedMixed])
+        require(OwnedTaskMove.applicationIsForeground(component:component,taskID:81,in:[ownedMixed],packageName:"org.example.selected",target:7))
         print("PASS single-read whole-root validation: foreign child, mixed user, HOME, reparent/reuse, split display, disappearance, arrival and idempotent restore; no device or UI")
     }
 }

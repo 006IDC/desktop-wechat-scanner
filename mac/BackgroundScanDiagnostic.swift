@@ -478,6 +478,7 @@ private final class BackgroundScanResult:@unchecked Sendable {
         await mirror?.stop();board?.orderOut(nil)
         let cleanup=await phone.disconnect()
         report["applications"]=items;report["cleanupSucceeded"]=cleanup.isEmpty
+        report["cleanupStage"]=await phone.cleanupStage
         report["sessionRecordAbsent"] = !FileManager.default.fileExists(atPath:journal.path)
         report["frontmostUnchanged"] = frontBefore==NSWorkspace.shared.frontmostApplication?.processIdentifier
         report["passed"]=passed && cleanup.isEmpty && report["sessionRecordAbsent"] as? Bool==true

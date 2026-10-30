@@ -234,8 +234,9 @@ import Foundation
         """
         let embedded=try AndroidTaskSnapshot.parseChecked(fragments,requiredDisplay:8)
         require(embedded.count==1 && embedded[0].id==20 && embedded[0].rootID==20 && embedded[0].userID==0 && embedded[0].packageName=="org.example.app","Fragments became tasks or lost owning task")
+        let crossPackageFragment=try AndroidTaskSnapshot.parseChecked(fragments.replacingOccurrences(of:"org.example.app/.Second",with:"org.example.other/.Second"),requiredDisplay:8)
+        require(crossPackageFragment.count==1 && crossPackageFragment[0].packageName==nil && crossPackageFragment[0].packageNames==["org.example.app","org.example.other"],"A fragment activity package was lost or guessed as the sole task owner")
         let unsafeFragments=[
-            fragments.replacingOccurrences(of:"org.example.app/.Second",with:"org.example.other/.Second"),
             fragments.replacingOccurrences(of:"ActivityRecord{y u0",with:"ActivityRecord{y u999"),
             fragments.replacingOccurrences(of:".Second t20",with:".Second t21"),
             fragments.replacingOccurrences(of:"sz=2",with:"sz=3"),
@@ -255,6 +256,26 @@ import Foundation
         """
         let child=try AndroidTaskSnapshot.parseChecked(embeddedChild,requiredDisplay:8)
         require(child.count==1 && child[0].id==21 && child[0].rootID==20,"Nested actual Task lost root ownership")
+        let crossPackage="""
+        Display #0 (activities from top to bottom):
+          * Task{normal #30 U=0 sz=2 type=standard}
+            * Hist #1: ActivityRecord{a u0 org.example.first/.Main t30}
+            * Hist #0: ActivityRecord{b u0 org.example.second/.Result t30}
+        Display #8 (activities from top to bottom):
+        """
+        let mixedTask=try AndroidTaskSnapshot.parseChecked(crossPackage,requiredDisplay:8)
+        require(mixedTask.count==1 && mixedTask[0].packageName==nil && mixedTask[0].packageNames==["org.example.first","org.example.second"],"Unrelated coherent cross-app task blocked the owned display or lost a package")
+        let reversed=crossPackage.replacingOccurrences(of:"org.example.first/.Main",with:"org.example.second/.Result").replacingOccurrences(of:"ActivityRecord{b u0 org.example.second/.Result",with:"ActivityRecord{b u0 org.example.first/.Main")
+        require(try AndroidTaskSnapshot.parseChecked(reversed,requiredDisplay:8)==mixedTask,"History order changed a task's package set")
+        for changed in [
+            "Display #0 (activities from top to bottom):\n  * Task{same #30 U=0 sz=1 type=standard}\n    * Hist #0: ActivityRecord{a u0 org.example.first/.Main t30}\n  * Task{same #30 U=0 sz=1 type=standard}\n    * Hist #0: ActivityRecord{a u0 org.example.first/.Main t30}",
+            "Display #0 (activities from top to bottom):\n  * Task{same #30 U=0 sz=0 type=standard}\n  * Task{same #30 U=0 sz=0 type=standard}",
+            "Display #0 (activities from top to bottom):\n  * Task{a #30 U=0 sz=1 type=standard}\n    * Hist #0: ActivityRecord{a u0 org.example.first/.Main t30}\nDisplay #8 (activities from top to bottom):\n  * Task{b #30 U=0 sz=1 type=standard}\n    * Hist #0: ActivityRecord{b u0 org.example.first/.Main t30}",
+            "Display #0 (activities from top to bottom):\n  * Task{a #30 U=0 sz=1 type=home}\n    * Hist #0: ActivityRecord{a u0 org.example.first/.Main t30}\n  * Task{b #30 U=0 sz=1 type=standard}\n    * Hist #0: ActivityRecord{b u0 org.example.first/.Main t30}",
+            crossPackage.replacingOccurrences(of:"Task{normal #30 U=0",with:"Task{normal #30").replacingOccurrences(of:"ActivityRecord{b u0",with:"ActivityRecord{b u999")
+        ] {
+            do {_=try AndroidTaskSnapshot.parseChecked(changed);fatalError("Structural/user conflict accepted as a package union")}catch{}
+        }
         print("PASS authoritative task parser and fail-closed checked production path, trusted empty displays/split children, real Hist spacing and unknown/partial/absent target rejection")
     }
 }

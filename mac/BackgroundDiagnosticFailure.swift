@@ -12,6 +12,9 @@ enum BackgroundDiagnosticFailure {
         }
         if let error=error as? ScanError {
             let known=[
+                "此应用与其他应用共享任务容器，无法安全地单独移入窗口。":"shared_task_root",
+                "应用窗口的任务归属尚未完整确认，已保留窗口和恢复记录。":"unconfirmed_restore_tasks",
+                "应用任务的归属尚未完整确认，已保留恢复记录。":"unconfirmed_target_tasks",
                 "无法排除本 App，请重新打开 App。":"own_application_metadata",
                 "合成测试窗口尚未就绪。":"own_board_metadata",
                 "显示器已变化，请重新开始扫码。":"display_changed",

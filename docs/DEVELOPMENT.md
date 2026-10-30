@@ -912,3 +912,23 @@ Mac锁屏期间继续只做无Mac窗口/采集的手机镜像启动观察。私�
 
 
 该单次no-animation支付宝off/on/on/off四轮保留正式resumed、任务/恢复检查，并且双方均额外等待确认后的新解码帧；无迁移root，最终resumed、清理通过。launch611.1/619.4/137.8/615.5ms，新帧门槛626.4/715.0/153.0/626.7ms。B1仍慢，不能用B2单轮认定系统过渡是统一根因，不合入产品、不提高默认频率、不放宽启动准入。所有这些私有变体和运行数据未纳入公开源码或候选二进制，当前候选仍为63、安装61不变；Mac锁屏解除后才能继续实际桌面扫码验收。
+
+
+## build64 同任务多包修复（2026-10-30，候选验证中）
+
+机主解锁后复核图形会话screenLocked=false、候选63严格签名及无其他扫码进程后，进行非激活后台实扫。微信、支付宝及带只读轮询的第三轮都在initialTaskSnapshot抛conflictingTask，未迁移、未发扫码tap，三轮均保留恢复记录；不能称性能通过。每次测试进程退出后均由当前正式恢复逻辑核验并清理，无删除/绕过记录。外部轮询没有捕获精确冲突，因此改用仅加固定字段的真实Swift解析器现场插桩；结果为physical显示、非HOME、非目标显示，同display/root/home/user，仅package不同。该诊断也以保留记录停止，再由正式恢复器清理。原始dump、设备标识和实际包名未保存/公开。
+
+错误在于旧模型给每Task只存一个package，把同task多Activity的不同包判成结构冲突。[Android官方任务说明](https://developer.android.com/guide/components/activities/tasks-and-back-stack)说明连续打开的Activity可以进入同一task；本次不据相同Task ID推断只有单包。64改用每task精确packageNames集合，单包便利属性为optional，多包返回nil；display/root/HOME/user冲突仍拒绝。初始搜索包含所选包的所有任务，再要求移动根每task均为该包的单包任务；不含所选包的其他根多包任务仍保留在快照，不影响本次打开，不忽略其用户/根结构。
+
+恢复政策保持兼容结果页：已经处于本次自有显示中的同用户任务，旧record的包仍属于当前完整集合时沿用record的原显示，新任务默认返回主屏；不是历史身份等价证明。记录格式不改、不把完整活动历史持久化。实际根移动前/后比较每task的精确包集合以及id/root/display/user/HOME，集合增删或跨task交换均拒绝；根的空真实叶Task没有包身份时，会标记rootContainsUnknownTasks并拒绝迁移/恢复该活动根。只含子任务的容器不误判；独立无Activity空树的既有处理不变。原resumed/同代新帧/input/相机归属门槛不变，不采用上轮私有提前回调/动画试验。
+
+纯数据回归覆盖同task多包、Hist顺序、TaskFragment包集合完整保留，无关混包不阻挡，选择混包任意成员均拒绝，foreign sibling/混用户/HOME/同根空叶拒绝、多纯净根保留、恢复锚点与每task集合增删/交换拒绝。AndroidApplication全套及OwnedTaskMove通过；完整包与真机另列。候选64尚未替换安装61，录屏权限未重置。
+
+
+64开发代码（O0，未签名包）与字节未变的63手机服务的隐藏生产集成已通过：真实微信首次启动、新帧、仅自有视频断流、旧source失效/clear ACK、同Mac窗口新显示重试、最终请求App前台和完整清理；所有Mac窗口未显示、无桌面采集或Mac输入。首次launch336.0ms+后续新帧660.1ms，重试launch1110.9ms+新帧64.2ms，仅作功能定位，不与优化构建比性能；该轮仍有慢重试，不能称稳定提速。另提前拒绝同root跨display到恢复记录写入前，并通过相应纯数据反例。完整签名包扫码待下一节。
+
+后台报告另补固定cleanupStage，以及共享任务根/未确认恢复任务的白名单分类，仍不保存任意异常文本；分类脱敏反例测试通过。
+
+独立复核发现启动后的unknown根仍可能在旧确认分支写record/报告ready，已补目标任务规划：所有新目标任务先检查user0、非HOME、无混用户/未知空叶后才进入record写入循环；ready必须将原生resumed中的正task ID唯一关联到该目标任务及包集合，不能只凭组件包前缀。纯数据反例覆盖启动后unknown空叶、缺失/错误/重复task ID、错显示/用户/HOME；同用户结果页集合仍可确认。等待完整包复测，不追认前一开发集成覆盖了这次增量。
+
+另补真实Task header的全局ID唯一检查，防止两个同字段Task头被Hist聚合字典压成一个条目；同Task多Hist/TaskFragment仍允许，重复真实Task头（含空Task）反例拒绝。

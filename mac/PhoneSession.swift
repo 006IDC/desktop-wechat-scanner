@@ -740,19 +740,14 @@ actor PhoneSession {
         guard entries.contains(where:{$0.canonicalComponent==app.canonicalComponent}) else{throw ScanError("手机主用户中未找到此应用入口。")}
         return try DesktopCameraLaunch.perform(bind:{try self.measureLaunch("bindMilliseconds"){try self.bindDesktopCamera(display:target,package:app.packageName)}},launch:{
             let before = try measureLaunch("initialTaskSnapshotMilliseconds"){try tasks(requiredDisplay:target)}
-            let moving = before.filter { $0.userID == 0 && $0.packageName == app.packageName && $0.display != target }
+            let moving = try OwnedTaskMove.applicationTasks(in:before,packageName:app.packageName,target:target)
             let groups = Dictionary(grouping: moving, by: \.rootID)
             lastLaunchStages["movingRoots"]=Double(groups.count)
             lastLaunchStages["movingTasks"]=Double(moving.count)
-            for root in groups.keys {
-                guard before.filter({ $0.rootID == root }).allSatisfy({ $0.userID == 0 && !$0.rootContainsOtherUsers && $0.packageName == app.packageName && $0.display != target }) else {
-                    throw ScanError("此应用与其他应用共享任务容器，无法安全地单独移入窗口。")
-                }
-            }
             // Record every child before moving a root once: one root move affects all children.
             for task in moving {
                 if state.appTasks?.contains(where: { $0.id == task.id }) != true {
-                    appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: task.display, packageName: task.packageName, ownedDisplay: target))
+                    appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: task.display, packageName: app.packageName, ownedDisplay: target))
                 } else if let index = recovery?.appTasks?.firstIndex(where: { $0.id == task.id }), let old = recovery?.appTasks?[index] {
                     recovery?.appTasks?[index] = AndroidOwnedTask(id: old.id, originalDisplay: old.originalDisplay, packageName: old.packageName, ownedDisplay: target)
                 }
@@ -775,7 +770,8 @@ actor PhoneSession {
                     let dump=try activityTaskDump()
                     return (dump,try AndroidTaskSnapshot.parseChecked(dump,requiredDisplay:target))
                 }
-                for task in after where task.userID == 0 && !task.rootContainsOtherUsers && task.packageName == app.packageName && task.display == target && !(recovery?.appTasks?.contains(where: { $0.id == task.id }) ?? false) {
+                let targetTasks=try OwnedTaskMove.applicationTasksOnTarget(in:after,packageName:app.packageName,target:target)
+                for task in targetTasks where !(recovery?.appTasks?.contains(where: { $0.id == task.id }) ?? false) {
                     appendAppTask(AndroidOwnedTask(id: task.id, originalDisplay: 0, packageName: app.packageName, ownedDisplay: target))
                     try measureLaunch("recoverySaveMilliseconds"){try save()}
                 }
@@ -784,15 +780,16 @@ actor PhoneSession {
                 lastApplicationLaunchEvidence=[
                     "foregroundKind":foreground.map{$0.hasPrefix(app.packageName+"/") ? 1:2} ?? 0,
                     "foregroundTaskPlacementKind":foregroundTask.map{$0.display==target ? 1:2} ?? 0,
-                    "foregroundTaskPackageAgreementConfirmed":foregroundTask.map{task in foreground?.hasPrefix(task.packageName+"/")==true ? 1:0} ?? 0,
+                    "foregroundTaskPackageAgreementConfirmed":foregroundTask.map{task in task.packageNames.contains(where:{foreground?.hasPrefix($0+"/")==true}) ? 1:0} ?? 0,
                     "targetTaskCount":after.filter{$0.display==target}.count,
-                    "requestedTasksOnTarget":after.filter{$0.display==target && $0.userID==0 && $0.packageName==app.packageName}.count,
-                    "requestedTasksElsewhere":after.filter{$0.display != target && $0.userID==0 && $0.packageName==app.packageName}.count,
+                    "requestedTasksOnTarget":after.filter{$0.display==target && $0.userID==0 && $0.packageNames.contains(app.packageName)}.count,
+                    "requestedTasksElsewhere":after.filter{$0.display != target && $0.userID==0 && $0.packageNames.contains(app.packageName)}.count,
                     "otherUserTasksOnTarget":after.filter{$0.display==target && ($0.userID != 0 || $0.rootContainsOtherUsers)}.count]
                 // Preserve newly discovered task recovery before honoring a
                 // cancellation that arrived during the blocking snapshot.
                 try Task.checkCancellation()
-                if foreground?.hasPrefix(app.packageName+"/")==true {
+                if OwnedTaskMove.applicationIsForeground(component:foreground,taskID:observation?.taskID,
+                        in:after,packageName:app.packageName,target:target) {
                     lastLaunchStages["confirmed"]=1
                     lastApplicationLaunchEvidence=nil
                     return
@@ -807,8 +804,8 @@ actor PhoneSession {
     }
     private func restoreTasks(on target: Int) throws {
         let snapshot = try tasks(requiredDisplay: target)
-        guard snapshot.filter({ $0.display == target }).allSatisfy({ $0.userID == 0 && !$0.rootContainsOtherUsers }) else {
-            throw ScanError("应用窗口包含其他手机用户，已保留窗口和恢复记录。")
+        guard snapshot.filter({ $0.display == target }).allSatisfy({ $0.userID == 0 && !$0.rootContainsOtherUsers && !$0.rootContainsUnknownTasks }) else {
+            throw ScanError("应用窗口的任务归属尚未完整确认，已保留窗口和恢复记录。")
         }
         let recorded = recovery?.appTasks ?? []
         // Native secondary HOME belongs to the owned display itself. Android
@@ -822,7 +819,7 @@ actor PhoneSession {
                 throw ScanError("任务容器跨越多个屏幕，已保留恢复记录。")
             }
             let targetDisplays = Set(group.map { task in
-                recorded.first(where: { $0.id == task.id && $0.packageName == task.packageName })?.originalDisplay ?? 0
+                OwnedTaskMove.originalDisplay(for:task,recorded:recorded)
             })
             guard targetDisplays.count == 1, let destination = targetDisplays.first, destination != target else {
                 throw ScanError("同一任务容器的原屏幕记录不一致，已保留窗口和恢复记录。")
