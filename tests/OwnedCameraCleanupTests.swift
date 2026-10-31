@@ -26,6 +26,11 @@ import Foundation
         var failed=false
         do {try OwnedCameraCleanup.quiesce(read:{throw ScanError("read failure")})} catch {failed=true}
         precondition(failed,"Status failure was ignored")
+        let failedProducer:[String:Any]=["version":1,"generation":1,"activeStreams":0,"activities":[],"desktopHome":true,
+            "ownerKnown":true,"cameraOwner":NSNull(),"ownerGeneration":3,"requestDriverHealthy":false]
+        let closed=try PhoneCameraState.decode(JSONSerialization.data(withJSONObject:failedProducer))
+        precondition(closed.ownerKnown && !closed.requestDriverHealthy && closed.captureActivity()==nil)
+        r=run([closed]);precondition(r.0 && r.1==2,"A failed producer made known closed ownership impossible to confirm")
         print("PASS owned camera cleanup: no app input, stable known closed owner twice, fail closed on active/unknown/read error")
     }
 }

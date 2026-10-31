@@ -67,14 +67,15 @@ final class CameraPumpMailbox: @unchecked Sendable {
         lock.lock();defer{lock.unlock()}
         return admitsFrames && time>=captureNotBefore
     }
-    func publish(_ value:DesktopCaptureTarget) {
+    @discardableResult func publish(_ value:DesktopCaptureTarget)->Bool {
         lock.lock();defer{lock.unlock()}
         if admitsFrames {
             hasRegionHistory=true
             if target?.rect != value.rect || target?.displayID != value.displayID ||
                 target?.screenFrame != value.screenFrame || target?.pixelSize != value.pixelSize {revision &+= 1}
-            target=value
+            target=value;return true
         }
+        return false
     }
     func selection()->Selection? {
         lock.lock();defer{lock.unlock()}

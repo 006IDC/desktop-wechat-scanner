@@ -4,6 +4,8 @@ MiraDroid（原名“桌面微信扫码”）在 Mac 上操作真实 Android 手
 
 **公开发行仍为 preview.4，本机安装版为 build71（源码 `d8ca0a5`）。build71 采用相机请求驱动供图、并行编码/清图，并改进原生结果过渡；后台双App完整控制器识码和安装后的录屏/识码回归已通过。同窗口原生扫码已接入连接界面：保留 Android App 自己的控件和动画，由 Mac 直接透出桌面，真实桌面帧交给原 App 分析。连接时可勾选“原生扫码界面（试用）”，默认关闭；使用方式见[同窗口原生预览](docs/DEVELOPMENT.md#build69-原生扫码选择与场景恢复2026-10-31)，最新数据见[build71验证](docs/DEVELOPMENT.md#build71-移动捕获与旧图清除并行2026-10-31)。**
 
+build72 候选修复透明窗口的原生标题栏，并调整30Hz几何节拍和旧源提交等待；明暗窗口截图、并发与归属/清理回归已通过，完整退出流程仍在真机复验。本机安装版暂保持71，详见[build72记录](docs/DEVELOPMENT.md#build72-标题栏与原生供图节拍2026-10-31)。
+
 build67 起已取消通用桌面相机每次移动后的180ms重复等待，保留移动时旧区域失效、暂停与刷新保护。当前小米 USB 上，微信与支付宝均有真实合成码识别和清理记录；[运动与响应对照](docs/DEVELOPMENT.md#build67-通用模式运动供图2026-10-30)区分送图 ACK、程序移动和实际显示。
 
 [公开发行](https://github.com/006IDC/desktop-wechat-scanner/releases) · [安装说明](docs/INSTALL.md) · [版本记录](CHANGELOG.md)
@@ -57,7 +59,7 @@ python3 scripts/build_app.py
 python3 scripts/package_release.py
 ```
 
-构建前提交源码；App 记录准确 commit。ADB 从固定开源源码构建，工具和源码归档校验 SHA-256，缓存放 `.local/`；scrcpy server 固定官方 5.0.1。打包脚本按预览版目录写入发行物且不覆盖旧版；本机安装67，继续验证，尚未作为公开发行物；不能把旧发行物当作本候选。构建默认不替换已安装 App。
+构建前提交源码；App 记录准确 commit。ADB 从固定开源源码构建，工具和源码归档校验 SHA-256，缓存放 `.local/`；scrcpy server 固定官方 5.0.1。打包脚本按预览版目录写入发行物且不覆盖旧版；本机安装71，候选继续验证，尚未作为公开发行物；不能把旧发行物当作本候选。构建默认不替换已安装 App。
 
 原创代码采用 [Apache-2.0](LICENSE)；ADB/依赖的对应源码、许可证与构建配方随 App 分发，见 [第三方说明](THIRD_PARTY.md)、[开发与测试](docs/DEVELOPMENT.md)、[隐私](docs/PRIVACY.md)。维护者：[006IDC](https://github.com/006IDC)。
 

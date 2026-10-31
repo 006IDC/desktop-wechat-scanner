@@ -31,6 +31,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var catalogTask:Task<Void,Never>?
     private var physicalFrame:CVPixelBuffer?
     private var nextCameraGeometry=0.0
+    private var nativeGeometryClock=NativeGeometryClock()
     private let physicalMirror=MirrorRoute(), scannerMirror=MirrorRoute()
     private var activeRoute:MirrorRoute {mirrorDisplay == nil || mirrorDisplay == 0 ? physicalMirror:scannerMirror}
     private var mirror:MirrorSession {activeRoute.session}
@@ -951,7 +952,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                   windowAvailability?.isAvailable != false,overlay.decodedFrameDelivery else{throw ScanError("扫码镜像路由已变化。")}
                             if targetWindow === mainControl {applicationPickerVisible=false}
                             if overlay.interleaved,nativeCameraScene?.markVerified(in:attachmentState) != true {throw ScanError("原生相机界面已变化。")}
-                            targetWindow.showNativeScanner(overlay)
+                            guard targetWindow.showNativeScanner(overlay) else{throw ScanError("原生标题栏未能保持独立背景，已停止透明取景。")}
                             nativeScannerAttachedUptime=ProcessInfo.processInfo.systemUptime
                         } else {showLocalScanFrame(for:targetWindow)}
                     } else if localCameraMode {showLocalScanFrame(for:targetWindow)}
@@ -1766,8 +1767,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             maximumCameraTickMilliseconds=max(maximumCameraTickMilliseconds,gap)
         }
         cameraTickAt=tick
-        if tick>=nextCameraGeometry {
-            nextCameraGeometry=tick+1.0/30
+        let nativeGeometry=nativeScannerOverlay?.sourceLease != nil
+        if nativeGeometry ? nativeGeometryClock.due(at:tick):tick>=nextCameraGeometry {
+            if !nativeGeometry {nextCameraGeometry=tick+1.0/30}
             do {
                 let rect=localScanFrame?.captureRect ?? captureControl.desktopCaptureRect
                 if localCameraMode,localScanRect != rect {
@@ -1776,7 +1778,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                        continuousMovement:genericDesktopCamera)
                 }
                 performanceCheck?.recordCaptureRect(rect,at:tick)
-                pump.publish(try DesktopCaptureTarget.current(for:rect))
+                if pump.publish(try DesktopCaptureTarget.current(for:rect)) {performanceCheck?.recordGeometryPublication(at:tick)}
             }
             catch {pump.fail(error)}
         }
@@ -1816,7 +1818,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             cameraActivity=ProcessInfo.processInfo.beginActivity(options:.userInitiatedAllowingIdleSystemSleep,
                 reason:"实时手机桌面相机")
         }
-        cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0;nextCameraGeometry=0
+        cameraTickAt=nil;cameraTickGaps.removeAll(keepingCapacity:true);maximumCameraTickMilliseconds=0;nextCameraGeometry=0;nativeGeometryClock=NativeGeometryClock()
         let availability=cameraWindowAvailability,nativeSourceLease=nativeScannerOverlay?.sourceLease
         let sourceInterval:TimeInterval=nativeSourceLease != nil ? 1.0/30:0.125
         let pump=CameraPumpMailbox(sourceIsAvailable:{availability?.isAvailable != false}),generation=scanGeneration

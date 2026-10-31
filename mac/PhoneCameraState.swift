@@ -39,6 +39,7 @@ struct PhoneCameraState: Decodable, Sendable {
     let desktopHome: Bool
     let cameraOwner: String?
     let ownerStatus: String?
+    let requestDriverHealthy:Bool
     let ownerKnown: Bool
     let ownerGeneration: Int
     let solidCalibrationSupported: Bool
@@ -53,7 +54,7 @@ struct PhoneCameraState: Decodable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case version, generation, captureGeneration, activeStreams, activities, desktopHome
-        case cameraOwner, ownerKnown, ownerGeneration, ownerStatus
+        case cameraOwner, ownerKnown, ownerGeneration, ownerStatus, requestDriverHealthy
         case interleavedPreviewSupported,solidCalibrationSupported,desktopCameraSupported,desktopCameraEnabled,desktopCameraGeneration,desktopCameraBindings
         case paintTiming
         case packageLauncherQuerySupported
@@ -71,6 +72,7 @@ struct PhoneCameraState: Decodable, Sendable {
         cameraOwner = try values.decodeIfPresent(String.self, forKey: .cameraOwner)
         // Older servers omitted ownership evidence. Treat absence as unknown.
         ownerKnown = try values.decodeIfPresent(Bool.self, forKey: .ownerKnown) ?? false
+        requestDriverHealthy=try values.decodeIfPresent(Bool.self,forKey:.requestDriverHealthy) ?? true
         ownerStatus = try values.decodeIfPresent(String.self, forKey: .ownerStatus)
         ownerGeneration = try values.decodeIfPresent(Int.self, forKey: .ownerGeneration) ?? 0
         interleavedPreviewSupported = try values.decodeIfPresent(Bool.self,forKey:.interleavedPreviewSupported) ?? false
@@ -87,7 +89,7 @@ struct PhoneCameraState: Decodable, Sendable {
     }
 
     func scannerActivity() -> Activity? {
-        guard ownerKnown, (1...16).contains(activeStreams), let cameraOwner,
+        guard requestDriverHealthy,ownerKnown, (1...16).contains(activeStreams), let cameraOwner,
               Self.validOwner(cameraOwner), ownerGeneration >= 0,
               activities.count <= 8, activities.allSatisfy(\.valid),
               Set(activities.map(\.displayId)).count == activities.count else { return nil }
@@ -100,6 +102,7 @@ struct PhoneCameraState: Decodable, Sendable {
     /// Explicit connection source + selected owned window, without app/page allowlists.
     /// Camera use alone does not opt the connection into desktop input.
     func captureActivity()->Activity? {
+        guard requestDriverHealthy else{return nil}
         guard desktopCameraEnabled else{return scannerActivity()}
         guard desktopCameraSupported,ownerKnown,(1...16).contains(activeStreams),let owner=cameraOwner,Self.validOwner(owner),
               generation>=0,ownerGeneration>=0,desktopCameraGeneration>=0,activities.count<=8,activities.allSatisfy(\.valid),

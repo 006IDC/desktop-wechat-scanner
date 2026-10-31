@@ -30,6 +30,10 @@ import Foundation
 
     static func main() throws {
         let matched = try decode(basic())
+        require(matched.requestDriverHealthy,"Old server lost backwards compatibility")
+        var failedDriver=basic();failedDriver["requestDriverHealthy"]=false
+        let unhealthy=try decode(failedDriver)
+        require(unhealthy.ownerKnown && unhealthy.scannerActivity()==nil && unhealthy.captureActivity()==nil,"Producer failure authorized pixels or erased actual owner knowledge")
         require(matched.captureGeneration==nil && !matched.interleavedPreviewSupported,"Legacy state advertised native preview evidence")
         var native=basic();native["captureGeneration"]=8;native["interleavedPreviewSupported"]=true
         require(try decode(native).captureGeneration==8 && decode(native).interleavedPreviewSupported,"Native preview capability lost")

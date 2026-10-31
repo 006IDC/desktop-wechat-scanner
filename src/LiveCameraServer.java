@@ -78,6 +78,7 @@ public final class LiveCameraServer {
     private static final int DISPLAY_SYSTEM_DECORATIONS = 1 << 9;
 
     private final Object cameraLock = new Object();
+    private final CameraSourcePostFence sourcePostFence = new CameraSourcePostFence(cameraLock);
     private final CameraPaintTiming cameraPaintTiming = new CameraPaintTiming();
     private final Object cameraPermissionLock = new Object();
     private final Object frameLock = new Object();
@@ -129,6 +130,7 @@ public final class LiveCameraServer {
         }
     }
     private final AtomicBoolean requestDriverFailed = new AtomicBoolean();
+    private final CameraPostFailureCheck postFailureChecks = new CameraPostFailureCheck();
     private final CameraCallbackDispatcher cameraCallbacks = new CameraCallbackDispatcher(128, this::failRequestDriver);
     private void failRequestDriver() {
         if (!desktopHomeRequested || stopping || !requestDriverFailed.compareAndSet(false, true)) return;
@@ -871,7 +873,12 @@ public final class LiveCameraServer {
     }
 
     private void requestDesktopFrame(int streamId) {
-        Surface requested = streams.get(streamId);
+        final Surface requested;
+        final CameraRequestScope scope;
+        synchronized (stateLock) {
+            requested=streams.get(streamId);
+            scope=new CameraRequestScope(streamGeneration,cameraStateGeneration,currentEpoch);
+        }
         if (stopping || requestDriverFailed.get() || requested == null) return;
         cameraRequests.incrementAndGet();
         int count = requestPaints.incrementAndGet();
@@ -883,10 +890,26 @@ public final class LiveCameraServer {
                 try {
                     if (stopping || streams.get(streamId) != requested) {requestIdentitySkips.incrementAndGet();return;}
                     long before = requestPosts.get();paint(requested, requestedAt);
-                    CameraRequestOutcome.Value outcome = CameraRequestOutcome.classify(stopping,
-                            streams.get(streamId) == requested, requested.isValid(), requestPosts.get() != before);
-                    if (outcome == CameraRequestOutcome.Value.RETIRED) requestIdentitySkips.incrementAndGet();
-                    else if (outcome == CameraRequestOutcome.Value.FAILED) {requestPostFailures.incrementAndGet();failRequestDriver();}
+                    boolean surfaceValid=requested.isValid();
+                    synchronized (stateLock) {
+                        boolean current=streams.get(streamId)==requested && scope.matches(streamGeneration,cameraStateGeneration,currentEpoch);
+                        CameraRequestOutcome.Value outcome=CameraRequestOutcome.classify(stopping,current,surfaceValid,requestPosts.get()!=before);
+                        if (outcome==CameraRequestOutcome.Value.RETIRED) requestIdentitySkips.incrementAndGet();
+                        else if (outcome==CameraRequestOutcome.Value.FAILED) {
+                            requestPostFailures.incrementAndGet();
+                            if (streams.size()==1) {
+                                long postsBeforeRecovery=requestPosts.get();
+                                boolean queued=postFailureChecks.schedule(painter,scope,()->{
+                                    synchronized(stateLock) {
+                                        if (!stopping && !requestDriverFailed.get() && streams.size()==1 && streams.get(streamId)==requested &&
+                                            scope.matches(streamGeneration,cameraStateGeneration,currentEpoch) && requested.isValid() &&
+                                            cameraOwnerKnown && cameraOwner!=null && requestPosts.get()==postsBeforeRecovery) failRequestDriver();
+                                    }
+                                });
+                                if (!queued && !stopping) failRequestDriver();
+                            } else failRequestDriver();
+                        }
+                    }
                 } finally {requestPaints.decrementAndGet();}
             });
         } catch (RejectedExecutionException closed) {requestPaints.decrementAndGet();requestRejected.incrementAndGet();failRequestDriver();}
@@ -917,6 +940,7 @@ public final class LiveCameraServer {
         if (stopping || (desktopHomeRequested && requestDriverFailed.get()) || !surface.isValid()) return;
         Canvas canvas = null;
         CameraPaintTiming.Ticket paintedTicket = null;
+        CameraSourcePostFence.Ticket sourcePost = null;
         long lockBegan = System.nanoTime(), locked = 0, drawn = 0, paintedGeneration = -1;
         boolean drewSource = false;
         CameraPreviewInterleave.Phase previewPhase = CameraPreviewInterleave.Phase.UNCHANGED;
@@ -934,6 +958,9 @@ public final class LiveCameraServer {
                 boolean keyed = previewPhase == CameraPreviewInterleave.Phase.KEY;
                 boolean solid = cameraSolidColor != null && desktopHomeRequested && frameStateGeneration == cameraStateGeneration;
                 if (keyed || solid || (cameraFrame != null && (!desktopHomeRequested || frameStateGeneration == cameraStateGeneration))) {
+                    // Register before any source/solid draw: an exception may
+                    // still leave source pixels on the Canvas that finally posts.
+                    if (!keyed) sourcePost = sourcePostFence.begin();
                     paintedTicket = keyed ? null : cameraPaintTiming.current();
                     paintedGeneration = keyed ? cameraStateGeneration : frameStateGeneration;
                     int width = canvas.getWidth();
@@ -981,6 +1008,8 @@ public final class LiveCameraServer {
                 if (drewSource && (!desktopHomeRequested || paintedGeneration == cameraStateGeneration))
                     cameraPaintTiming.posted(paintedTicket, lockBegan, locked, drawn, System.nanoTime());
             } catch (Exception ignored) {}
+            // Complete only after unlock/post and its metadata attempt returned.
+            sourcePostFence.complete(sourcePost);
         }
     }
 
@@ -1260,11 +1289,13 @@ public final class LiveCameraServer {
 
     private void clearCameraFrame() { clearCameraFrame(false); }
 
-    private void clearCameraFrame(boolean keepPreview) {
+    private CameraSourcePostFence.Ticket clearCameraFrame(boolean keepPreview) {
+        final CameraSourcePostFence.Ticket retiredPost;
         synchronized (cameraLock) {
             sourceLease.invalidate();
             if (!keepPreview || !previewInterleave.active(cameraStateGeneration, currentEpoch)) previewInterleave.disable();
             sourceAcceptedNanos = 0;
+            retiredPost = sourcePostFence.snapshot();
             Bitmap previous = cameraFrame;
             cameraFrame = null;
             cameraSolidColor = null;
@@ -1274,6 +1305,7 @@ public final class LiveCameraServer {
         }
         lastCameraUpdateNanos = System.nanoTime();
         requestPaint();
+        return retiredPost;
     }
 
     private void awaitCameraPaints() throws IOException { CameraPaintBarrier.await(painter); }
@@ -1312,6 +1344,7 @@ public final class LiveCameraServer {
         long epoch = request.getLong(), capture = request.getLong(), token = request.getLong();
         ownedDisplay(id);
         boolean applied = false;
+        CameraSourcePostFence.Ticket retiredPost = null;
         synchronized (stateLock) {
             synchronized (cameraLock) {
                 if (action == 2) {
@@ -1335,10 +1368,13 @@ public final class LiveCameraServer {
             }
             // Clear under the same state lock as selection; a later enable
             // cannot be cleared by a retired disable after it took ownership.
-            if (!enable && applied) clearCameraFrame();
+            if (!enable && applied) retiredPost=clearCameraFrame(false);
         }
         // A retired overlay cannot erase a newer preview on the same display.
-        if (action != 2 && applied) awaitCameraPaints();
+        if (action != 2 && applied) {
+            if (!enable && desktopHomeRequested) sourcePostFence.await(retiredPost);
+            else awaitCameraPaints();
+        }
         synchronized (cameraLock) {
             return new JSONObject().put("applied", applied).put("token", token)
                     .put("enabled", previewInterleave.active(cameraStateGeneration, currentEpoch))
@@ -1419,7 +1455,10 @@ public final class LiveCameraServer {
             state.put("desktopCameraBindings",bindings);
             state.put("generation", streamGeneration).put("captureGeneration", cameraStateGeneration).put("activeStreams", streams.size());
             state.put("cameraOwner", cameraOwner == null ? JSONObject.NULL : cameraOwner);
-            state.put("ownerKnown", cameraOwnerKnown && !requestDriverFailed.get()).put("ownerGeneration", ownerGeneration);
+            // Owner observation remains independent of producer health, including
+            // known closed ownership required by safe device teardown.
+            state.put("ownerKnown", cameraOwnerKnown).put("ownerGeneration", ownerGeneration);
+            state.put("requestDriverHealthy", !requestDriverFailed.get());
             state.put("ownerStatus", requestDriverFailed.get() ? "request_error" : ownerStatus)
                     .put("ownerErrorClass", ownerErrorClass == null ? JSONObject.NULL : ownerErrorClass)
                     .put("ownerErrorDetail", ownerErrorDetail == null ? JSONObject.NULL : ownerErrorDetail)
@@ -1556,25 +1595,36 @@ public final class LiveCameraServer {
                 if (length != Long.BYTES) { error(output, "Clear request needs an 8-byte epoch"); continue; }
                 long epoch = new DataInputStream(new ByteArrayInputStream(body)).readLong();
                 if (epoch < 0) { error(output, "Epoch must be nonnegative"); continue; }
+                CameraSourcePostFence.Ticket retiredPost = null;
+                boolean advanced = false;
                 synchronized (stateLock) {
                     if (epoch > currentEpoch) {
-                        currentEpoch = epoch;
+                        currentEpoch = epoch;advanced = true;
                         // An explicit new capture operation may select ordinary
                         // camera input again. Retired native packets still carry
                         // their old epoch/token and cannot enter this operation.
                         synchronized (cameraLock) {nativeSourceOnly = false;}
-                        clearCameraFrame();
+                        retiredPost=clearCameraFrame(false);
                     }
                 }
-                try { awaitCameraPaints(); reply(output, true, new byte[0]); }
+                try {
+                    if (desktopHomeRequested && advanced) sourcePostFence.await(retiredPost);
+                    else awaitCameraPaints();
+                    reply(output, true, new byte[0]);
+                }
                 catch (IOException failure) { error(output, "Camera clear is not yet confirmed"); }
             } else if (command == 23) {
                 if (length != Long.BYTES) { error(output, "Discard request needs an 8-byte epoch"); continue; }
                 long epoch = new DataInputStream(new ByteArrayInputStream(body)).readLong();
                 if (epoch < 0) { error(output, "Epoch must be nonnegative"); continue; }
                 // An old discard must never erase a newer capture generation.
-                if (epoch == currentEpoch) clearCameraFrame(true);
-                try { awaitCameraPaints(); reply(output, true, new byte[0]); }
+                final boolean sameEpoch = epoch == currentEpoch;
+                CameraSourcePostFence.Ticket retiredPost = sameEpoch ? clearCameraFrame(true) : null;
+                try {
+                    if (desktopHomeRequested && sameEpoch) sourcePostFence.await(retiredPost);
+                    else awaitCameraPaints();
+                    reply(output, true, new byte[0]);
+                }
                 catch (IOException failure) { error(output, "Camera discard is not yet confirmed"); }
             } else if (command == 4) {
                 if (length != 0) { error(output, "Heartbeat must be empty"); continue; }

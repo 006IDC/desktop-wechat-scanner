@@ -540,6 +540,7 @@ final class ControlWindowController: NSWindowController {
     private var isStandalone = false
     private var desktopOverlayRestore: (NSWindow.Level, NSWindow.CollectionBehavior)?
     var nativeScannerVisible:Bool {background.nativeScannerPreview}
+    private var nativeTitlebarBackdrop:NSView?
     var nativeSurfaceDiagnostic:[String:Any] {holder.phone.nativeSurfaceDiagnostic}
     private(set) var nativeSurfaceBeforeAttachment=[String:Any]()
 
@@ -847,8 +848,9 @@ final class ControlWindowController: NSWindowController {
         holder.phone.interactionEnabled=false
         holder.phone.nativeScannerFrames={ [weak overlay] in overlay?.receive($0) ?? true }
     }
-    func showNativeScanner(_ overlay:NativeScannerOverlay) {
-        guard let window else{return}
+    @discardableResult func showNativeScanner(_ overlay:NativeScannerOverlay)->Bool {
+        guard let window,let backdrop=NativeWindowChrome.install(in:window) else{return false}
+        nativeTitlebarBackdrop?.removeFromSuperview();nativeTitlebarBackdrop=backdrop
         nativeSurfaceBeforeAttachment=nativeSurfaceDiagnostic
         // A verified scanner owns this surface. A previous HOME picker must
         // not keep the phone view hidden while its Metal layer keeps rendering.
@@ -863,10 +865,12 @@ final class ControlWindowController: NSWindowController {
         holder.phone.interactionEnabled=true
         setScannerFloating(true)
         overlay.startPresentation()
+        return true
     }
     func freezeNativeScanner() {holder.phone.interactionEnabled=false}
     func endNativeScanner(retiredFilter:((CVPixelBuffer)->Bool)?=nil,restoringInput:Bool=true) {
         holder.phone.retiredNativeFrameFilter=retiredFilter
+        nativeTitlebarBackdrop?.removeFromSuperview();nativeTitlebarBackdrop=nil
         setScannerFloating(false)
         holder.phone.nativeScannerFrames=nil;holder.phone.nativeScannerResize=nil;holder.phone.setNativeScannerLayer(nil)
         holder.phone.interactionEnabled=restoringInput;background.nativeScannerPreview=false

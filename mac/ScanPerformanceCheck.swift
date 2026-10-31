@@ -25,6 +25,7 @@ import CoreImage.CIFilterBuiltins
     private var captureCosts:[Double]=[],transferCosts:[Double]=[]
     private var processingCosts:[Double]=[],requestCosts:[Double]=[],actorWaitCosts:[Double]=[],imageSizes:[Double]=[]
     private var previousClearCosts:[Double]=[]
+    private var geometryTimes:[TimeInterval]=[]
     private var sendCosts:[Double]=[],responseWaitCosts:[Double]=[],responseBodyCosts:[Double]=[]
     private var presentationCosts:[String:[Double]]=[:]
     private(set) var qrVisible = false
@@ -93,6 +94,11 @@ import CoreImage.CIFilterBuiltins
     }
 
     /// Called by the same common-mode presentation tick as the product camera.
+    func recordGeometryPublication(at now:TimeInterval) {
+        guard let started,now.isFinite,now>=started,now-started<=6,geometryTimes.count<360,
+              geometryTimes.last.map({now>$0}) ?? true else{return}
+        geometryTimes.append(now)
+    }
     func tick(at now: TimeInterval) {
         synchronizeStacking()
         guard let started else { return }
@@ -175,6 +181,9 @@ import CoreImage.CIFilterBuiltins
                 "movementMaximumSendGapMilliseconds":movementMaximumGap,
                 "outgoingSyntheticQRVisible":syntheticQRVisible,
                 "movementSendFPS":movementDuration>0 ? Double(movementSent)/movementDuration : 0,
+                "movementGeometryPublications":geometryTimes.count,
+                "movementGeometryPublicationFPS":geometryTimes.count>1 ? Double(geometryTimes.count-1)/(geometryTimes.last!-geometryTimes.first!):0,
+                "movementGeometryIntervalP95Milliseconds":percentile(zip(geometryTimes,geometryTimes.dropFirst()).map{($1-$0)*1000}),
                 "movementCaptureP95Milliseconds":percentile(captureCosts),
                 "movementLastClearAtFrameAckP95Milliseconds":percentile(previousClearCosts),
                 "movementTransferP95Milliseconds":percentile(transferCosts),
