@@ -941,18 +941,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             try overlay.observeDecodedFrames(in:nativeMailbox,generation:nativeIncarnation)
                             if overlay.interleaved,nativeCameraScene?.sameSource(in:state) != true {nativeCameraScene=NativeCameraScene(state:state)}
                             nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
-                            status("准备原生扫码预览","正在校准手机应用自己的相机背景…")
+                            status("准备扫码预览","正在准备手机应用的扫码画面…")
                             try await overlay.prepare(phone:phone,epoch:generation)
                             let attachmentState=try await phone.cameraState()
                             try Task.checkCancellation()
                             guard connected,!stopping,generation==scanGeneration,nativeScannerOverlay === overlay else{throw CancellationError()}
-                            guard overlay.matches(attachmentState) else{throw ScanError("原生扫码状态已变化，已停止挂载预览。")}
+                            guard overlay.matches(attachmentState) else{throw ScanError("手机扫码画面已切换，透明取景已停止。请重新打开手机应用的扫一扫。")}
                             guard let currentBinding=nativeCameraFrames(window:targetWindow,display:targetDisplay),
                                   currentBinding.0 === nativeMailbox,currentBinding.1==nativeIncarnation,
                                   windowAvailability?.isAvailable != false,overlay.decodedFrameDelivery else{throw ScanError("扫码镜像路由已变化。")}
                             if targetWindow === mainControl {applicationPickerVisible=false}
                             if overlay.interleaved,nativeCameraScene?.markVerified(in:attachmentState) != true {throw ScanError("原生相机界面已变化。")}
-                            guard targetWindow.showNativeScanner(overlay) else{throw ScanError("原生标题栏未能保持独立背景，已停止透明取景。")}
+                            guard targetWindow.showNativeScanner(overlay) else{throw ScanError("透明取景未能开启。请先关闭“原生扫码界面（试用）”，使用普通扫码框重试。")}
                             nativeScannerAttachedUptime=ProcessInfo.processInfo.systemUptime
                         } else {showLocalScanFrame(for:targetWindow)}
                     } else if localCameraMode {showLocalScanFrame(for:targetWindow)}
