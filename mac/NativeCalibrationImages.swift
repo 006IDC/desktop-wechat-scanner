@@ -11,17 +11,17 @@ enum NativeCalibrationImages {
             guard let space=CGColorSpace(name:CGColorSpace.sRGB),
                   let context=CGContext(data:nil,width:720,height:1280,bitsPerComponent:8,bytesPerRow:720*4,
                       space:space,bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue) else {
-                throw ScanError("无法准备原生相机校准图。")
+                throw ScanError("无法准备透明取景画面。请关闭“原生扫码界面（试用）”，使用普通扫码框重试。")
             }
             context.setFillColor(red:0,green:0,blue:blue ? 1:0,alpha:1)
             context.fill(CGRect(x:0,y:0,width:720,height:1280))
             let data=NSMutableData()
             guard let image=context.makeImage(),
                   let destination=CGImageDestinationCreateWithData(data,UTType.png.identifier as CFString,1,nil) else {
-                throw ScanError("无法准备原生相机校准图。")
+                throw ScanError("无法准备透明取景画面。请关闭“原生扫码界面（试用）”，使用普通扫码框重试。")
             }
             CGImageDestinationAddImage(destination,image,nil)
-            guard CGImageDestinationFinalize(destination) else{throw ScanError("无法编码原生相机校准图。")}
+            guard CGImageDestinationFinalize(destination) else{throw ScanError("无法生成透明取景画面。请关闭“原生扫码界面（试用）”，使用普通扫码框重试。")}
             return data as Data
         }
         return (try encode(blue:false),try encode(blue:true))

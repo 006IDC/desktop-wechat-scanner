@@ -6,7 +6,13 @@ import QuartzCore
 /// or replaces Android controls. Not enabled by the default product path.
 final class NativeScannerMatte {
     enum Algorithm { case blackWhite, blueWithNativeColorBias, spatialBlue }
-    struct Unavailable: Error { let stage: String; init(_ stage: String = "gpu_resource") { self.stage = stage } }
+    struct Unavailable: LocalizedError {
+        let stage: String
+        init(_ stage: String = "gpu_resource") { self.stage = stage }
+        var errorDescription:String? {
+            "透明取景暂时无法显示。请关闭“原生扫码界面（试用）”，使用普通扫码框重试。"
+        }
+    }
     private let context: CIContext
     private let queue: MTLCommandQueue
     private let composite: MTLComputePipelineState

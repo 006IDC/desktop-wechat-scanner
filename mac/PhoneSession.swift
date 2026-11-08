@@ -442,18 +442,18 @@ actor PhoneSession {
             var big=number.bigEndian;withUnsafeBytes(of:&big){body.append(contentsOf:$0)}
         }
         let data=try channel.request(32,body)
-        guard data.count<=1024,let response=try JSONSerialization.jsonObject(with:data) as? [String:Any] else{throw ScanError("原生预览状态未确认。")}
+        guard data.count<=1024,let response=try JSONSerialization.jsonObject(with:data) as? [String:Any] else{throw ScanError("手机暂未确认扫码预览状态。请断开后重新连接手机。")}
         return response
     }
     func beginNativePreview(display:Int,epoch:Int,capture:Int) throws ->NativePreviewLease {
         let response=try nativePreviewRequest(display:display,action:1,epoch:epoch,capture:capture,token:0)
         guard response["applied"] as? Bool==true,response["enabled"] as? Bool==true,
-              let token=response["token"] as? UInt64,token>0 else{throw ScanError("原生预览状态未确认。")}
+              let token=response["token"] as? UInt64,token>0 else{throw ScanError("手机暂未确认扫码预览状态。请断开后重新连接手机。")}
         return NativePreviewLease(display:display,epoch:epoch,capture:capture,token:token)
     }
     func endNativePreview(_ lease:NativePreviewLease) throws {
         let response=try nativePreviewRequest(display:lease.display,action:0,epoch:lease.epoch,capture:lease.capture,token:lease.token)
-        guard let applied=response["applied"] as? Bool,!applied || response["enabled"] as? Bool==false else{throw ScanError("原生预览退出未确认。")}
+        guard let applied=response["applied"] as? Bool,!applied || response["enabled"] as? Bool==false else{throw ScanError("手机尚未确认停止透明取景。请断开后重新连接手机。")}
     }
     struct NativePreviewPostCounts:Sendable {let key:Int,source:Int}
     func nativePreviewPostCounts(_ lease:NativePreviewLease) throws ->NativePreviewPostCounts {
@@ -463,7 +463,7 @@ actor PhoneSession {
         return NativePreviewPostCounts(key:key,source:source)
     }
     func nativePreviewCalibration(_ phase:UInt8,lease:NativePreviewLease) throws {
-        guard phase<=2,ownsDisplay(lease.display),let channel else{throw ScanError("原生预览校准已停止。")}
+        guard phase<=2,ownsDisplay(lease.display),let channel else{throw ScanError("手机扫码预览已停止。请退出扫一扫后重新进入。")}
         var id=UInt32(lease.display).bigEndian
         var body=withUnsafeBytes(of:&id){Data($0)};body.append(phase)
         for number in [UInt64(lease.epoch),UInt64(lease.capture),lease.token] {

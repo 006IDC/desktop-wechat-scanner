@@ -64,8 +64,8 @@ import QuartzCore
         return decision
     }
     var failure:String? {
-        if decodedBinding != nil,!decodedFrameDelivery {return "原生视频会话已变化。"}
-        if interleaved,!keyGate.current(at:ProcessInfo.processInfo.systemUptime) {return "原生相机画面已变化，已停止透明预览。"}
+        if decodedBinding != nil,!decodedFrameDelivery {return "手机画面连接已变化。请退出扫一扫后重新进入；仍失败时请重连手机。"}
+        if interleaved,!keyGate.current(at:ProcessInfo.processInfo.systemUptime) {return "手机相机画面已切换，透明取景已停止。请退出扫一扫后重新进入。"}
         return renderFailure
     }
     private(set) var calibrationTiming=[String:Double]()
@@ -93,9 +93,9 @@ import QuartzCore
         if let changed=error as? CameraFrameExpiredError {termination["sourceInvalidated"]=changed.sourceInvalidated}
         if let scan=error as? ScanError {
             switch scan.message {
-            case "原生相机画面已变化，已停止透明预览。":termination["failureKind"]="carrierExpired"
-            case "原生扫码显示中断。":termination["failureKind"]="nativeRenderer"
-            case "原生视频会话已变化。":termination["failureKind"]="decodedBinding"
+            case "手机相机画面已切换，透明取景已停止。请退出扫一扫后重新进入。":termination["failureKind"]="carrierExpired"
+            case "扫码画面显示中断。请退出扫一扫后重新进入。":termination["failureKind"]="nativeRenderer"
+            case "手机画面连接已变化。请退出扫一扫后重新进入；仍失败时请重连手机。":termination["failureKind"]="decodedBinding"
             default:break
             }
         }
@@ -107,7 +107,7 @@ import QuartzCore
             }
         }
     }
-    private func recordFailure() {renderFailure="原生扫码显示中断。"}
+    private func recordFailure() {renderFailure="扫码画面显示中断。请退出扫一扫后重新进入。"}
     init(display:Int,package:String,fastCalibration:Bool=false,batchedCalibration:Bool=false,solidCalibrationEnabled:Bool=true,displaySyncEnabled:Bool=true,interleaved:Bool=false) {
         self.interleaved=interleaved
         self.display=display;self.package=package;self.fastCalibration=fastCalibration || batchedCalibration
@@ -124,11 +124,11 @@ import QuartzCore
     /// Bind only after the caller verified the exact mirror display/incarnation.
     /// Capture the thread-safe frame slot, never this MainActor UI object.
     func observeDecodedFrames(in mailbox:MirrorVideoMailbox,generation:Int) throws {
-        guard decodedBinding == nil,!frozen else{throw ScanError("原生视频已绑定或停止。")}
+        guard decodedBinding == nil,!frozen else{throw ScanError("手机扫码预览已停止。请退出扫一扫后重新进入。")}
         let input=frames,statistics=statistics,gate=keyGate
         guard let id=mailbox.observeDecodedFrames(generation:generation,onInvalidated:{input.stop()},receive:{pixels in
             if gate.accepts(pixels),input.publish(pixels) {statistics.received(at:ProcessInfo.processInfo.systemUptime)}
-        }) else{throw ScanError("原生视频会话已变化。")}
+        }) else{throw ScanError("手机画面连接已变化。请退出扫一扫后重新进入；仍失败时请重连手机。")}
         decodedBinding=(mailbox,id,generation)
     }
     func matches(_ state:PhoneCameraState)->Bool {
@@ -139,11 +139,11 @@ import QuartzCore
     @discardableResult
     private func requireCurrent(_ phone:PhoneSession) async throws -> PhoneCameraState {
         try Task.checkCancellation()
-        if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("原生视频会话已变化。")}
+        if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("手机画面连接已变化。请退出扫一扫后重新进入；仍失败时请重连手机。")}
         let state=try await phone.cameraState()
         try Task.checkCancellation()
-        if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("原生视频会话已变化。")}
-        guard matches(state) else{throw ScanError("原生扫码状态已变化，已停止校准。")}
+        if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("手机画面连接已变化。请退出扫一扫后重新进入；仍失败时请重连手机。")}
+        guard matches(state) else{throw ScanError("手机扫码画面已切换，透明取景已停止。请退出扫一扫后重新进入。")}
         if identity == nil,let activity=interleaved ? state.captureActivity():state.scannerActivity() {
             identity=Identity(stream:state.generation,owner:state.ownerGeneration,component:activity.component,binding:state.desktopCameraGeneration,capture:state.captureGeneration)
         }
@@ -167,8 +167,8 @@ import QuartzCore
             guard remaining>0 else{throw NativeScannerFrames.Failure.timedOut}
             return try await frames.wait(after:after,notBefore:notBefore,timeout:remaining)
         } catch NativeScannerFrames.Failure.stopped {throw CancellationError()}
-        catch NativeScannerFrames.Failure.concurrentWait {throw ScanError("原生扫码校准状态已变化。")}
-        catch NativeScannerFrames.Failure.timedOut {throw ScanError("原生扫码校准未收到新画面。")}
+        catch NativeScannerFrames.Failure.concurrentWait {throw ScanError("扫码预览准备已中断。请退出扫一扫后重新进入。")}
+        catch NativeScannerFrames.Failure.timedOut {throw ScanError("暂时没有收到手机扫码画面。请退出扫一扫后重新进入。")}
     }
     private nonisolated static func isBlue(_ pixels:CVPixelBuffer)->Bool {
         guard CVPixelBufferGetPixelFormatType(pixels)==kCVPixelFormatType_32BGRA,
@@ -190,7 +190,7 @@ import QuartzCore
         func mark(_ stage:String) {calibrationTiming[stage]=(ProcessInfo.processInfo.systemUptime-began)*1000}
         // scannerActivity() is the single authoritative allowlist for owner,
         // exact route and owned display. Unknown camera apps cannot calibrate.
-        guard display > 0 else{throw ScanError("原生扫码不属于本次独立屏幕。")}
+        guard display > 0 else{throw ScanError("无法连接当前手机应用窗口。请断开后重新连接手机，再打开应用的扫一扫。")}
         let initialState=try await requireCurrent(phone)
         let solid=batchedCalibration && solidCalibrationEnabled && initialState.solidCalibrationSupported
         calibrationTiming["solidCalibrationSelected"]=solid ? 1:0
@@ -224,7 +224,7 @@ import QuartzCore
                 }
                 if !batchedCalibration {try await Task.sleep(nanoseconds:10_000_000)}
             }
-            guard !samples.isEmpty else{throw ScanError("原生相机黑底尚未确认，已停止校准。")}
+            guard !samples.isEmpty else{throw ScanError("手机扫码画面尚未准备好，透明取景已停止。请退出扫一扫后重新进入。")}
             if !batchedCalibration {try await Task.sleep(nanoseconds:40_000_000)}
         } else {
             try await Task.sleep(nanoseconds:350_000_000)
@@ -243,7 +243,7 @@ import QuartzCore
                 }
                 sample=frames.latest()
             }
-            guard sample.2,sample.0>last,let pixels=sample.1 else{throw ScanError("原生扫码校准未收到新画面。")}
+            guard sample.2,sample.0>last,let pixels=sample.1 else{throw ScanError("暂时没有收到手机扫码画面。请退出扫一扫后重新进入。")}
             if !batchedCalibration {
                 try await requireCurrent(phone)
                 calibrationTiming["sampleStateChecks",default:0]+=1
@@ -292,7 +292,7 @@ import QuartzCore
                 try await Task.sleep(nanoseconds:20_000_000)
             }
         }
-        guard confirmed else{throw ScanError("原生相机背景尚未确认，已停止透明预览。")}
+        guard confirmed else{throw ScanError("无法确认手机扫码画面，透明取景已停止。请退出扫一扫后重新进入。")}
         mark("blueConfirmedMilliseconds")
         installRenderer(renderer)
     }
@@ -313,12 +313,12 @@ import QuartzCore
         let began=ProcessInfo.processInfo.systemUptime
         let state=try await requireCurrent(phone)
         guard state.interleavedPreviewSupported,state.desktopCameraEnabled,state.activeStreams==1 else{
-            throw ScanError("当前相机不支持同窗口透明预览。")
+            throw ScanError("当前相机不支持透明取景。请关闭“原生扫码界面（试用）”，使用普通扫码框重试。")
         }
         // Establish black before enabling the carrier: no coded frame may flash
         // through the ordinary phone surface while calibration is being prepared.
         _=try await phone.solidCalibrationFrame(blue:false,epoch:epoch)
-        guard let capture=state.captureGeneration else{throw ScanError("原生预览缺少相机代次。")}
+        guard let capture=state.captureGeneration else{throw ScanError("当前手机连接无法开启透明取景。请关闭“原生扫码界面（试用）”，使用普通扫码框重试。")}
         sourceLease=try await phone.beginNativePreview(display:display,epoch:epoch,capture:capture)
         var samples=[CVPixelBuffer]()
         for phase:UInt8 in 0...2 {
@@ -360,7 +360,7 @@ import QuartzCore
             let sample=try await nextCalibrationFrame(after:observed,deadline:deadline)
             observed=sample.revision;latest=(sample.revision,sample.pixels,true,sample.receivedAt)
         }
-        guard confirmed else{throw ScanError("原生相机取景标记未确认。")}
+        guard confirmed else{throw ScanError("手机扫码画面无法用于透明取景。请关闭“原生扫码界面（试用）”，使用普通扫码框重试。")}
         try await requireCurrent(phone)
         calibrationTiming["carrierConfirmationWaitMilliseconds"]=(ProcessInfo.processInfo.systemUptime-confirmationBegan)*1000
         keyReference=prepared.0;keyGate.begin(prepared.0,verifiedAt:latest.3)

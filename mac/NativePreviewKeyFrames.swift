@@ -7,7 +7,12 @@ final class NativePreviewKeyReference:@unchecked Sendable {
     struct Point {let x:Int,y:Int,r:Int,g:Int,b:Int}
     private let width:Int,height:Int
     private let points:[Point]
-    enum Failure:Error {case dimensions,buffer,insufficientCarrier}
+    enum Failure:LocalizedError {
+        case dimensions,buffer,insufficientCarrier
+        var errorDescription:String? {
+            "手机扫码画面无法用于透明取景。请关闭“原生扫码界面（试用）”，使用普通扫码框重试。"
+        }
+    }
     private static func median(_ a:Int,_ b:Int,_ c:Int)->Int {max(min(a,b),min(max(a,b),c))}
     private static func locked<T>(_ images:[CVPixelBuffer],_ body:([UnsafePointer<UInt8>],[Int])throws->T) throws ->T {
         var acquired=[CVPixelBuffer](),bases=[UnsafePointer<UInt8>](),rows=[Int]()

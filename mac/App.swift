@@ -927,7 +927,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if localCameraMode,nativeScannerRequested,(!genericDesktopCamera || nativeInterleavedRequested),let targetDisplay {
                         let state=try await phone.cameraState()
                         guard let scanner=eligibleCameraActivity(state),scanner.displayId==targetDisplay else {
-                            throw ScanError("原生相机界面已变化。")
+                            throw ScanError("手机扫码画面已切换，透明取景已停止。请退出扫一扫后重新进入。")
                         }
                         if !genericDesktopCamera || (state.interleavedPreviewSupported && state.activeStreams==1) {
                             let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
@@ -936,7 +936,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 solidCalibrationEnabled:!CommandLine.arguments.contains("--native-png-calibration"),
                                 displaySyncEnabled:!CommandLine.arguments.contains("--native-unsynced-presentation"),
                                 interleaved:genericDesktopCamera && nativeInterleavedRequested)
-                            guard let nativeBinding=nativeCameraFrames(window:targetWindow,display:targetDisplay) else{throw ScanError("扫码镜像路由已变化。")}
+                            guard let nativeBinding=nativeCameraFrames(window:targetWindow,display:targetDisplay) else{throw ScanError("手机画面连接已变化，透明取景已停止。请退出扫一扫后重新进入；仍失败时请重连手机。")}
                             let nativeMailbox=nativeBinding.0,nativeIncarnation=nativeBinding.1
                             try overlay.observeDecodedFrames(in:nativeMailbox,generation:nativeIncarnation)
                             if overlay.interleaved,nativeCameraScene?.sameSource(in:state) != true {nativeCameraScene=NativeCameraScene(state:state)}
@@ -949,9 +949,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             guard overlay.matches(attachmentState) else{throw ScanError("手机扫码画面已切换，透明取景已停止。请重新打开手机应用的扫一扫。")}
                             guard let currentBinding=nativeCameraFrames(window:targetWindow,display:targetDisplay),
                                   currentBinding.0 === nativeMailbox,currentBinding.1==nativeIncarnation,
-                                  windowAvailability?.isAvailable != false,overlay.decodedFrameDelivery else{throw ScanError("扫码镜像路由已变化。")}
+                                  windowAvailability?.isAvailable != false,overlay.decodedFrameDelivery else{throw ScanError("手机画面连接已变化，透明取景已停止。请退出扫一扫后重新进入；仍失败时请重连手机。")}
                             if targetWindow === mainControl {applicationPickerVisible=false}
-                            if overlay.interleaved,nativeCameraScene?.markVerified(in:attachmentState) != true {throw ScanError("原生相机界面已变化。")}
+                            if overlay.interleaved,nativeCameraScene?.markVerified(in:attachmentState) != true {throw ScanError("手机扫码画面已切换，透明取景已停止。请退出扫一扫后重新进入。")}
                             guard targetWindow.showNativeScanner(overlay) else{throw ScanError("透明取景未能开启。请先关闭“原生扫码界面（试用）”，使用普通扫码框重试。")}
                             nativeScannerAttachedUptime=ProcessInfo.processInfo.systemUptime
                         } else {showLocalScanFrame(for:targetWindow)}
