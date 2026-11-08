@@ -361,6 +361,18 @@ actor DesktopCapture {
             try target.requireFresh(at:ProcessInfo.processInfo.systemUptime);return data
         }catch {markPermissionFailure(error);throw error}
     }
+    /// Reserve this actor's capture slot while starting the same full-display
+    /// stream used by capture(target). No image is encoded or sent here. A
+    /// later crop still selects a fresh target and passes all normal fences.
+    func prepareStream(_ target:DesktopCaptureTarget) async throws {
+        guard CGPreflightScreenCaptureAccess() else{throw ScanError("桌面采集预备需要既有录屏授权。")}
+        try checkPermission();try Task.checkCancellation()
+        try target.validate();try target.requireFresh(at:ProcessInfo.processInfo.systemUptime)
+        guard !captureInFlight else{throw DesktopCaptureTransientError.encodingBusy}
+        captureInFlight=true;defer{captureInFlight=false}
+        do {try await ensureStream(display:target.displayID,screen:target.screenFrame,pixels:target.pixelSize)}
+        catch {markPermissionFailure(error);throw error}
+    }
     func startDiagnosticStream(_ target:DesktopCaptureTarget) async throws {
         guard diagnosticBoardID != nil,CGPreflightScreenCaptureAccess() else{throw ScanError("连续预备需要既有授权和自有测试板。")}
         guard !captureInFlight else{throw DesktopCaptureTransientError.encodingBusy}

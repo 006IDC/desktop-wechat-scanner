@@ -266,6 +266,9 @@ actor PhoneSession {
     private var cleaning=false
     private(set) var connectionStage = "idle"
     private var companionSyntax:CompanionAssociationCommands?
+    // Register before returning an enable ACK to a UI caller. Failed handoff
+    // retirement remains owned here and must be retried before another enable.
+    private var nativePreviewLeases:[Int:NativePreviewLease]=[:]
     private var diagnosticLog: ServerLog?
     func encoderLatencyFrames() -> Int? { diagnosticLog?.encoderLatencyFrames() }
     init(resources: URL, adbURL: URL? = nil, serverSocket: String? = nil) {
@@ -475,7 +478,7 @@ actor PhoneSession {
         body.append(blue ? 1:0)
         return body
     }
-    struct NativePreviewLease:Sendable {let display:Int,epoch:Int,capture:Int,token:UInt64}
+    struct NativePreviewLease:Sendable,Equatable {let display:Int,epoch:Int,capture:Int,token:UInt64}
     private func nativePreviewRequest(display:Int,action:UInt8,epoch:Int,capture:Int,token:UInt64) throws ->[String:Any] {
         guard ownsDisplay(display),epoch>=0,capture>=0,let channel else{throw ScanError("原生预览连接已变化。")}
         var id=UInt32(display).bigEndian
@@ -488,14 +491,19 @@ actor PhoneSession {
         return response
     }
     func beginNativePreview(display:Int,epoch:Int,capture:Int) throws ->NativePreviewLease {
+        try Task.checkCancellation()
+        if let pending=nativePreviewLeases[display] {try endNativePreview(pending)}
         let response=try nativePreviewRequest(display:display,action:1,epoch:epoch,capture:capture,token:0)
         guard response["applied"] as? Bool==true,response["enabled"] as? Bool==true,
               let token=response["token"] as? UInt64,token>0 else{throw ScanError("手机暂未确认扫码预览状态。请断开后重新连接手机。")}
-        return NativePreviewLease(display:display,epoch:epoch,capture:capture,token:token)
+        let lease=NativePreviewLease(display:display,epoch:epoch,capture:capture,token:token)
+        nativePreviewLeases[display]=lease
+        return lease
     }
     func endNativePreview(_ lease:NativePreviewLease) throws {
         let response=try nativePreviewRequest(display:lease.display,action:0,epoch:lease.epoch,capture:lease.capture,token:lease.token)
         guard let applied=response["applied"] as? Bool,!applied || response["enabled"] as? Bool==false else{throw ScanError("手机尚未确认停止透明取景。请断开后重新连接手机。")}
+        if nativePreviewLeases[lease.display]==lease {nativePreviewLeases.removeValue(forKey:lease.display)}
     }
     struct NativePreviewPostCounts:Sendable {let key:Int,source:Int}
     func nativePreviewPostCounts(_ lease:NativePreviewLease) throws ->NativePreviewPostCounts {
@@ -945,6 +953,7 @@ actor PhoneSession {
         var network = value.bigEndian
         let body = withUnsafeBytes(of: &network) { Data($0) }
         _ = try channel.request(12, body)
+        nativePreviewLeases.removeValue(forKey:id)
         recovery?.appDisplays?.removeAll(where: { $0.id == id })
         try save()
     }
@@ -1161,6 +1170,7 @@ actor PhoneSession {
             serverPipe=nil;server=nil;displayID=nil
             try FileManager.default.removeItem(at:recoveryURL)
             recovery=nil
+            nativePreviewLeases.removeAll()
             cleanupStage="complete"
             return ""
         } catch {

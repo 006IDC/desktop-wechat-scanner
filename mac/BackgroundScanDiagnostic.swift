@@ -389,17 +389,24 @@ private final class BackgroundScanResult:@unchecked Sendable {
                     // The next application's frame epoch must advance past it.
                     let epoch=100+index*100
                     try await phone.clear(epoch:epoch,requireConnection:true)
+                    // Select our board before any optional stream preparation.
+                    // A background diagnostic must never warm a desktop source.
+                    await capture.setDiagnosticBoard(CGWindowID(window.windowNumber))
                     if nativePreview {
                         stage="native-calibration"
                         let overlay=NativeScannerOverlay(display:display,package:package,interleaved:true)
                         nativeOverlay=overlay
                         try overlay.observeDecodedFrames(in:mailbox,generation:1)
-                        try await overlay.prepare(phone:phone,epoch:epoch)
+                        let warmTarget=try DesktopCaptureTarget.current(for:window.frame)
+                        let preparation=try await CaptureStartupOverlap.during(prepare:{
+                            try await capture.prepareStream(warmTarget)
+                        },operation:{try await overlay.prepare(phone:phone,epoch:epoch)})
+                        item["streamWarmupCompleted"]=preparation.warmup.completed
+                        item["streamWarmupMilliseconds"]=preparation.warmup.milliseconds
                         item["nativeCalibration"]=overlay.calibrationTiming
                         item["nativeMatteReadback"]=try await overlay.diagnosticRenderingSummary()
                     }
                     let sourceLease=nativeOverlay?.sourceLease
-                    await capture.setDiagnosticBoard(CGWindowID(window.windowNumber))
                     stage="capture-prepare"
                     let prepare=now;try await capture.prepare();item["capturePrepareMilliseconds"]=(now-prepare)*1000
                     if motion {

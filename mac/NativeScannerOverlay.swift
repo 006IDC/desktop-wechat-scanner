@@ -10,6 +10,7 @@ import QuartzCore
     private let keyGate=NativePreviewKeyGate()
     private var keyReference:NativePreviewKeyReference?
     private(set) var sourceLease:PhoneSession.NativePreviewLease?
+    private var acquiringSource=false,sourceRelease:Task<Void,Error>?
     let interleaved:Bool
     var retiredFrameFilter:((CVPixelBuffer)->Bool)? {
         guard interleaved else{return nil}
@@ -139,9 +140,11 @@ import QuartzCore
     @discardableResult
     private func requireCurrent(_ phone:PhoneSession) async throws -> PhoneCameraState {
         try Task.checkCancellation()
+        guard !frozen else{throw CancellationError()}
         if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("手机画面连接已变化。请退出扫一扫后重新进入；仍失败时请重连手机。")}
         let state=try await phone.cameraState()
         try Task.checkCancellation()
+        guard !frozen else{throw CancellationError()}
         if decodedBinding != nil,!decodedFrameDelivery {throw ScanError("手机画面连接已变化。请退出扫一扫后重新进入；仍失败时请重连手机。")}
         guard matches(state) else{throw ScanError("手机扫码画面已切换，透明取景已停止。请退出扫一扫后重新进入。")}
         if identity == nil,let activity=interleaved ? state.captureActivity():state.scannerActivity() {
@@ -310,6 +313,8 @@ import QuartzCore
         return total>0 && white*100>=total*70
     }
     private func prepareInterleaved(phone:PhoneSession,epoch:Int) async throws {
+        guard !acquiringSource,sourceLease==nil,!frozen else{throw CancellationError()}
+        acquiringSource=true;defer{acquiringSource=false}
         let began=ProcessInfo.processInfo.systemUptime
         let state=try await requireCurrent(phone)
         guard state.interleavedPreviewSupported,state.desktopCameraEnabled,state.activeStreams==1 else{
@@ -319,33 +324,82 @@ import QuartzCore
         // through the ordinary phone surface while calibration is being prepared.
         _=try await phone.solidCalibrationFrame(blue:false,epoch:epoch)
         guard let capture=state.captureGeneration else{throw ScanError("当前手机连接无法开启透明取景。请关闭“原生扫码界面（试用）”，使用普通扫码框重试。")}
-        sourceLease=try await phone.beginNativePreview(display:display,epoch:epoch,capture:capture)
-        var samples=[CVPixelBuffer]()
-        for phase:UInt8 in 0...2 {
-            if phase>0 {hidesCalibrationFrames=true}
-            let before=frames.latest().0
-            guard let sourceLease else{throw CancellationError()}
-            try await phone.nativePreviewCalibration(phase,lease:sourceLease)
-            let deadline=CACurrentMediaTime()+2
-            var observed=before,lastAccepted=0.0,accepted=0,nextStateCheck=CACurrentMediaTime()+0.08
-            while accepted<3 {
-                let sample=try await nextCalibrationFrame(after:observed,notBefore:lastAccepted>0 ? lastAccepted+0.04:0,deadline:deadline)
-                observed=sample.revision
-                if CACurrentMediaTime()>=nextStateCheck {try await requireCurrent(phone);nextStateCheck=CACurrentMediaTime()+0.08}
-                let ready=phase==0 ? NativeCalibrationReadiness.blackVisible(sample.pixels):
-                    (phase==1 ? Self.whiteVisible(sample.pixels):Self.isBlue(sample.pixels))
-                guard ready else{continue}
-                samples.append(sample.pixels);lastAccepted=sample.receivedAt;accepted+=1
+        try await NativePreviewLeaseHandoff.acquire(begin:{
+            try await phone.beginNativePreview(display:display,epoch:epoch,capture:capture)
+        },adopt:{lease in
+            guard !frozen,sourceLease==nil,decodedBinding==nil || decodedFrameDelivery else{throw CancellationError()}
+            sourceLease=lease
+        },retire:{try await phone.endNativePreview($0)})
+        do {try await calibrateInterleaved(phone:phone,epoch:epoch,began:began)}
+        catch {try? await releaseSource(phone:phone);throw error}
+    }
+    private func calibrateInterleaved(phone:PhoneSession,epoch:Int,began:TimeInterval) async throws {
+        try await requireCurrent(phone)
+        let prepared=try await withThrowingTaskGroup(of:(Int,NativeScannerMatte.CalibrationBatch,Double).self) {group in
+            // At most nine immutable uploads, owned and joined by this lease's
+            // preparation. Cancellation/failure cannot leave a publisher behind.
+            defer {group.cancelAll()}
+            var samples=[CVPixelBuffer]()
+            for phase:UInt8 in 0...2 {
+                if phase>0 {hidesCalibrationFrames=true}
+                let before=frames.latest().0
+                guard let sourceLease else{throw CancellationError()}
+                let phaseBegan=ProcessInfo.processInfo.systemUptime
+                try await phone.nativePreviewCalibration(phase,lease:sourceLease)
+                calibrationTiming["phase\(phase)CommandMilliseconds"]=(ProcessInfo.processInfo.systemUptime-phaseBegan)*1000
+                var firstAccepted:Double?,lastReceipt=0.0,rejected=0,ownershipMilliseconds=0.0
+                let deadline=CACurrentMediaTime()+2
+                var observed=before,lastAccepted=0.0,accepted=0,nextStateCheck=CACurrentMediaTime()+0.08
+                while accepted<3 {
+                    let sample=try await nextCalibrationFrame(after:observed,notBefore:lastAccepted>0 ? lastAccepted+0.04:0,deadline:deadline)
+                    observed=sample.revision
+                    if CACurrentMediaTime()>=nextStateCheck {
+                        let checkBegan=ProcessInfo.processInfo.systemUptime
+                        try await requireCurrent(phone);ownershipMilliseconds+=(ProcessInfo.processInfo.systemUptime-checkBegan)*1000
+                        nextStateCheck=CACurrentMediaTime()+0.08
+                    }
+                    let ready=phase==0 ? NativeCalibrationReadiness.blackVisible(sample.pixels):
+                        (phase==1 ? Self.whiteVisible(sample.pixels):Self.isBlue(sample.pixels))
+                    guard ready else{rejected+=1;continue}
+                    if firstAccepted==nil {
+                        firstAccepted=sample.receivedAt
+                        calibrationTiming["phase\(phase)FirstMatchMilliseconds"]=(ProcessInfo.processInfo.systemUptime-phaseBegan)*1000
+                    }
+                    let index=samples.count,pixels=sample.pixels
+                    samples.append(pixels);lastAccepted=sample.receivedAt;lastReceipt=sample.receivedAt;accepted+=1
+                    group.addTask(priority:.userInitiated) {
+                        try Task.checkCancellation()
+                        let uploadBegan=ProcessInfo.processInfo.systemUptime
+                        let batch=try NativeScannerMatte.prepareCalibrationBatch([CIImage(cvPixelBuffer:pixels)])
+                        return (index,batch,(ProcessInfo.processInfo.systemUptime-uploadBegan)*1000)
+                    }
+                }
+                try await requireCurrent(phone)
+                calibrationTiming["phase\(phase)ReadyMilliseconds"]=(ProcessInfo.processInfo.systemUptime-began)*1000
+                calibrationTiming["phase\(phase)SampleSpanMilliseconds"]=(lastReceipt-(firstAccepted ?? lastReceipt))*1000
+                calibrationTiming["phase\(phase)RejectedFrames"]=Double(rejected)
+                calibrationTiming["phase\(phase)OwnershipCheckMilliseconds"]=ownershipMilliseconds
             }
-            try await requireCurrent(phone)
-            calibrationTiming["phase\(phase)ReadyMilliseconds"]=(ProcessInfo.processInfo.systemUptime-began)*1000
+            let joinBegan=ProcessInfo.processInfo.systemUptime
+            var batches=[NativeScannerMatte.CalibrationBatch?](repeating:nil,count:9)
+            for try await (index,batch,milliseconds) in group {
+                batches[index]=batch;calibrationTiming["sample\(index)UploadMilliseconds"]=milliseconds
+            }
+            calibrationTiming["uploadJoinMilliseconds"]=(ProcessInfo.processInfo.systemUptime-joinBegan)*1000
+            let rendererBegan=ProcessInfo.processInfo.systemUptime
+            let complete=batches.compactMap{$0}
+            guard complete.count==9 else{throw NativeScannerMatte.Unavailable("prepared_calibration")}
+            let result=try await Task.detached(priority:.userInitiated) {
+                try Task.checkCancellation()
+                let reference=try NativePreviewKeyReference(samples:samples)
+                let images=samples.map{CIImage(cvPixelBuffer:$0)}
+                let renderer=try NativeScannerMatte(black:images[0],white:images[3],algorithm:.spatialBlue,
+                    blueCalibration:images,preparedCalibration:complete)
+                return (reference,renderer)
+            }.value
+            calibrationTiming["rendererPreparationMilliseconds"]=(ProcessInfo.processInfo.systemUptime-rendererBegan)*1000
+            return result
         }
-        let prepared=try await Task.detached(priority:.userInitiated) {
-            let reference=try NativePreviewKeyReference(samples:samples)
-            let images=samples.map{CIImage(cvPixelBuffer:$0)}
-            let renderer=try NativeScannerMatte(black:images[0],white:images[3],algorithm:.spatialBlue,blueCalibration:images)
-            return (reference,renderer)
-        }.value
         try await requireCurrent(phone)
         let confirmationBegan=ProcessInfo.processInfo.systemUptime,deadline=CACurrentMediaTime()+0.3
         var latest=frames.latest(),confirmed=false,observed=latest.0
@@ -417,9 +471,15 @@ import QuartzCore
         if let binding=decodedBinding {binding.mailbox.removeDecodedFrameObserver(binding.id);decodedBinding=nil}
     }
     func releaseSource(phone:PhoneSession) async throws {
+        if let sourceRelease {try await sourceRelease.value;return}
         guard let lease=sourceLease else{return}
-        try await phone.endNativePreview(lease)
-        sourceLease=nil
+        let job=Task {try await phone.endNativePreview(lease)}
+        sourceRelease=job
+        do {
+            try await job.value
+            if sourceLease==lease {sourceLease=nil}
+            sourceRelease=nil
+        }catch {sourceRelease=nil;throw error}
     }
     func stop() async {
         noteEnd(.cleared);freeze()

@@ -46,7 +46,7 @@ import Metal
     static func ci(_ data:[UInt8])->CIImage {
         CIImage(bitmapData:Data(data),bytesPerRow:width*4,size:CGSize(width:width,height:height),format:.RGBA8,colorSpace:nil)
     }
-    static func main() throws {
+    static func main() async throws {
         let black=rgba(0),white=rgba(1),key=rgba(2)
         let samples=[black,black,black,white,white,white,key,key,key].map{pixels($0)}
         let reference=try NativePreviewKeyReference(samples:samples)
@@ -84,8 +84,32 @@ import Metal
             return data
         }
         let target=texture(width,height,.rgba8Unorm)
-        let command=try renderer.render(black:ci(key),into:target,allowFused:false);command.waitUntilCompleted()
+        let command=try renderer.render(black:ci(key),into:target,allowFused:false);await command.completed()
         check(command.status == .completed)
+        // Pre-uploaded observations must preserve exactly the serial path's
+        // asymmetric native colors, alpha, orientation and temporal ordering.
+        let images=[black,black,black,white,white,white,key,key,key].map{ci($0)}
+        let uploads=try await withThrowingTaskGroup(of:(Int,NativeScannerMatte.CalibrationBatch).self) {group in
+            for (index,image) in images.enumerated() {
+                group.addTask{(index,try NativeScannerMatte.prepareCalibrationBatch([image]))}
+            }
+            var slots=[NativeScannerMatte.CalibrationBatch?](repeating:nil,count:9)
+            for try await (index,batch) in group{slots[index]=batch}
+            let complete=slots.compactMap{$0};check(complete.count==9);return complete
+        }
+        let staged=try NativeScannerMatte(black:images[0],white:images[3],algorithm:.spatialBlue,
+            blueCalibration:images,preparedCalibration:uploads)
+        let stagedTarget=texture(width,height,.rgba8Unorm)
+        let stagedCommand=try staged.render(black:ci(key),into:stagedTarget,allowFused:false)
+        await stagedCommand.completed();check(stagedCommand.status == .completed)
+        check(bytes(target)==bytes(stagedTarget),"Pre-upload changed serial calibration pixels")
+        do {
+            _=try NativeScannerMatte(black:images[0],white:images[3],algorithm:.spatialBlue,
+                blueCalibration:images,preparedCalibration:Array(uploads.dropLast()))
+            check(false,"Partial uploads accepted")
+        }catch is NativeScannerMatte.Unavailable {}
+        do {_=try NativeScannerMatte.prepareCalibrationBatch([]);check(false,"Empty batch accepted")}
+        catch is NativeScannerMatte.Unavailable {}
         // Compare canonical CI bitmap rows; raw Metal textures use a different
         // image origin. Fused/reference textures are compared directly below.
         let recovered=CIImage(cgImage:try renderer.render(black:ci(key)),options:[.colorSpace:NSNull()])
@@ -101,8 +125,8 @@ import Metal
         check(maximum<=4,"Spatial key changed original native pixels: \(maximum)")
         for (w,h) in [(width,height),(width*2,height*2),(width/2,height/2)] {
             let a=texture(w,h,.bgra8Unorm),b=texture(w,h,.bgra8Unorm)
-            let ca=try renderer.render(black:ci(key),into:a,allowFused:false);ca.waitUntilCompleted()
-            let cb=try renderer.render(black:ci(key),into:b,allowFused:true);cb.waitUntilCompleted()
+            let ca=try renderer.render(black:ci(key),into:a,allowFused:false);await ca.completed()
+            let cb=try renderer.render(black:ci(key),into:b,allowFused:true);await cb.completed()
             check(ca.status == .completed && cb.status == .completed)
             check(zip(bytes(a),bytes(b)).map{abs(Int($0)-Int($1))}.max()!<=2)
         }

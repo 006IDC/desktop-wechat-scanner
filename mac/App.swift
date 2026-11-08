@@ -947,7 +947,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             if overlay.interleaved,nativeCameraScene?.sameSource(in:state) != true {nativeCameraScene=NativeCameraScene(state:state)}
                             nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
                             status("准备扫码预览","正在准备手机应用的扫码画面…")
-                            try await overlay.prepare(phone:phone,epoch:generation)
+                            let warmTarget=try DesktopCaptureTarget.current(for:targetWindow.desktopCaptureRect)
+                            let preparation=try await CaptureStartupOverlap.during(prepare:{[capture] in
+                                try await capture.prepareStream(warmTarget)
+                            },operation:{try await overlay.prepare(phone:phone,epoch:generation)})
+                            cameraStartupStages["streamWarmupCompleted"]=preparation.warmup.completed ? 1:0
+                            cameraStartupStages["streamWarmupMilliseconds"]=preparation.warmup.milliseconds
                             let attachmentState=try await phone.cameraState()
                             try Task.checkCancellation()
                             guard connected,!stopping,generation==scanGeneration,nativeScannerOverlay === overlay else{throw CancellationError()}

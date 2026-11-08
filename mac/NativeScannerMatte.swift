@@ -193,7 +193,35 @@ final class NativeScannerMatte {
     private static let resources:Result<Resources,Error>=Result {try Resources()}
     /// Call on a background worker before a scanner opens. No camera/capture access.
     static func prewarm() throws {_=try resources.get()}
-    init(black: CIImage, white: CIImage, algorithm: Algorithm = .blackWhite, blueCalibration: [CIImage] = []) throws {
+    /// Immutable, completed uploads from one calibration phase. Never cached
+    /// between scanners; the caller retains all nine original observations.
+    struct CalibrationBatch:@unchecked Sendable {
+        fileprivate let extent:CGRect,textures:[MTLTexture]
+    }
+    static func prepareCalibrationBatch(_ images:[CIImage]) throws ->CalibrationBatch {
+        try Task.checkCancellation()
+        guard (1...3).contains(images.count),let first=images.first,first.extent.origin == .zero,
+              !first.extent.isEmpty,first.extent.width<=4096,first.extent.height<=4096,
+              images.allSatisfy({$0.extent==first.extent}) else{throw Unavailable("calibration_batch")}
+        let resources=try resources.get()
+        guard let queue=resources.device.makeCommandQueue(),let command=queue.makeCommandBuffer() else{throw Unavailable()}
+        let descriptor=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.rgba8Unorm,
+            width:Int(first.extent.width),height:Int(first.extent.height),mipmapped:false)
+        descriptor.usage=[.shaderRead,.shaderWrite,.renderTarget]
+        var textures=[MTLTexture]()
+        for image in images {
+            guard let texture=resources.device.makeTexture(descriptor:descriptor) else{throw Unavailable()}
+            textures.append(texture)
+            resources.context.render(image,to:texture,commandBuffer:command,bounds:first.extent,colorSpace:CGColorSpaceCreateDeviceRGB())
+        }
+        command.commit();command.waitUntilCompleted()
+        withExtendedLifetime(images) {}
+        guard command.status == .completed else{throw Unavailable()}
+        try Task.checkCancellation()
+        return CalibrationBatch(extent:first.extent,textures:textures)
+    }
+    init(black: CIImage, white: CIImage, algorithm: Algorithm = .blackWhite, blueCalibration: [CIImage] = [],
+         preparedCalibration:[CalibrationBatch] = []) throws {
         guard black.extent == white.extent, black.extent.origin == .zero,
               !black.extent.isEmpty, black.extent.width <= 4096, black.extent.height <= 4096 else { throw Unavailable("dimensions") }
         guard blueCalibration.isEmpty || ((algorithm == .blueWithNativeColorBias || algorithm == .spatialBlue) && blueCalibration.count == 9 &&
@@ -201,6 +229,13 @@ final class NativeScannerMatte {
         guard algorithm != .spatialBlue || blueCalibration.count==9 else{throw Unavailable("spatial_calibration_count")}
         let resources=try Self.resources.get()
         let device=resources.device
+        guard preparedCalibration.isEmpty || (algorithm == .spatialBlue && blueCalibration.count==9 &&
+            preparedCalibration.reduce(0,{$0+$1.textures.count})==9 && preparedCalibration.allSatisfy({batch in
+                batch.extent==black.extent && (1...3).contains(batch.textures.count) && batch.textures.allSatisfy({
+                    $0.device.registryID==device.registryID && $0.pixelFormat == .rgba8Unorm &&
+                    $0.width==Int(black.extent.width) && $0.height==Int(black.extent.height)
+                })
+            })) else{throw Unavailable("prepared_calibration")}
         guard let queue=device.makeCommandQueue() else{throw Unavailable()}
         extent = black.extent
         self.queue = queue;context=resources.context
@@ -227,10 +262,14 @@ final class NativeScannerMatte {
             context.render(white,to:whiteInput,commandBuffer:command,bounds:extent,colorSpace:CGColorSpaceCreateDeviceRGB())
             try Self.encode(command, pipeline: calibrate, a: input, b: whiteInput, output: transmission)
         } else {
-            for image in blueCalibration {
-                guard let texture = device.makeTexture(descriptor: descriptor) else { throw Unavailable() }
-                retained.append(texture)
-                context.render(image,to: texture,commandBuffer: command,bounds: extent,colorSpace: CGColorSpaceCreateDeviceRGB())
+            if preparedCalibration.isEmpty {
+                for image in blueCalibration {
+                    guard let texture = device.makeTexture(descriptor: descriptor) else { throw Unavailable() }
+                    retained.append(texture)
+                    context.render(image,to: texture,commandBuffer: command,bounds: extent,colorSpace: CGColorSpaceCreateDeviceRGB())
+                }
+            } else {
+                retained=preparedCalibration.flatMap(\.textures)
             }
             guard let encoder = command.makeComputeCommandEncoder() else { throw Unavailable() }
             encoder.setComputePipelineState(calibrate)
