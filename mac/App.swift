@@ -402,7 +402,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 mainControl.setPhoneDesktopMode(desktopMode)
                 if desktopMode {
                     let endpoint=try await phone.mirrorEndpoint()
-                    try await showMirror(display:endpoint.display)
+                    try await prepareMirror(display:endpoint.display)
+                    // Some secondary launchers resume without drawing a frame.
+                    // The authenticated, rechecked HOME state can show the real
+                    // app catalog without waiting for that blank video surface.
+                    try await followDesktopHome(phone.cameraState(),display:endpoint.display)
+                    if !applicationPickerVisible {try await showMirror(display:endpoint.display)}
                 } else if !primaryLocked {try await showMirror(display:0)}
                 mainApplicationInputReady=true;mainControl.setPhoneInteractionEnabled(true)
                 try Task.checkCancellation();busy=false

@@ -20,6 +20,14 @@ struct ScanError:LocalizedError {
     }
     static func main() throws {
         let expected=[task(11),task(12)],arrived=[task(11,display:7),task(12,display:7)]
+        for (id,root) in [(0,10),(12,0)] {
+            let source=[task(id,root:root)]
+            let target=[task(id,display:7,root:root)]
+            rejects{_=try OwnedTaskMove.applicationTasks(in:source,packageName:"org.example.selected",target:7)}
+            rejects{_=try OwnedTaskMove.applicationTasksOnTarget(in:target,packageName:"org.example.selected",target:7)}
+            require(!OwnedTaskMove.applicationIsForeground(component:"org.example.selected/.Main",taskID:id,in:target,packageName:"org.example.selected",target:7))
+            rejects{_=try OwnedTaskMove.rootToMove(expected:source,current:source,destination:7)}
+        }
         require(try OwnedTaskMove.rootToMove(expected:expected,current:expected,destination:7)==10)
         require(try OwnedTaskMove.rootToMove(expected:expected,current:arrived,destination:7)==nil)
         require(try OwnedTaskMove.rootToMove(expected:expected,current:[],destination:7)==nil)

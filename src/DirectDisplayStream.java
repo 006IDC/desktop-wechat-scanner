@@ -12,7 +12,6 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
 import java.io.*;
-import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -28,6 +27,7 @@ final class DirectDisplayStream implements AutoCloseable {
     private final VirtualDisplay display;
     private final Surface originalSurface;
     private final Validator validator;
+    private final OwnedInputInjector inputInjector;
     private final boolean realtimeRequested;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Object connections = new Object();
@@ -44,13 +44,16 @@ final class DirectDisplayStream implements AutoCloseable {
     private long downTime;
     private float lastX, lastY;
 
-    DirectDisplayStream(VirtualDisplay display, Surface originalSurface, int width, int height, boolean realtimeRequested, Validator validator) throws Exception {
+    DirectDisplayStream(android.content.Context context, VirtualDisplay display, Surface originalSurface, int width, int height, boolean realtimeRequested, Validator validator) throws Exception {
         this.display = display; this.originalSurface = originalSurface;
         this.width = width; this.height = height; this.validator = validator;
         this.realtimeRequested = realtimeRequested;
         validator.validate();
         displayId = display.getDisplay().getDisplayId();
         if (displayId <= Display.DEFAULT_DISPLAY || width <= 0 || height <= 0) throw new IOException("Invalid owned video display");
+        // Reuse the server's prepared shell context. Creating another context
+        // here would prepare its main Looper twice on the serving thread.
+        inputInjector = OwnedInputInjector.create(context.getSystemService(android.content.Context.INPUT_SERVICE), InputEvent.class);
         socketName = "006idc_video_" + randomHex(); token = randomHex();
     }
 
@@ -171,12 +174,9 @@ final class DirectDisplayStream implements AutoCloseable {
         if (actual == null || !actual.isValid() || actual.getDisplayId() != displayId || displayId <= 0)
             throw new IOException("Input display is no longer owned and valid");
         InputEvent.class.getMethod("setDisplayId", int.class).invoke(event, displayId);
-        Class<?> inputManager = Class.forName("android.hardware.input.InputManager");
-        Object manager = inputManager.getMethod("getInstance").invoke(null);
-        Method inject = inputManager.getMethod("injectInputEvent", InputEvent.class, int.class);
         // Keep delivery asynchronous, as in scrcpy. Waiting for a focused
         // target can retain the control worker during Android input stalls.
-        if (!Boolean.TRUE.equals(inject.invoke(manager, event, 0))) throw new IOException("Owned display input rejected");
+        inputInjector.inject(event);
     }
 
     private void control(LocalSocket socket) {

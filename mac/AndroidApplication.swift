@@ -143,7 +143,10 @@ struct AndroidTaskSnapshot: Equatable {
             guard let currentDisplay = display else { continue }
             if indent <= displayIndent { display = nil; roots.removeAll(); continue }
             while let last = roots.last, nodes[last].indent >= indent { roots.removeLast() }
-            if let match = taskPattern.firstMatch(in: line, range: range), let id = Int(ns.substring(with: match.range(at: 1))), id > 0 {
+            // Android task IDs include zero. In particular, Xiaomi may retain
+            // an empty #0 root on the physical display. Parse its children and
+            // ownership normally; move authorization remains a separate check.
+            if let match = taskPattern.firstMatch(in: line, range: range), let id = Int(ns.substring(with: match.range(at: 1))), id >= 0 {
                 // Multiple Hist records may share an id; real Task headers
                 // may not. Do not let the activity aggregation hide reuse.
                 if strict,!taskHeaders.insert(id).inserted {throw ValidationError(reason:.conflictingTask)}

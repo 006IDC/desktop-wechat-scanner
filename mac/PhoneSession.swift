@@ -184,6 +184,7 @@ final class ServerLog {
 private struct Recovery: Codable {
     var serial: String, suffix: String, token: String, mac: String
     var association: Int? = nil
+    var associationPending:Bool? = nil
     var port: UInt16? = nil
     var display: Int? = nil
     var device: Int? = nil
@@ -264,6 +265,7 @@ actor PhoneSession {
     private(set) var lastApplicationLaunchEvidence:[String:Int]?
     private var cleaning=false
     private(set) var connectionStage = "idle"
+    private var companionSyntax:CompanionAssociationCommands?
     private var diagnosticLog: ServerLog?
     func encoderLatencyFrames() -> Int? { diagnosticLog?.encoderLatencyFrames() }
     init(resources: URL, adbURL: URL? = nil, serverSocket: String? = nil) {
@@ -278,11 +280,48 @@ actor PhoneSession {
         return try ShellCommand.run(adbURL, (serverSocket.map { ["-L", $0] } ?? []) + (selected.map { ["-s",$0] } ?? []) + args, timeout: timeout,cancellable:!cleaning)
     }
     private func shell(_ command: String) throws -> String { try adb(["shell",command]) }
+    private func companionCommands(serial:String?=nil) throws ->CompanionAssociationCommands {
+        if let companionSyntax {return companionSyntax}
+        // Android's help may return 255. Only this read-only probe ignores its
+        // remote exit status; an unknown/error payload still fails detection.
+        // Transport failures continue to throw from adb, as for other reads.
+        let help=try adb(["shell","cmd companiondevice help; :"],serial:serial)
+        let advertised=try CompanionAssociationCommands.advertised(help:help)
+        let runtimeOptions=advertised == .options ? try CompanionAssociationCommands.runtimeOptions(in:companionProbe()):nil
+        let syntax=try CompanionAssociationCommands.detect(help:help,runtimeOptions:runtimeOptions)
+        companionSyntax=syntax;return syntax
+    }
+
     private func save() throws {
         guard let state = recovery else { return }
         try FileManager.default.createDirectory(at: recoveryURL.deletingLastPathComponent(),withIntermediateDirectories:true)
         try JSONEncoder().encode(state).write(to: recoveryURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:recoveryURL.path)
+    }
+    private func companionProbe(mac:String?=nil) throws ->Data {
+        guard let state=recovery,state.valid,state.suffix.utf8.count==8,state.token.utf8.count==32 else {
+            throw ScanError("临时连接记录无法核实，已停止操作。")
+        }
+        if let mac {_=try CompanionAssociationCommands.positional.disassociate(mac:mac)} // Validate only, never execute.
+        let owner=try shell("if test -d \(state.path); then cat \(state.path)/owner; else printf absent; fi")
+        guard owner==state.token || owner=="absent" else{throw ScanError("手机会话标记不匹配，已保留恢复记录。")}
+        if owner=="absent" {_=try shell("mkdir \(state.path) && printf '%s' '\(state.token)' > \(state.path)/owner")}
+        // Read-only helper: keep the active server.jar unchanged. On uncertain
+        // helper/transport failure, the normal recovery record remains intact.
+        let probe=state.path+"/cmd-capabilities.jar"
+        defer {_=try? shell("rm -f \(probe)")}
+        _=try adb(["push",jarURL.path,probe])
+        let arguments=mac.map{" association \($0)"} ?? ""
+        let raw=try adb(["shell","CLASSPATH=\(probe) app_process / CompanionCommandCapabilities"+arguments],timeout:8)
+        return Data(raw.utf8)
+    }
+    private func readAssociationID(_ state:Recovery) throws ->Int? {
+        try CompanionAssociationCommands.associationID(in:companionProbe(mac:state.mac),mac:state.mac,expected:state.association)
+    }
+    private func confirmAssociation(_ state:Recovery) throws ->Int {
+        try CompanionAssociationCommands.confirmAssociation(read:{try self.readAssociationID(state)},check:{
+            if !self.cleaning {try Task.checkCancellation()}
+        })
     }
     func connect(openWechatOnConnect: Bool = true, selectedSerial: String? = nil, allowLockedApplications: Bool = false, desktopHome: Bool = false, balancedDisplay: Bool = false, displayBeforeCamera: Bool = false, mirrorOnly: Bool = false, realtimeVideo: Bool = false, genericDesktopCamera:Bool=false, progress: @escaping @Sendable (String) -> Void) async throws -> String {
         guard server == nil else { throw ScanError("手机已经连接。") }
@@ -290,6 +329,7 @@ actor PhoneSession {
             throw ScanError("通用桌面相机需要启用相机的应用桌面会话。")
         }
         do {
+            companionSyntax=nil
             packageLauncherQuerySupported=false
             activityTaskDumpSupported=false;activityTaskDumpDisabled=false
             connectionStage = "enumeration"
@@ -330,12 +370,14 @@ actor PhoneSession {
             let r = recovery!
             connectionStage = "session_directory"
             _ = try shell("mkdir \(r.path) && printf '%s' '\(r.token)' > \(r.path)/owner")
+            connectionStage = "association_capabilities"
+            let commands=try companionCommands(serial:serial)
             progress("正在创建临时手机摄像头…")
             connectionStage = "association"
-            _ = try shell("cmd companiondevice associate 0 com.android.shell \(r.mac) android.app.role.COMPANION_DEVICE_APP_STREAMING")
-            let entries = try shell("cmd companiondevice list 0").split(separator:"\n").map { $0.split(separator:"|").map { $0.trimmingCharacters(in:.whitespaces) } }
-            guard let entry = entries.first(where:{$0.count==3 && $0[1]=="com.android.shell" && $0[2].uppercased()==r.mac}), let association=Int(entry[0]) else { throw ScanError("手机未返回有效的临时连接编号。") }
-            recovery?.association=association; try save()
+            recovery?.associationPending=true;try save()
+            _ = try shell(commands.associate(mac:r.mac))
+            let association=try confirmAssociation(r)
+            recovery?.association=association;recovery?.associationPending=false;try save()
             connectionStage = "service_transfer"
             _ = try adb(["push",jarURL.path,r.path+"/server.jar"])
             try Task.checkCancellation()
@@ -947,14 +989,11 @@ actor PhoneSession {
     }
 
     private func associationPresent(_ state: Recovery) throws -> Bool {
-        let rows=try shell("cmd companiondevice list 0").split(separator:"\n")
-        let matches=rows.map{$0.split(separator:"|").map{$0.trimmingCharacters(in:.whitespaces)}}
-            .filter{$0.count==3 && $0[1]=="com.android.shell" && $0[2].uppercased()==state.mac}
-        guard matches.count<=1 else {throw ScanError("存在多个同名临时连接，已停止自动清理。")}
-        if let row=matches.first,let expected=state.association,Int(row[0]) != expected {
+        let found=try readAssociationID(state)
+        if let found,let expected=state.association,found != expected {
             throw ScanError("临时连接编号不匹配，已停止自动清理。")
         }
-        return !matches.isEmpty
+        return found != nil
     }
 
     private func processExists(_ pid:Int) throws -> Bool {
@@ -1010,9 +1049,14 @@ actor PhoneSession {
         activityTaskDumpSupported=false;activityTaskDumpDisabled=false
         independentApplicationsWhenLocked=false
         cleaning=true;defer {cleaning=false}
-        if let state = recovery {
+        if var state = recovery {
             do {
                 guard state.valid else { throw ScanError("连接恢复记录无效。") }
+                if state.associationPending==true {
+                    cleanupStage="confirmPendingAssociation"
+                    state.association=try confirmAssociation(state);state.associationPending=false
+                    recovery=state;try save()
+                }
                 cleanupStage="verifyOwner"
                 let owner = try shell("if test -d \(state.path); then cat \(state.path)/owner; else printf absent; fi")
                 guard owner == state.token || owner == "absent" else { throw ScanError("手机会话标记不匹配。") }
@@ -1092,15 +1136,23 @@ actor PhoneSession {
                 throw ScanError("本次虚拟设备尚未关闭，已保留恢复记录。")
             }
             if try associationPresent(state) {
-                _ = try shell("cmd companiondevice disassociate 0 com.android.shell \(state.mac)")
+                _ = try shell(companionCommands().disassociate(mac:state.mac))
             }
-            if owner != "absent" {
-                _ = try shell("rm -f \(state.path)/server.jar \(state.path)/owner && rmdir \(state.path)")
+            // The structured read uses a short-lived owned helper. Confirm
+            // association absence before removing the directory it needs.
+            let associationRemoved=try !associationPresent(state)
+            guard associationRemoved else{throw ScanError("手机临时关联尚未删除，已保留恢复记录。")}
+            // Capability checks can recreate a missing owned directory. Never
+            // decide cleanup from the earlier, stale owner snapshot.
+            let currentOwner=try shell("if test -d \(state.path); then cat \(state.path)/owner; else printf absent; fi")
+            guard currentOwner==state.token || currentOwner=="absent" else{throw ScanError("手机会话标记已变化，已停止清理。")}
+            if currentOwner != "absent" {
+                _ = try shell("rm -f \(state.path)/server.jar \(state.path)/cmd-capabilities.jar \(state.path)/owner && rmdir \(state.path)")
             }
             if let port=state.port {_ = try? adb(["forward","--remove","tcp:\(port)"])}
             guard try ownedDevice(state)==nil,
                   try findOwnedProcess(state)==nil,
-                  try !associationPresent(state),
+                  associationRemoved,
                   try shell("if test -e \(state.path); then printf present; else printf absent; fi")=="absent" else {
                 throw ScanError("手机临时资源未全部消失，已保留恢复记录。")
             }

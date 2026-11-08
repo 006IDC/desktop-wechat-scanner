@@ -1158,7 +1158,7 @@ public final class LiveCameraServer {
         if (!verifyIndependentLock(target)) throw new IOException("Independent lock policy is not active");
         stopDirectStream(id);
         Surface original = target == display ? displayReader.getSurface() : appDisplays.get(id).reader.getSurface();
-        DirectDisplayStream stream = new DirectDisplayStream(target, original, displayWidth, displayHeight, realtimeVideoRequested, () -> {
+        DirectDisplayStream stream = new DirectDisplayStream(context, target, original, displayWidth, displayHeight, realtimeVideoRequested, () -> {
             if (stopping || ownedDisplay(id) != target || !verifyIndependentLock(target))
                 throw new IOException("Direct display is no longer owned and independently unlocked");
         });

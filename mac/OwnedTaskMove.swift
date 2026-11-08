@@ -10,7 +10,7 @@ enum OwnedTaskMove {
         for root in Set(moving.map(\.rootID)) {
             let members=snapshot.filter{$0.rootID==root}
             guard Set(members.map(\.display)).count==1,members.allSatisfy({
-                $0.userID==0 && !$0.rootContainsOtherUsers && !$0.rootContainsUnknownTasks && !$0.isHome &&
+                $0.id>0 && $0.rootID>0 && $0.userID==0 && !$0.rootContainsOtherUsers && !$0.rootContainsUnknownTasks && !$0.isHome &&
                 $0.packageNames==[packageName] && $0.display != target
             }) else {throw ScanError("此应用与其他应用共享任务容器，无法安全地单独移入窗口。")}
         }
@@ -26,7 +26,7 @@ enum OwnedTaskMove {
     /// foreground package alone cannot certify an incomplete task root.
     static func applicationTasksOnTarget(in snapshot:[AndroidTaskSnapshot],packageName:String,target:Int) throws ->[AndroidTaskSnapshot] {
         let tasks=snapshot.filter{$0.display==target && $0.packageNames.contains(packageName)}
-        guard tasks.allSatisfy({$0.userID==0 && !$0.isHome && !$0.rootContainsOtherUsers && !$0.rootContainsUnknownTasks}) else {
+        guard tasks.allSatisfy({$0.id>0 && $0.rootID>0 && $0.userID==0 && !$0.isHome && !$0.rootContainsOtherUsers && !$0.rootContainsUnknownTasks}) else {
             throw ScanError("应用任务的归属尚未完整确认，已保留恢复记录。")
         }
         return tasks

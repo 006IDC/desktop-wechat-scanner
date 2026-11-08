@@ -200,6 +200,32 @@ import Foundation
                 "A foreign empty child must block moving its primary-user root")
         let mismatchedUser = "Display #0 (activities from top to bottom):\n  * Task{foreign #9 U=999 sz=1}\n    * Hist  #0: ActivityRecord{x u0 org.example.other/.Main t9}"
         do { _ = try AndroidTaskSnapshot.parseChecked(mismatchedUser); fatalError("Task header/history user mismatch accepted") } catch {}
+        let zeroRoot="""
+        Display #0 (activities from top to bottom):
+          * Task{empty #0 type=undefined U=0 mode=multi-window sz=0}
+          * Task{app #12 U=0 type=standard sz=1}
+            * Hist #0: ActivityRecord{a u0 org.example.app/.Main t12}
+        Display #8 (activities from top to bottom):
+          * Task{home #20 U=0 type=home sz=1}
+            * Hist #0: ActivityRecord{b u0 org.example.launcher/.Home t20}
+        """
+        let zeroSnapshot=try AndroidTaskSnapshot.parseChecked(zeroRoot,requiredDisplay:8)
+        require(zeroSnapshot.count==2 && zeroSnapshot.first(where:{$0.id==12})?.rootContainsUnknownTasks==false,
+                "A valid unrelated empty task zero blocked the owned display")
+        let zeroChild="""
+        Display #8 (activities from top to bottom):
+          * Task{root #20 U=0 sz=2}
+            * Task{empty #0 U=0 sz=0}
+            * Task{app #21 U=0 sz=1}
+              * Hist #0: ActivityRecord{a u0 org.example.app/.Main t21}
+        """
+        require(try AndroidTaskSnapshot.parseChecked(zeroChild,requiredDisplay:8).first?.rootContainsUnknownTasks==true,
+                "Empty task zero was hidden from its shared root's ownership checks")
+        for tree in [zeroRoot.replacingOccurrences(of:"#0 type=undefined",with:"#-1 type=undefined"),
+                     zeroRoot.replacingOccurrences(of:"mode=multi-window sz=0",with:"mode=multi-window sz=1"),
+                     zeroRoot.replacingOccurrences(of:"  * Task{app #12",with:"  * Task{duplicate #0 U=0 sz=0}\n  * Task{app #12")] {
+            do {_=try AndroidTaskSnapshot.parseChecked(tree,requiredDisplay:8);fatalError("Invalid task zero shape accepted")}catch{}
+        }
         let rejectedTrees = [
             "Display #0 (unknown tree):\n  * Task{x #6 sz=0}",
             "Display #0 (activities from top to bottom):\n  * Task{x #6 sz=1}",
