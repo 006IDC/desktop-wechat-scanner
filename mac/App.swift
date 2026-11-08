@@ -321,6 +321,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         value["cameraActivityActive"]=cameraActivity != nil
         value["localScanFrameVisible"]=localScanFrame?.window?.isVisible == true
         value["localCameraMode"]=localCameraMode
+        value["nativeSourceBudgetMilliseconds"]=(cameraPump?.nativeMinimumInterval ?? 0)*1000
         value["desktopMode"]=desktopMode
         value["genericDesktopCamera"]=genericDesktopCamera
         value["nativeScanPreviewSelected"]=genericDesktopCamera && nativeInterleavedRequested
@@ -891,6 +892,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let startupBegan=ProcessInfo.processInfo.systemUptime
         operationTask=Task { [self] in
             defer {if cameraPreparation?.token==preparationToken {cameraPreparation=nil}}
+            var preparationActivity:NSObjectProtocol?
+            defer {if let preparationActivity {ProcessInfo.processInfo.endActivity(preparationActivity)}}
             let drainingBegan=ProcessInfo.processInfo.systemUptime
             await metadataWarmup.withForeground { prepared in
                 do {
@@ -901,10 +904,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     stage=ProcessInfo.processInfo.systemUptime
                     guard await clearCamera() else{localScanClearFailed();return}
                     cameraStartupStages["clearPreviousMilliseconds"]=(ProcessInfo.processInfo.systemUptime-stage)*1000
+                    preparationActivity=ProcessInfo.processInfo.beginActivity(options:.userInitiatedAllowingIdleSystemSleep,
+                        reason:"准备实时手机桌面相机")
+                    cameraStartupStages["preparationActivityRequested"]=1
                     let generation=scanGeneration
                     status("准备桌面相机","正在读取当前窗口后方的桌面画面…")
                     stage=ProcessInfo.processInfo.systemUptime
-                    try await prepareForegroundCaptureMetadata();try Task.checkCancellation()
+                    let deferMetadata=desktopMode && genericDesktopCamera && nativeScannerRequested && nativeInterleavedRequested && CGPreflightScreenCaptureAccess()
+                    // The native stream warmup below prepares the same metadata
+                    // during calibration. Initial permission/fallback paths keep
+                    // the foreground prepare and never rely on an optional job.
+                    if !deferMetadata {try await prepareForegroundCaptureMetadata()}
+                    try Task.checkCancellation()
+                    cameraStartupStages["metadataPreparationDeferred"]=deferMetadata ? 1:0
                     cameraStartupStages["prepareMetadataMilliseconds"]=(ProcessInfo.processInfo.systemUptime-stage)*1000
                     screenAccessGranted=true
                     targetWindow.showPermissionHelp(false)
@@ -953,6 +965,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             },operation:{try await overlay.prepare(phone:phone,epoch:generation)})
                             cameraStartupStages["streamWarmupCompleted"]=preparation.warmup.completed ? 1:0
                             cameraStartupStages["streamWarmupMilliseconds"]=preparation.warmup.milliseconds
+                            if deferMetadata && !preparation.warmup.completed {
+                                try await prepareForegroundCaptureMetadata()
+                                cameraStartupStages["metadataFallbackCompleted"]=1
+                            }
                             let attachmentState=try await phone.cameraState()
                             try Task.checkCancellation()
                             guard connected,!stopping,generation==scanGeneration,nativeScannerOverlay === overlay else{throw CancellationError()}
@@ -964,8 +980,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             if overlay.interleaved,nativeCameraScene?.markVerified(in:attachmentState) != true {throw ScanError("手机扫码画面已切换，透明取景已停止。请退出扫一扫后重新进入。")}
                             guard targetWindow.showNativeScanner(overlay) else{throw ScanError("透明取景未能开启。请先关闭“原生扫码界面（试用）”，使用普通扫码框重试。")}
                             nativeScannerAttachedUptime=ProcessInfo.processInfo.systemUptime
-                        } else {showLocalScanFrame(for:targetWindow)}
-                    } else if localCameraMode {showLocalScanFrame(for:targetWindow)}
+                        } else {
+                            if deferMetadata {try await prepareForegroundCaptureMetadata()}
+                            showLocalScanFrame(for:targetWindow)
+                        }
+                    } else if localCameraMode {
+                        if deferMetadata {try await prepareForegroundCaptureMetadata()}
+                        showLocalScanFrame(for:targetWindow)
+                    }
                     busy=false
                     startCameraLoop();desktopCameraReadyUptime=ProcessInfo.processInfo.systemUptime
                     cameraStartupStages["presentAndStartPumpMilliseconds"]=(ProcessInfo.processInfo.systemUptime-stage)*1000
@@ -1766,7 +1788,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // worker retires in-flight ROI; a recovered scene must republish.
             cameraWindow?.freezeNativeScanner()
             if pump.latest() != nil {pump.invalidateRegion()}
-            if !recoveryWasPending {cameraStateRefreshRequested=true}
+            // Fresh post-clear presentation need not wait for the ordinary
+            // 250ms activity poll. This only requests authenticated validation;
+            // the existing owner/state/clear/presentation checks resume input.
+            if !recoveryWasPending || overlay.recoveryReadyForValidation {cameraStateRefreshRequested=true}
             return
         }
         if let failure=nativeScannerOverlay?.failure {pump.fail(ScanError(failure))}
@@ -1778,7 +1803,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         cameraTickAt=tick
         let nativeGeometry=nativeScannerOverlay?.sourceLease != nil
-        if nativeGeometry ? nativeGeometryClock.due(at:tick):tick>=nextCameraGeometry {
+        if nativeGeometry ? nativeGeometryClock.due(at:tick,minimumInterval:pump.nativeMinimumInterval):tick>=nextCameraGeometry {
             if !nativeGeometry {nextCameraGeometry=tick+1.0/30}
             do {
                 let rect=localScanFrame?.captureRect ?? captureControl.desktopCaptureRect
@@ -1886,7 +1911,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     stats.captureMilliseconds=(ProcessInfo.processInfo.systemUptime-began)*1000
                     try Task.checkCancellation()
                     guard pump.isAdmittingFrames else{break}
-                    if localFrameMode,(!pump.captureReady(at:ProcessInfo.processInfo.systemUptime) || !pump.isCurrent(selection)) {continue}
+                    if localFrameMode,(!pump.captureReady(at:ProcessInfo.processInfo.systemUptime) || !pump.isCurrent(selection)) {
+                        if nativeSourceLease != nil {pump.noteProcessingRetirement(milliseconds:stats.captureMilliseconds)}
+                        continue
+                    }
                     var localCodeVisible=false
                     if localFrameMode {
                         let delivery=try DesktopCameraInput.delivery(generic:genericFrameMode) {
@@ -1915,9 +1943,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if localFrameMode,!pump.isCurrent(selection) {
                         try await phone.discardFrame(epoch:generation)
                         lastDeliveredRevision=nil
+                        if nativeSourceLease != nil {pump.noteProcessingRetirement(milliseconds:(ProcessInfo.processInfo.systemUptime-began)*1000)}
                         stats.dropped+=1;pump.update(stats);continue
                     }
                     if genericFrameMode {lastDeliveredRevision=selection.revision}
+                    if nativeSourceLease != nil {pump.noteProcessingACK(milliseconds:(ProcessInfo.processInfo.systemUptime-began)*1000)}
                     stats.sent+=1
                     if stats.firstFrameAcknowledgedAt==nil {stats.firstFrameAcknowledgedAt=sentAt}
                     if let previous=lastSentAt {stats.maximumGapMilliseconds=max(stats.maximumGapMilliseconds,(sentAt-previous)*1000)}

@@ -29,6 +29,7 @@ final class CameraPumpMailbox: @unchecked Sendable {
     private var admitsFrames:Bool {active && sourceIsAvailable()}
     private let lock=NSLock()
     private var active=true
+    private var nativeSourceBudget=NativeSourceBudget()
     private var target:DesktopCaptureTarget?
     private var statistics=Statistics()
     private var failure:Error?
@@ -77,6 +78,13 @@ final class CameraPumpMailbox: @unchecked Sendable {
         }
         return false
     }
+    func noteProcessingRetirement(milliseconds:Double) {
+        lock.withLock {if admitsFrames {nativeSourceBudget.retired(milliseconds:milliseconds)}}
+    }
+    func noteProcessingACK(milliseconds:Double) {
+        lock.withLock {if admitsFrames {nativeSourceBudget.acknowledged(milliseconds:milliseconds)}}
+    }
+    var nativeMinimumInterval:Double {lock.withLock {nativeSourceBudget.minimumInterval}}
     func selection()->Selection? {
         lock.lock();defer{lock.unlock()}
         return admitsFrames ? target.map{Selection(target:$0,revision:revision)}:nil

@@ -49,6 +49,8 @@ import Foundation
         precondition(recovery.decide(at:10.1,matches:true,freshCarrier:false) == .waiting)
         precondition(recovery.decide(at:10.1,matches:true,freshCarrier:true,freshPresentation:true) == .resumed)
         precondition(recovery.decide(at:10.1,matches:true,freshCarrier:true) == .waiting,"Decode without presentation reopened input")
+        precondition(recovery.decide(at:10.1,matches:true,freshCarrier:false,freshPresentation:true) == .waiting,"An old presentation bypassed carrier freshness")
+        precondition(recovery.decide(at:10.1,matches:false,freshCarrier:true,freshPresentation:true) == .retire,"Fresh presentation bypassed the authenticated source check")
         precondition(recovery.decide(at:10.1,matches:false,freshCarrier:true) == .retire)
         precondition(recovery.decide(at:10.7,matches:true,freshCarrier:false) == .retire)
         precondition(recovery.decide(at:9,matches:true,freshCarrier:true) == .retire)

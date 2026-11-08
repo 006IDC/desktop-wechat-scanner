@@ -56,6 +56,12 @@ import QuartzCore
               !keyGate.current(at:ProcessInfo.processInfo.systemUptime) else{return false}
         recoveryClearedAt=nil;recoverySourceCleared=false;carrierRecovery=NativeCarrierRecovery(at:ProcessInfo.processInfo.systemUptime);return true
     }
+    /// A scheduling hint only. Reopening input still needs a subsequent
+    /// authenticated state snapshot through resolveCarrierRecovery below.
+    var recoveryReadyForValidation:Bool {
+        guard carrierRecovery != nil,recoverySourceCleared,let recoveryClearedAt else{return false}
+        return keyGate.current(at:ProcessInfo.processInfo.systemUptime) && statistics.hasPresentedSource(after:recoveryClearedAt)
+    }
     func resolveCarrierRecovery(in state:PhoneCameraState)->NativeCarrierRecovery.Decision {
         let decision=carrierRecovery?.decide(at:ProcessInfo.processInfo.systemUptime,
             matches:matches(state) && renderFailure==nil && decodedFrameDelivery,

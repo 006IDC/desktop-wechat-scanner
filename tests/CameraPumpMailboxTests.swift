@@ -173,6 +173,19 @@ import Dispatch
         require(marker(replacement.latest())==123 && pump.latest()==nil,
                 "New pump shared state with stopped pump")
 
+        let budgeted=CameraPumpMailbox();budgeted.publish(target(1));let budgetedOld=budgeted.selection()!
+        budgeted.noteProcessingRetirement(milliseconds:60)
+        require(budgeted.nativeMinimumInterval>0,"Slow retired work did not pace subsequent native selections")
+        budgeted.invalidateRegion()
+        require(!budgeted.isCurrent(budgetedOld) && budgeted.selection()==nil,"Backpressure authorized a retired ROI")
+        for _ in 0..<3 {budgeted.noteProcessingACK(milliseconds:12)}
+        require(budgeted.nativeMinimumInterval==0 && budgeted.selection()==nil,"Successful work revived invalid geometry")
+        budgeted.noteProcessingRetirement(milliseconds:80);budgeted.stop();let retiredBudget=budgeted.nativeMinimumInterval
+        budgeted.noteProcessingRetirement(milliseconds:2000)
+        for _ in 0..<3 {budgeted.noteProcessingACK(milliseconds:12)}
+        require(budgeted.nativeMinimumInterval==retiredBudget && !budgeted.isAdmittingFrames,"Late work modified a stopped budget owner")
+        require(CameraPumpMailbox().nativeMinimumInterval==0,"Replacement pump inherited old backpressure")
+
         let stopped=CameraPumpMailbox()
         stopped.publish(target(1));stopped.stop()
         DispatchQueue.concurrentPerform(iterations:8) { worker in
