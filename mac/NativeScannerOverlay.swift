@@ -305,19 +305,6 @@ import QuartzCore
         mark("blueConfirmedMilliseconds")
         installRenderer(renderer)
     }
-    private nonisolated static func whiteVisible(_ pixels:CVPixelBuffer)->Bool {
-        guard CVPixelBufferGetPixelFormatType(pixels)==kCVPixelFormatType_32BGRA,
-              CVPixelBufferLockBaseAddress(pixels,.readOnly)==kCVReturnSuccess else{return false}
-        defer {CVPixelBufferUnlockBaseAddress(pixels,.readOnly)}
-        guard let p=CVPixelBufferGetBaseAddress(pixels)?.assumingMemoryBound(to:UInt8.self) else{return false}
-        let w=CVPixelBufferGetWidth(pixels),h=CVPixelBufferGetHeight(pixels),row=CVPixelBufferGetBytesPerRow(pixels)
-        guard w>=32,h>=32 else{return false}
-        var white=0,total=0
-        for y in stride(from:h/3,to:h*2/3,by:max(1,h/24)) {for x in stride(from:w/3,to:w*2/3,by:max(1,w/24)) {
-            let i=y*row+x*4;total+=1;if min(p[i],min(p[i+1],p[i+2]))>200 {white+=1}
-        }}
-        return total>0 && white*100>=total*70
-    }
     private func prepareInterleaved(phone:PhoneSession,epoch:Int) async throws {
         guard !acquiringSource,sourceLease==nil,!frozen else{throw CancellationError()}
         acquiringSource=true;defer{acquiringSource=false}
@@ -364,8 +351,8 @@ import QuartzCore
                         try await requireCurrent(phone);ownershipMilliseconds+=(ProcessInfo.processInfo.systemUptime-checkBegan)*1000
                         nextStateCheck=CACurrentMediaTime()+0.08
                     }
-                    let ready=phase==0 ? NativeCalibrationReadiness.blackVisible(sample.pixels):
-                        (phase==1 ? Self.whiteVisible(sample.pixels):Self.isBlue(sample.pixels))
+                    let ready=phase==0 ? NativeCalibrationReadiness.blackEndpointVisible(sample.pixels):
+                        (phase==1 ? NativeCalibrationReadiness.whiteEndpointVisible(sample.pixels):Self.isBlue(sample.pixels))
                     guard ready else{rejected+=1;continue}
                     if firstAccepted==nil {
                         firstAccepted=sample.receivedAt

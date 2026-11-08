@@ -123,6 +123,22 @@ import Metal
             for c in 0..<4 {maximum=max(maximum,abs(Int(output[i+c])-expected[c]))}
         }}
         check(maximum<=4,"Spatial key changed original native pixels: \(maximum)")
+        // A real startup failure: two accepted transition-gray observations
+        // outvote the one genuine black frame. White/key can look correct while
+        // this silently leaves an opaque haze in the clear camera center.
+        var gray=black
+        for y in height/3..<height*2/3 {for x in width/3..<width*2/3 {
+            let i=(y*width+x)*4;gray[i]=19;gray[i+1]=22;gray[i+2]=26
+        }}
+        let contaminated=[gray,gray,black,white,white,white,key,key,key].map{ci($0)}
+        let haze=try NativeScannerMatte(black:contaminated[0],white:contaminated[3],algorithm:.spatialBlue,blueCalibration:contaminated)
+        let bad=CIImage(cgImage:try haze.render(black:ci(key)),options:[.colorSpace:NSNull()])
+        var badBytes=[UInt8](repeating:0,count:width*height*4)
+        badBytes.withUnsafeMutableBytes {CIContext(options:[.workingColorSpace:NSNull(),.outputColorSpace:NSNull()]).render(bad,
+            toBitmap:$0.baseAddress!,rowBytes:width*4,bounds:bad.extent,format:.RGBA8,colorSpace:nil)}
+        let center=(height/2*width+width/2)*4+3
+        check(badBytes[center]>=16 && output[center]<=4,"Transition-gray fixture did not reproduce the startup haze")
+
         for (w,h) in [(width,height),(width*2,height*2),(width/2,height/2)] {
             let a=texture(w,h,.bgra8Unorm),b=texture(w,h,.bgra8Unorm)
             let ca=try renderer.render(black:ci(key),into:a,allowFused:false);await ca.completed()
