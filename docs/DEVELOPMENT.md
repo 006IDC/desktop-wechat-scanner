@@ -1321,3 +1321,8 @@ owner等待分别波动（支付宝473/230ms、微信438/356ms），不能拿上
 所有原权限true、无session残留。不把A2识码未确认抹掉，也不把不同手机流配置时间引起的整体波动都归功于快探测。支付宝这一组配置后发现102/123→39/29ms，微信并非每轮更快。MirrorInputRecency测试覆盖current/old epoch、停止、无穷/未来时间、active/busy/expiry决策；CameraEntryActivity测试验证独立于调用方阻塞的到期、40轮stop/expire竞争、deinit和非法duration默认。
 
 最后撤掉私有PhoneSession/Java事件探针，恢复原后端，以最终真实控制器复测双App精确识码和清理通过，权限true、前台不变、App从未激活、session消失。微信检测383ms、首ACK1361ms，支付宝检测305ms、首ACK1413ms；native route快照1–2ms、控件设置1–6ms、挂载状态2–6ms、显示切换2ms，nativePrepareAndStream约880/1032ms仍是主体。首开尚未稳定低于1.2秒；支付宝程序移动最长ACK间隔560ms仍保留。已补各段数值到诊断字段，未靠去掉归属校验或放宽灰帧阈值缩短等待。
+
+
+77源码`b70af443d3647329964f4e2e9217de39b05b2efc`持久签名ZIP已安装，SHA256 `8974b42b9cef77949b65d7907fd32afd1b11e6b092ee69fa6ca42cd5595f7224`。相同designated requirement，ADB、scrcpy和Android JAR与76相同，完整76应用回退保留；没有重置/申请录屏权限或激活App。未公开Release。
+
+安装原包后台回归：微信精确识码通过，owner873/校准829/首ACK1785ms；支付宝owner369/校准1009/首ACK1412ms，精确结果未确认，退出清理成功。支付宝阶段1首匹配423ms，继续暴露颜色往返波动。支付宝单独复核精确识码、清理通过，owner544/首ACK1305ms，中央alpha<16/255比例99.68%。两轮原权限true、前台PID不变、session记录消失；保留首轮反例，不以补测覆盖失败。诊断不测AppController或物理拖动，公开与私有证据口径分别保留。
