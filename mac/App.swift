@@ -942,11 +942,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     cameraActive=true;paused=false
                     localCameraMode=desktopMode
                     if localCameraMode,nativeScannerRequested,(!genericDesktopCamera || nativeInterleavedRequested),let targetDisplay {
+                        let nativeStateBegan=ProcessInfo.processInfo.systemUptime
                         let state=try await phone.cameraState()
+                        cameraStartupStages["nativeRouteStateMilliseconds"]=(ProcessInfo.processInfo.systemUptime-nativeStateBegan)*1000
                         guard let scanner=eligibleCameraActivity(state),scanner.displayId==targetDisplay else {
                             throw ScanError("手机扫码画面已切换，透明取景已停止。请退出扫一扫后重新进入。")
                         }
                         if !genericDesktopCamera || (state.interleavedPreviewSupported && state.activeStreams==1) {
+                            let nativeSetupBegan=ProcessInfo.processInfo.systemUptime
                             let overlay=NativeScannerOverlay(display:targetDisplay,package:scanner.package,
                                 fastCalibration:CommandLine.arguments.contains("--native-fast-calibration"),
                                 batchedCalibration:CommandLine.arguments.contains("--native-batched-calibration"),
@@ -960,16 +963,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             nativeScannerOverlay=overlay;targetWindow.prepareNativeScanner(overlay)
                             status("准备扫码预览","正在准备手机应用的扫码画面…")
                             let warmTarget=try DesktopCaptureTarget.current(for:targetWindow.desktopCaptureRect)
+                            cameraStartupStages["nativeViewSetupMilliseconds"]=(ProcessInfo.processInfo.systemUptime-nativeSetupBegan)*1000
+                            let nativePrepareBegan=ProcessInfo.processInfo.systemUptime
                             let preparation=try await CaptureStartupOverlap.during(prepare:{[capture] in
                                 try await capture.prepareStream(warmTarget)
                             },operation:{try await overlay.prepare(phone:phone,epoch:generation)})
+                            cameraStartupStages["nativePrepareAndStreamMilliseconds"]=(ProcessInfo.processInfo.systemUptime-nativePrepareBegan)*1000
                             cameraStartupStages["streamWarmupCompleted"]=preparation.warmup.completed ? 1:0
                             cameraStartupStages["streamWarmupMilliseconds"]=preparation.warmup.milliseconds
                             if deferMetadata && !preparation.warmup.completed {
                                 try await prepareForegroundCaptureMetadata()
                                 cameraStartupStages["metadataFallbackCompleted"]=1
                             }
+                            let attachmentStateBegan=ProcessInfo.processInfo.systemUptime
                             let attachmentState=try await phone.cameraState()
+                            cameraStartupStages["attachmentStateMilliseconds"]=(ProcessInfo.processInfo.systemUptime-attachmentStateBegan)*1000
                             try Task.checkCancellation()
                             guard connected,!stopping,generation==scanGeneration,nativeScannerOverlay === overlay else{throw CancellationError()}
                             guard overlay.matches(attachmentState) else{throw ScanError("手机扫码画面已切换，透明取景已停止。请重新打开手机应用的扫一扫。")}
@@ -978,7 +986,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                   windowAvailability?.isAvailable != false,overlay.decodedFrameDelivery else{throw ScanError("手机画面连接已变化，透明取景已停止。请退出扫一扫后重新进入；仍失败时请重连手机。")}
                             if targetWindow === mainControl {applicationPickerVisible=false}
                             if overlay.interleaved,nativeCameraScene?.markVerified(in:attachmentState) != true {throw ScanError("手机扫码画面已切换，透明取景已停止。请退出扫一扫后重新进入。")}
+                            let nativeShowBegan=ProcessInfo.processInfo.systemUptime
                             guard targetWindow.showNativeScanner(overlay) else{throw ScanError("透明取景未能开启。请先关闭“原生扫码界面（试用）”，使用普通扫码框重试。")}
+                            cameraStartupStages["nativeShowMilliseconds"]=(ProcessInfo.processInfo.systemUptime-nativeShowBegan)*1000
                             nativeScannerAttachedUptime=ProcessInfo.processInfo.systemUptime
                         } else {
                             if deferMetadata {try await prepareForegroundCaptureMetadata()}
@@ -1702,11 +1712,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.status(app.name,self.genericDesktopCamera ? (cameraReady ? "桌面相机已绑定；在应用内打开相机或扫一扫即可取景。":"此应用未声明相机权限，已按普通手机应用打开。") : "直接操作手机应用。")
         })
     }
+    private func cameraEntryPolling()->CameraEntryPolling.Decision {
+        let latest=desktopMode ? [activeRoute.session.lastInputIssuedAt,detachedApplications?.latestInputIssuedAt].compactMap{$0}.max():nil
+        return CameraEntryPolling.decision(cameraActive:cameraActive,busy:busy,lastInput:latest,now:ProcessInfo.processInfo.systemUptime)
+    }
     private func startLoop(){
         loop?.cancel()
         loop=Task {
             var nextActivity=Date.distantPast,nextHeartbeat=Date.distantPast,failures=0
+            let entryActivity=CameraEntryActivity()
+            defer {entryActivity.stop()}
             while connected && !Task.isCancelled {
+                let entry=cameraEntryPolling()
+                if entryActivity.update(entry.holdActivity) {cameraStateRefreshRequested=true}
                 let generation=scanGeneration
                 if (Date()>=nextActivity || cameraStateRefreshRequested) && !busy && !Task.isCancelled {
                     cameraStateRefreshRequested=false
@@ -1741,7 +1759,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     // Keep entry detection quick, but avoid ten competing state
                     // round trips per second while scanning. Android still
                     // invalidates ownership/activity on every submitted frame.
-                    nextActivity=Date().addingTimeInterval(desktopMode ? (cameraActive ? 0.25:0.1) : (mode == .wechat ? 0.25:0.7))
+                    nextActivity=Date().addingTimeInterval(desktopMode ? cameraEntryPolling().statusInterval : (mode == .wechat ? 0.25:0.7))
                 }
                 if Date()>=nextHeartbeat && !Task.isCancelled {
                     do {try await phone.heartbeat();failures=0} catch {failures+=1}
@@ -1754,7 +1772,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     status("手机连接中断","请检查数据线与手机状态，再重新连接。")
                     disconnect(preserveError:true);break
                 }
-                try? await Task.sleep(nanoseconds:desktopMode ? 60_000_000:120_000_000)
+                try? await Task.sleep(nanoseconds:desktopMode ? cameraEntryPolling().sleepNanoseconds:120_000_000)
             }
         }
     }

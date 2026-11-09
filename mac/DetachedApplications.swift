@@ -52,6 +52,7 @@ final class DetachedApplications: NSObject, NSWindowDelegate {
         entry.ui.showWindow(nil)
         if let window=entry.ui.window {AppWindowMotion.reveal(window,from:point)}
     }
+    var latestInputIssuedAt:Double? {entries.values.compactMap{$0.mirror.lastInputIssuedAt}.max()}
     func cameraWindows()->[(display:Int,window:ControlWindowController)] {
         entries.values.compactMap {entry in
             guard entry.acceptsInput,let display=entry.display else{return nil}

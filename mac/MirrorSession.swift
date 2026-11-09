@@ -353,6 +353,8 @@ final class MirrorSession: @unchecked Sendable {
     private let lock=NSLock()
     private let timing = MirrorTiming()
     var timingSnapshot: MirrorTiming.Snapshot { timing.snapshot }
+    private var inputRecency=MirrorInputRecency()
+    var lastInputIssuedAt:Double? {lock.withLock{inputRecency.latest}}
     private let inputScheduler = MirrorInputScheduler()
     private let inputQueue=DispatchQueue(label:"com.idc006.mirror.input",qos:.userInitiated)
     private var generation=0, video:MirrorSocket?, control:MirrorSocket?, server:Process?
@@ -370,6 +372,7 @@ final class MirrorSession: @unchecked Sendable {
         started=true;generation += 1
         timing.begin(epoch: generation)
         inputScheduler.reset(epoch: generation, enabled: true)
+        inputRecency.reset(epoch:generation,enabled:true)
         self.adbURL=adbURL;self.serial=serial;self.serverSocket=serverSocket
         failureCallback=onFailure
         let token=UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased()
@@ -658,6 +661,7 @@ final class MirrorSession: @unchecked Sendable {
         guard current else {return}
         guard let channel else {throw ScanError("手机控制连接尚未就绪。")}
         try channel.write(data)
+        lock.withLock {inputRecency.wrote(epoch:epoch,at:ProcessInfo.processInfo.systemUptime)}
     }
     private func reportInputFailure(_ error:Error,epoch:Int) {
         let callback=lock.withLock {started && generation==epoch ? failureCallback:nil}
@@ -673,6 +677,7 @@ final class MirrorSession: @unchecked Sendable {
                 timing.invalidate(epoch: generation)
                 stopping=true;generation += 1;started=false
                 inputScheduler.reset(epoch: generation, enabled: false)
+                inputRecency.reset(epoch:generation,enabled:false)
                 return (video,control,preparing)
             }
             guard let (video,control,preparing)=state else {return}

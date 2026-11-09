@@ -170,14 +170,17 @@ import QuartzCore
         }
     }
     private func nextCalibrationFrame(after:Int,notBefore:TimeInterval=0,
-                                      deadline:TimeInterval) async throws -> NativeScannerFrames.Sample {
+                                      deadline:TimeInterval,preserveTimeout:Bool=false) async throws -> NativeScannerFrames.Sample {
         do {
             let remaining=deadline-CACurrentMediaTime()
             guard remaining>0 else{throw NativeScannerFrames.Failure.timedOut}
             return try await frames.wait(after:after,notBefore:notBefore,timeout:remaining)
         } catch NativeScannerFrames.Failure.stopped {throw CancellationError()}
         catch NativeScannerFrames.Failure.concurrentWait {throw ScanError("扫码预览准备已中断。请退出扫一扫后重新进入。")}
-        catch NativeScannerFrames.Failure.timedOut {throw ScanError("暂时没有收到手机扫码画面。请退出扫一扫后重新进入。")}
+        catch NativeScannerFrames.Failure.timedOut {
+            if preserveTimeout {throw NativeScannerFrames.Failure.timedOut}
+            throw ScanError("暂时没有收到手机扫码画面。请退出扫一扫后重新进入。")
+        }
     }
     private nonisolated static func isBlue(_ pixels:CVPixelBuffer)->Bool {
         guard CVPixelBufferGetPixelFormatType(pixels)==kCVPixelFormatType_32BGRA,
@@ -323,56 +326,43 @@ import QuartzCore
             guard !frozen,sourceLease==nil,decodedBinding==nil || decodedFrameDelivery else{throw CancellationError()}
             sourceLease=lease
         },retire:{try await phone.endNativePreview($0)})
-        do {try await calibrateInterleaved(phone:phone,epoch:epoch,began:began)}
+        do {
+            try await NativeCalibrationSequence.run(overlap:true,verify:{_ = try await self.requireCurrent(phone)},retry:{
+                self.calibrationTiming["overlapFallback"]=1
+                self.calibrationTiming["overlapAttemptMilliseconds"]=(ProcessInfo.processInfo.systemUptime-began)*1000
+            },operation:{overlap in try await self.calibrateInterleaved(phone:phone,epoch:epoch,began:began,overlap:overlap)})
+        }
+        catch NativeScannerFrames.Failure.timedOut {
+            try? await releaseSource(phone:phone)
+            throw ScanError("暂时没有收到手机扫码画面。请退出扫一扫后重新进入。")
+        }
         catch {try? await releaseSource(phone:phone);throw error}
     }
-    private func calibrateInterleaved(phone:PhoneSession,epoch:Int,began:TimeInterval) async throws {
+    private func calibrateInterleaved(phone:PhoneSession,epoch:Int,began:TimeInterval,overlap:Bool) async throws {
         try await requireCurrent(phone)
         let prepared=try await withThrowingTaskGroup(of:(Int,NativeScannerMatte.CalibrationBatch,Double).self) {group in
             // At most nine immutable uploads, owned and joined by this lease's
             // preparation. Cancellation/failure cannot leave a publisher behind.
             defer {group.cancelAll()}
-            var samples=[CVPixelBuffer]()
-            for phase:UInt8 in 0...2 {
-                if phase>0 {hidesCalibrationFrames=true}
-                let before=frames.latest().0
-                guard let sourceLease else{throw CancellationError()}
-                let phaseBegan=ProcessInfo.processInfo.systemUptime
-                try await phone.nativePreviewCalibration(phase,lease:sourceLease)
-                calibrationTiming["phase\(phase)CommandMilliseconds"]=(ProcessInfo.processInfo.systemUptime-phaseBegan)*1000
-                var firstAccepted:Double?,lastReceipt=0.0,rejected=0,ownershipMilliseconds=0.0
-                let deadline=CACurrentMediaTime()+2
-                var observed=before,lastAccepted=0.0,accepted=0,nextStateCheck=CACurrentMediaTime()+0.08
-                while accepted<3 {
-                    let sample=try await nextCalibrationFrame(after:observed,notBefore:lastAccepted>0 ? lastAccepted+0.04:0,deadline:deadline)
-                    observed=sample.revision
-                    if CACurrentMediaTime()>=nextStateCheck {
-                        let checkBegan=ProcessInfo.processInfo.systemUptime
-                        try await requireCurrent(phone);ownershipMilliseconds+=(ProcessInfo.processInfo.systemUptime-checkBegan)*1000
-                        nextStateCheck=CACurrentMediaTime()+0.08
-                    }
-                    let ready=phase==0 ? NativeCalibrationReadiness.blackEndpointVisible(sample.pixels):
-                        (phase==1 ? NativeCalibrationReadiness.whiteEndpointVisible(sample.pixels):Self.isBlue(sample.pixels))
-                    guard ready else{rejected+=1;continue}
-                    if firstAccepted==nil {
-                        firstAccepted=sample.receivedAt
-                        calibrationTiming["phase\(phase)FirstMatchMilliseconds"]=(ProcessInfo.processInfo.systemUptime-phaseBegan)*1000
-                    }
-                    let index=samples.count,pixels=sample.pixels
-                    samples.append(pixels);lastAccepted=sample.receivedAt;lastReceipt=sample.receivedAt;accepted+=1
+            let samples=try await NativeCalibrationSequence.collect(overlap:overlap,began:began,
+                clock:{ProcessInfo.processInfo.systemUptime},latest:{self.frames.latest().0},
+                command:{phase in
+                    try Task.checkCancellation()
+                    guard let lease=self.sourceLease else{throw CancellationError()}
+                    try await phone.nativePreviewCalibration(phase,lease:lease)
+                },read:{revision,notBefore,deadline in
+                    try await self.nextCalibrationFrame(after:revision,notBefore:notBefore,deadline:deadline,preserveTimeout:true)
+                },verify:{_ = try await self.requireCurrent(phone)},ready:{phase,pixels in
+                    phase==0 ? NativeCalibrationReadiness.blackEndpointVisible(pixels):
+                        (phase==1 ? NativeCalibrationReadiness.whiteEndpointVisible(pixels):Self.isBlue(pixels))
+                },hide:{self.hidesCalibrationFrames=true},upload:{index,pixels in
                     group.addTask(priority:.userInitiated) {
                         try Task.checkCancellation()
                         let uploadBegan=ProcessInfo.processInfo.systemUptime
                         let batch=try NativeScannerMatte.prepareCalibrationBatch([CIImage(cvPixelBuffer:pixels)])
                         return (index,batch,(ProcessInfo.processInfo.systemUptime-uploadBegan)*1000)
                     }
-                }
-                try await requireCurrent(phone)
-                calibrationTiming["phase\(phase)ReadyMilliseconds"]=(ProcessInfo.processInfo.systemUptime-began)*1000
-                calibrationTiming["phase\(phase)SampleSpanMilliseconds"]=(lastReceipt-(firstAccepted ?? lastReceipt))*1000
-                calibrationTiming["phase\(phase)RejectedFrames"]=Double(rejected)
-                calibrationTiming["phase\(phase)OwnershipCheckMilliseconds"]=ownershipMilliseconds
-            }
+                },record:{self.calibrationTiming[$0]=$1})
             let joinBegan=ProcessInfo.processInfo.systemUptime
             var batches=[NativeScannerMatte.CalibrationBatch?](repeating:nil,count:9)
             for try await (index,batch,milliseconds) in group {
